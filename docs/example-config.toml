@@ -1,0 +1,47 @@
+# 示例配置：本地自测用（不落 /etc）。启动：cargo run -- -config ../docs/example-config.toml
+# 生产配置见 files/etc/modemd/config.toml。
+
+[server]
+listen = "0.0.0.0:9527"
+scan_interval = 3
+pid_file = "/var/run/modemd.pid"
+log_file = "/var/log/modemd.log"
+log_level = "info"
+# 定时任务循环节拍（秒），默认 10；<=0 按 10 兜底。
+schedule_interval = 10
+
+[serial]
+baud = 115200
+at_probe_timeout = "4s"
+cmd_timeout = "3s"
+
+[net]
+wan_mode = "modem_pro"
+host_dial = true
+# 主机侧拨号器："" = 厂商二进制（/usr/lib/modemd/），"native" = 内置 Rust QMI 拨号器
+host_dial_bin = ""
+auto_dial = true
+# 模组侧 IPv6 取址方式：dhcpv6（默认，odhcp6c 收 RA + /64 委派给 LAN）/ ra（内核 RA+SLAAC，
+# 本程序开 accept_ra=2 并主动发 RS）/ static（照模组上报地址写 /128）/ off（不托管）。
+# 350 系列（FM350 / RW350）用默认的 dhcpv6，别用 static（模组会报无前缀残值）。
+wan_ipv6_mode = "dhcpv6"
+
+[quota]
+# 默认关闭；上限 0 = 不限量。按模组保存的配额与用量写在配置文件同目录的 quota.json。
+enabled = false
+limit_bytes = 0
+count_up = true
+count_down = true
+action = "block"
+reset_day = 0
+
+[ui]
+# 本地自测建议关掉登录闸门；生产保持默认（开）。
+require_luci_login = false
+
+[ntp]
+# SNTP 校时：enabled / servers / timezone / timeout_secs（默认开，腾讯/Cloudflare/阿里三台）
+enabled = true
+servers = ["ntp.tencent.com", "time.cloudflare.com", "ntp.aliyun.com"]
+timezone = "Asia/Shanghai"
+timeout_secs = 3

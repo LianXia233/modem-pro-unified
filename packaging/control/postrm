@@ -1,0 +1,21 @@
+#!/bin/sh
+# modem-pro 卸载后（postrm）。IPKG_INSTROOT 非空 = 离线 rootfs，跳过。
+[ -n "$IPKG_INSTROOT" ] && exit 0
+
+rm -f /tmp/luci-indexcache /tmp/luci-indexcache.* 2>/dev/null
+rm -rf /tmp/luci-modulecache 2>/dev/null
+
+# 退役的 Lua 世代（2026-10 起只留 ucode/JS）：升级上来的机器上要清干净，
+# 否则 Lua 控制器的 entry() 会盖掉 menu.d 里的 view 动作，菜单还指向旧模板。
+rm -f /usr/lib/lua/luci/controller/modemd.lua 2>/dev/null
+rm -f /usr/lib/lua/luci/modemd_i18n.lua 2>/dev/null
+rm -rf /usr/lib/lua/luci/view/modemd 2>/dev/null
+
+[ -x /etc/init.d/rpcd ] && /etc/init.d/rpcd reload 2>/dev/null
+[ -x /etc/init.d/uhttpd ] && /etc/init.d/uhttpd reload 2>/dev/null
+
+# 注意：/etc/modemd/config.toml 是 conffile，卸载不删（保留用户配置）。
+# 同目录的台账（quota.json / imei.json / schedule.json / atport*.json / hostnic.json）
+# 也**故意保留**：IMEI 备份丢了就无法 restore，配额/定时任务重装后还要接着用。
+# 确实要清干净时由用户手工 rm -f /etc/modemd/*.json。
+exit 0

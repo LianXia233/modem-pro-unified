@@ -1,0 +1,373 @@
+//! PDP 上下文与选网总览（`GET /api/params`）。
+//!
+//! 配置来自 `AT+CGDCONT?`，激活状态来自 `AT+CGACT?`，选网方式来自 `AT+COPS?`。
+
+use std::time::Duration;
+
+use serde::Serialize;
+
+use crate::error::{msg, Result};
+
+use super::super::at::{csv, extract_all, is_duplicate_activate, is_ok};
+use super::modem::Modem;
+use super::netselect::{self, NetSelect};
+
+/// 一个 PDP 上下文。
+#[derive(Debug, Clone, Serialize)]
+pub struct Context {
+    pub cid: i32,
+    pub pdp_type: String,
+    pub apn: String,
+    pub active: bool,
+    /// IMS / sos 等内部专用 APN，不用于上网
+    pub internal: bool,
+}
+
+/// 参数总览。
+#[derive(Debug, Clone, Serialize)]
+pub struct ParamsStatus {
+    pub modem_id: u32,
+    pub queried_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apn: Option<String>,
+    pub contexts: Vec<Context>,
+    pub net_select: NetSelect,
+}
+
+impl Modem {
+    /// 读取参数总览。
+    pub fn params(&self) -> ParamsStatus {
+        let defined = self
+            .with_at(|p| p.command("AT+CGDCONT?", self.cmd_timeout))
+            .unwrap_or_default();
+        let activated = self
+            .with_at(|p| p.command("AT+CGACT?", self.cmd_timeout))
+            .unwrap_or_default();
+        let net_select = self
+            .with_at(|p| p.command("AT+COPS?", self.cmd_timeout))
+            .map(|raw| netselect::parse(&raw))
+            .unwrap_or_default();
+
+        let contexts = build_contexts(&defined, &activated);
+        let apn = contexts
+            .iter()
+            .find(|c| c.active && !c.internal)
+            .map(|c| c.apn.clone());
+
+        ParamsStatus {
+            modem_id: self.id,
+            queried_at: crate::logging::timestamp(),
+            apn,
+            contexts,
+            net_select,
+        }
+    }
+}
+
+/// PLMN 文本校验（手动选网要 5~6 位数字）。
+fn valid_plmn_text(p: &str) -> bool {
+    p.len() >= 5 && p.len() <= 6 && p.chars().all(|c| c.is_ascii_digit())
+}
+
+/// APN 只允许字母 / 数字与 `. - _`（会拼进 `AT+CGDCONT`，必须卡死）。
+pub fn valid_apn(apn: &str) -> bool {
+    let s = apn.trim();
+    !s.is_empty()
+        && s.len() <= 100
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+impl Modem {
+    /// 写 APN：`AT+CGDCONT=<cid>,"<pdp>","<apn>"` → 回读确认 → 重新激活该 cid → 顺手激活 IMS。
+    ///
+    /// 返回（新的参数总览，每一步的说明）。回读是必须的：模组回 OK 不代表真存下了。
+    pub fn set_apn(
+        &self,
+        cid: i32,
+        pdp_type: &str,
+        apn: &str,
+        activate_ims: bool,
+    ) -> Result<(ParamsStatus, String)> {
+        let apn = apn.trim();
+        if cid <= 0 {
+            return Err(msg("上下文 cid 要是正数"));
+        }
+        if !valid_apn(apn) {
+            return Err(msg("APN 只允许字母 / 数字与 . - _"));
+        }
+        let mut steps = Vec::new();
+        let cmd = format!("AT+CGDCONT={cid},\"{pdp_type}\",\"{apn}\"");
+        let resp = self.with_at(|p| p.command(&cmd, self.cmd_timeout))?;
+        if !is_ok(&resp) {
+            return Err(msg(format!("写入失败：{}", resp.trim())));
+        }
+        steps.push(format!("已下发 {cmd}"));
+
+        // 回读确认
+        let defined = self.at_cmd("AT+CGDCONT?");
+        let contexts = build_contexts(&defined, "");
+        let stored = contexts
+            .iter()
+            .find(|c| c.cid == cid)
+            .map(|c| c.apn.clone());
+        if stored.as_deref() != Some(apn) {
+            return Err(msg(format!(
+                "模组回读了不一样的 APN（写入 {apn}，回读 {}）",
+                stored.unwrap_or_else(|| "空".to_string())
+            )));
+        }
+        steps.push("回读确认一致".to_string());
+
+        // 之前激活着的就先断后连，让新 APN 立即生效
+        let activated = self.at_cmd("AT+CGACT?");
+        let was_active = build_contexts(&defined, &activated)
+            .iter()
+            .any(|c| c.cid == cid && c.active);
+        if was_active {
+            let _ = self.at_cmd(&format!("AT+CGACT=0,{cid}"));
+            let resp = self.at_cmd(&format!("AT+CGACT=1,{cid}"));
+            steps.push(if is_ok(&resp) {
+                "已重新激活该上下文（先断后连）".to_string()
+            } else {
+                format!("重新激活被拒：{}", resp.trim())
+            });
+        }
+
+        // IMS 是 VoLTE / IMS 短信的前提，顺手拉起来；失败不影响本次写入
+        if activate_ims {
+            if let Some(ims) = contexts.iter().find(|c| c.internal) {
+                let resp = self.at_cmd(&format!("AT+CGACT=1,{}", ims.cid));
+                steps.push(if is_ok(&resp) {
+                    format!("已激活 IMS 上下文（cid {}）", ims.cid)
+                } else {
+                    format!(
+                        "IMS 激活被拒（cid {}，固件不许手动激活），不影响本次写入",
+                        ims.cid
+                    )
+                });
+            }
+        }
+        Ok((self.params(), steps.join("；")))
+    }
+
+    /// 删除一条 APN 定义：`AT+CGDCONT=<cid>`（不带后面的参数即删除）。
+    pub fn delete_apn(&self, cid: i32) -> Result<(ParamsStatus, String)> {
+        if cid <= 0 {
+            return Err(msg("上下文 cid 要是正数"));
+        }
+        let resp = self.with_at(|p| p.command(&format!("AT+CGDCONT={cid}"), self.cmd_timeout))?;
+        if !is_ok(&resp) {
+            return Err(msg(format!("删除失败：{}", resp.trim())));
+        }
+        let defined = self.at_cmd("AT+CGDCONT?");
+        let still = build_contexts(&defined, "").iter().any(|c| c.cid == cid);
+        let msg = if still {
+            format!("已下发删除，但模组仍报有 cid {cid}（可能被固件保留）")
+        } else {
+            format!("已删除 cid {cid} 并回读确认")
+        };
+        Ok((self.params(), msg))
+    }
+
+    /// 激活 / 停用一条 PDP 上下文（`reconnect` = 先断后连）。
+    pub fn set_pdp(
+        &self,
+        cid: i32,
+        active: bool,
+        reconnect: bool,
+    ) -> Result<(ParamsStatus, String)> {
+        if cid <= 0 {
+            return Err(msg("上下文 cid 要是正数"));
+        }
+        let mut steps = Vec::new();
+        if reconnect {
+            // 部分固件不允许停用内部上下文（实测 RM502Q-GL 的 AT+CGACT=0,2 回 ERROR），
+            // 被拒就跳过断开、直接激活
+            let off = self.at_cmd(&format!("AT+CGACT=0,{cid}"));
+            steps.push(if is_ok(&off) {
+                "已断开".to_string()
+            } else {
+                "断开被拒（固件不许手动停用），直接激活".to_string()
+            });
+        }
+        let want = if active { 1 } else { 0 };
+        let resp = self.at_cmd(&format!("AT+CGACT={want},{cid}"));
+        // `+CME ERROR: 5847` 是「重复激活」：上下文其实已经激活，不该判失败。
+        // 只对激活放行 —— 停用回 5847 没有语义。
+        let duplicate = active && is_duplicate_activate(&resp);
+        if !is_ok(&resp) && !duplicate {
+            return Err(msg(format!(
+                "{}失败：{}",
+                if active { "激活" } else { "停用" },
+                resp.trim()
+            )));
+        }
+        steps.push(
+            if duplicate {
+                "模组报告该上下文已激活（重复激活），按成功处理".to_string()
+            } else if active {
+                "已激活".to_string()
+            } else {
+                "已停用".to_string()
+            }
+            .to_string(),
+        );
+        Ok((self.params(), steps.join("；")))
+    }
+
+    /// 选网方式：`auto` → `AT+COPS=0`；`manual` → `AT+COPS=1,2,"<plmn>"`。
+    pub fn set_netselect(&self, mode: &str, plmn: &str) -> Result<(ParamsStatus, String)> {
+        let mode = mode.trim().to_ascii_lowercase();
+        let cmd = match mode.as_str() {
+            "auto" | "0" => "AT+COPS=0".to_string(),
+            "manual" | "1" => {
+                let p = plmn.trim();
+                if !valid_plmn_text(p) {
+                    return Err(msg("手动选网需要 5~6 位数字的 PLMN，如 46011"));
+                }
+                format!("AT+COPS=1,2,\"{p}\"")
+            }
+            other => return Err(msg(format!("不支持的选网方式 {other}"))),
+        };
+        // 选网会重注册，给足时间（普通命令超时只有几秒）
+        let resp = self.with_at(|p| p.command(&cmd, Duration::from_secs(60)))?;
+        if !is_ok(&resp) {
+            return Err(msg(format!("下发失败：{}", resp.trim())));
+        }
+        Ok((
+            self.params(),
+            format!("已下发 {cmd}（选网可能要几十秒完成重注册）"),
+        ))
+    }
+}
+
+/// 合并 `AT+CGDCONT?` 与 `AT+CGACT?` 的应答。
+pub fn build_contexts(defined: &str, activated: &str) -> Vec<Context> {
+    let active: Vec<(i32, bool)> = extract_all(activated, "+CGACT")
+        .iter()
+        .filter_map(|line| {
+            let f = csv(line);
+            Some((
+                f.first()?.parse().ok()?,
+                f.get(1)?.parse::<i32>().ok()? == 1,
+            ))
+        })
+        .collect();
+
+    extract_all(defined, "+CGDCONT")
+        .iter()
+        .filter_map(|line| {
+            let f = csv(line);
+            let cid: i32 = f.first()?.parse().ok()?;
+            let pdp_type = f.get(1).cloned().unwrap_or_default();
+            let apn = f.get(2).cloned().unwrap_or_default();
+            let internal = is_internal_apn(&apn);
+            let active = active.iter().any(|(c, a)| *c == cid && *a);
+            Some(Context {
+                cid,
+                pdp_type,
+                apn,
+                active,
+                internal,
+            })
+        })
+        .collect()
+}
+
+/// 内部专用 APN（IMS / sos / mms）不上网。
+pub fn is_internal_apn(apn: &str) -> bool {
+    let a = apn.to_ascii_lowercase();
+    a.contains("ims") || a.contains("sos") || a.contains("mms")
+}
+
+/// 从 `AT+CGACT?` 应答判定指定 cid 的激活态。
+///
+/// 三态而不是 bool，因为「模组没回任何 `+CGACT:` 行」和「回了但目标 cid
+/// 不在列里」是两件不同的事：
+///
+/// - `None` —— 命令不可用 / 未列明细，调用方应回落其它判据；
+/// - `Some(false)` —— 明确列了明细而目标 cid 不在或状态为 0，**权威未激活**；
+/// - `Some(true)` —— 目标 cid 状态为 1。
+///
+/// 之所以要区分：部分平台（实测广和通 MTK 平台）的 `AT+CGACT?` 只回 `OK`
+/// 不列明细，此时不能把「列表为空」当成「全部未激活」。
+pub fn cgact_state(resp: &str, cid: i32) -> Option<bool> {
+    let mut seen = false;
+    let mut active = false;
+    for line in extract_all(resp, "+CGACT") {
+        let f = csv(&line);
+        let Some(rc) = f.first().and_then(|v| v.parse::<i32>().ok()) else {
+            continue;
+        };
+        seen = true;
+        if rc == cid {
+            active = f.get(1).and_then(|v| v.parse::<i32>().ok()) == Some(1);
+        }
+    }
+    if seen {
+        Some(active)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_contexts, cgact_state, is_internal_apn, valid_apn, valid_plmn_text};
+
+    #[test]
+    fn merge_contexts() {
+        let defined = "+CGDCONT: 1,\"IPV4V6\",\"3GNET\",\"0.0.0.0\"\r\n\
+                       +CGDCONT: 2,\"IP\",\"ims\",\"0.0.0.0\"\r\nOK\r\n";
+        let activated = "+CGACT: 1,1\r\n+CGACT: 2,1\r\nOK\r\n";
+        let ctx = build_contexts(defined, activated);
+        assert_eq!(ctx.len(), 2);
+        assert!(ctx[0].active);
+        assert!(!ctx[0].internal);
+        assert!(ctx[1].internal);
+    }
+
+    #[test]
+    fn cgact_state_three_way() {
+        // 列了明细但目标 cid 不在 → 权威未激活
+        assert_eq!(cgact_state("+CGACT: 0,1\r\nOK", 1), Some(false));
+        // 目标 cid 状态 1 → 已激活
+        assert_eq!(
+            cgact_state("+CGACT: 0,1\r\n+CGACT: 1,1\r\nOK", 1),
+            Some(true)
+        );
+        assert_eq!(cgact_state("+CGACT: 1,0\r\nOK", 1), Some(false));
+        // 一条 +CGACT: 行都没有 → 不可用，调用方回落其它判据
+        assert_eq!(cgact_state("\r\nOK\r\n", 1), None);
+        assert_eq!(cgact_state("", 1), None);
+        assert_eq!(cgact_state("+CME ERROR: unknown\r\n", 1), None);
+    }
+
+    #[test]
+    fn apn_must_be_safe_to_embed() {
+        assert!(valid_apn("3GNET"));
+        assert!(valid_apn("cmnet.mnc011.mcc460.gprs"));
+        assert!(valid_apn("a-b_c.d"));
+        assert!(!valid_apn(""));
+        assert!(!valid_apn("a b"), "空格不行");
+        assert!(!valid_apn("a\"b"), "引号不行（会截断 AT 指令）");
+        assert!(!valid_apn("a,b"), "逗号不行（会截断 AT 指令）");
+    }
+
+    #[test]
+    fn plmn_text_must_be_digits() {
+        assert!(valid_plmn_text("46011"));
+        assert!(valid_plmn_text("460011"));
+        assert!(!valid_plmn_text("4601"));
+        assert!(!valid_plmn_text("4601x"));
+    }
+
+    #[test]
+    fn internal_apn_detection() {
+        assert!(is_internal_apn("ims"));
+        assert!(is_internal_apn("IMS"));
+        assert!(is_internal_apn("sos"));
+        assert!(!is_internal_apn("3gnet"));
+    }
+}

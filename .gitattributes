@@ -1,0 +1,22 @@
+# 强制 LF 行尾：CRLF 会让 BusyBox ash / procd / netifd 脚本启动失败。
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.lua  text eol=lf
+*.htm  text eol=lf
+*.uc   text eol=lf
+*.py   text eol=lf
+Makefile text eol=lf
+*.mk   text eol=lf
+Config.in text eol=lf
+VERSION text eol=lf
+
+# 二进制原样
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.gz  binary
+
+# 厂商源码原样保存，不做行尾转换
+third_party/** -text

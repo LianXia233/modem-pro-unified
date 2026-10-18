@@ -1,0 +1,67 @@
+# modem-pro
+
+OpenWrt 上统一管理 **5G/LTE 模组**（移远 Quectel、广和通 Fibocom、美格 Meig、芯讯通 SIMCom）
+的单一软件包：一个 Rust 守护进程 `modemd` + 四家主机侧拨号器 + netifd 协议 + LuCI 前端。
+
+> 本仓库由原先分离的两个工程合并而成：LuCI 前端插件与模组后端。现在是一个仓库、一个包、一份版本号。
+
+## 组成
+
+| 目录 | 内容 |
+| --- | --- |
+| `rust/` | `modemd` 守护进程（Rust，按功能域细分模块）+ 内置调试台页面 |
+| `third_party/` | 四家厂商主机侧拨号器源码与内核模块源码 |
+| `files/` | netifd 协议脚本、默认 `config.toml`、mp-client wrapper |
+| `luci/` | LuCI 前端：协议 JS、控制器、i18n、视图、菜单、ACL |
+| `packaging/` | init 脚本与安装/卸载脚本 |
+| `docs/` | 集成说明、构建说明、接口契约 |
+
+## 快速开始（设备端）
+
+```sh
+# 安装后
+/etc/init.d/modemd status
+/etc/init.d/modemd restart
+# 调试台： http://<路由器地址>:9527/
+# LuCI 菜单： 5G终端
+```
+
+配置在 `/etc/modemd/config.toml`（conffile，升级不覆盖）；改完 `restart` 生效。
+
+## 从源码构建
+
+见 [docs/BUILD.md](docs/BUILD.md)。核心：把本仓库当作 OpenWrt 的 package feed，
+`feeds/packages`（提供 `lang/rust`）必须启用。
+
+```sh
+echo "src-link modem-pro /path/to/modem-pro-unified" >> feeds.conf.default
+./scripts/feeds update -a && ./scripts/feeds install -a
+make menuconfig   # Network -> Modem Manager -> modem-pro
+make package/modem-pro/compile V=s
+```
+
+## 文档
+
+- [docs/INTEGRATION.md](docs/INTEGRATION.md) — 整合方案：目录结构、依赖关系、命名与版本、向后兼容。
+- [docs/BUILD.md](docs/BUILD.md) — SDK/feeds 编译与安装验证。
+- [docs/API.md](docs/API.md) — `modemd` HTTP 接口契约。
+- [docs/PORTING.md](docs/PORTING.md) — 接口级迁移清单（逐条路由的迁移状态）。
+- [docs/PROGRESS.md](docs/PROGRESS.md) — 完整进度文档与后续提示词要求。
+- [docs/HANDOFF.md](docs/HANDOFF.md) — 阶段交接表与硬性要求。
+- [CHANGELOG.md](CHANGELOG.md) — 变更记录。
+
+## 致谢
+
+本项目的方向、接口契约与真机调参经验来自以下两个上游工程，特此致谢：
+
+| 上游仓库 | 内容 |
+| --- | --- |
+| [ouyangzq/modem-pro](https://github.com/ouyangzq/modem-pro) | 模组侧守护进程 `modemd`：多模组管理、厂商指令方言、锁网/小区解析、短信与拨号托管等一整套真机打磨过的实现。本仓库的 HTTP/WS 接口、JSON 字段、AT 解析口径与配置项都以其为对齐基准。 |
+| [ouyangzq/luci-proto-modem-pro](https://github.com/ouyangzq/luci-proto-modem-pro) | `modem_pro` netifd 协议：**一张接口同时承载 IPv4 + IPv6** 的 `mp-client.sh` wrapper 与 LuCI 协议表单，并给出 `accept_ra=2`、QMI 数据面、前缀漂移等实机注意事项。 |
+
+本仓库是在这两个工程的基础上做「整合为单仓库 + 后端 Rust 重写」的工作，目标是与上述
+接口契约逐字兼容。上游仓库未声明开源许可证，本仓库的 [MIT 许可证](LICENSE) 仅覆盖本仓库自身的代码。
+
+## 许可证
+
+MIT，见 [LICENSE](LICENSE)。

@@ -1,0 +1,36 @@
+#!/bin/sh
+# modem-pro 安装后（postinst）。IPKG_INSTROOT 非空 = 在离线 rootfs 预装，不启动服务。
+[ -n "$IPKG_INSTROOT" ] && exit 0
+
+chmod +x /usr/bin/modemd 2>/dev/null
+for d in quectel-CM fibocom-dial meig-cm simcom-cm; do
+	[ -f "/usr/lib/modemd/$d" ] && chmod +x "/usr/lib/modemd/$d" 2>/dev/null
+done
+for s in /lib/netifd/proto/modem_pro.sh /lib/netifd/proto/quectel.sh /usr/lib/modem-pro/mp-client.sh; do
+	[ -f "$s" ] && chmod +x "$s" 2>/dev/null
+done
+
+# 注册并拉起服务
+/etc/init.d/modemd enable 2>/dev/null
+/etc/init.d/modemd restart 2>/dev/null
+
+# 清 LuCI 缓存，让新控制器/菜单立即生效
+rm -f /tmp/luci-indexcache /tmp/luci-indexcache.* 2>/dev/null
+rm -rf /tmp/luci-modulecache 2>/dev/null
+[ -x /etc/init.d/rpcd ] && /etc/init.d/rpcd reload 2>/dev/null
+[ -x /etc/init.d/uhttpd ] && /etc/init.d/uhttpd reload 2>/dev/null
+
+_port=$(sed -n 's/.*listen[[:space:]]*=[[:space:]]*"[^"]*:\([0-9][0-9]*\)".*/\1/p' /etc/modemd/config.toml 2>/dev/null | head -1)
+case "$_port" in ''|*[!0-9]*) _port=9527 ;; esac
+
+echo "modem-pro 已安装（modemd + 拨号器 + LuCI）："
+echo "  服务：  /etc/init.d/modemd status | start | stop | restart"
+echo "  配置：  /etc/modemd/config.toml（改完 restart 生效）"
+echo "  页面：  http://<路由器地址>:$_port/   或 LuCI 菜单「5G终端」"
+echo "  日志：  logread -e modemd   （或 /var/log/modemd.log）"
+echo ""
+echo "模组接口 prot=modem_pro 承载 IPv4(DHCP)+IPv6(SLAAC/DHCPv6)，拨号器按厂商选择："
+echo "  Quectel → /usr/lib/modemd/quectel-CM    Fibocom → /usr/lib/modemd/fibocom-dial"
+echo "  Meig    → /usr/lib/modemd/meig-cm       SIMCom  → /usr/lib/modemd/simcom-cm"
+echo "  四家 QMI 初始化序列不同，不能互相顶替。"
+exit 0

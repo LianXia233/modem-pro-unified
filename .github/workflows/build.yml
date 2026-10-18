@@ -1,0 +1,252 @@
+# 云编译 modem-pro（OpenWrt 官方 SDK）
+#
+# 产物两档，同一架构（armsr/armv8 → 包架构 aarch64_generic，Cortex-A53 及以上通用）：
+#   · 主线 APK   —— OpenWrt snapshots（25.x，apk 包管理器）
+#   · 24.10 IPK  —— OpenWrt 最新 24.10.x（opkg 包管理器）
+#
+# 触发：
+#   · 推送 v* 标签 → 编译 + 自动创建/更新同名 Release 并上传产物
+#   · 手动 workflow_dispatch → 只编译（产物存 artifact）
+#
+# 流程细分：每个阶段一个 step（依赖 → SDK → feeds → stub → 配置 → 缓存 → 编译 → 收集），
+# 编译用 V=s 输出细粒度日志，失败可直接定位到具体命令。
+#
+# 维护提示：
+#   · rust host 工具链（feeds/packages lang/rust）是源码编译，首跑约 1~2 小时；
+#     缓存 key 绑定 workflow 文件哈希，feeds 升级导致 rustc 版本变化时缓存自然失效重建；
+#   · SDK 不带 base 包源码，DEPENDS 里的 +odhcp6c 用本地 stub feed 满足（见 ci-stub），
+#     真机上的 odhcp6c 由固件自带，stub 包不会被发布。
+
+name: 云编译 modem-pro（OpenWrt SDK）
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # 通用 ARM64：包架构 aarch64_generic（A53/A55/A72 等 64 位设备通用，
+  # 无内核模块依赖，任何 aarch64 固件可装）
+  TARGET: armsr/armv8
+  PKG: modem-pro
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: apk-mainline
+            name: 主线 APK（snapshots · aarch64）
+            kind: apk
+          - id: ipk-24.10
+            name: 24.10 IPK（opkg · aarch64）
+            kind: ipk
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v7
+
+      - name: 版本号（单一来源 VERSION）
+        id: ver
+        run: |
+          V=$(cat VERSION)
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "modem-pro 版本：$V"
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk gcc gettext git \
+            libncurses-dev libssl-dev rsync unzip zlib1g-dev file wget curl \
+            zstd xz-utils \
+            python3 python3-setuptools swig patch pkg-config \
+            ca-certificates tar perl bash
+          # 清掉 apt 缓存给 rust host 编译腾磁盘（rustc 源码编译峰值 ~20GB）
+          sudo rm -rf /var/lib/apt/lists/* /usr/local/lib/android /opt/ghc
+
+      - name: 生成 odhcp6c stub（满足 SDK 构建依赖，不发布）
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.ci-stub/odhcp6c-stub"
+          cat > "$GITHUB_WORKSPACE/.ci-stub/odhcp6c-stub/Makefile" <<'EOF'
+          include $(TOPDIR)/rules.mk
+          PKG_NAME:=odhcp6c
+          PKG_VERSION:=stub
+          PKG_MAINTAINER:=CI
+          PKG_LICENSE:=GPL-2.0-only
+          define Package/odhcp6c
+            SECTION:=net
+            CATEGORY:=Network
+            TITLE:=odhcp6c (build stub, provided by firmware)
+          endef
+          define Build/Compile
+          endef
+          define Package/odhcp6c/install
+          endef
+          $(eval $(call BuildPackage,odhcp6c))
+          EOF
+          echo "stub 已生成：.ci-stub/odhcp6c-stub"
+
+      - name: 下载官方 SDK
+        id: sdk
+        run: |
+          if [ "${{ matrix.kind }}" = apk ]; then
+            BASE="https://downloads.openwrt.org/snapshots/targets/${TARGET}"
+          else
+            REL=$(curl -fsSL https://downloads.openwrt.org/releases/ \
+              | grep -oE '24\.10\.[0-9]+' | sort -uV | tail -1)
+            [ -n "$REL" ] || { echo "解析不到 24.10.x 版本号"; exit 1; }
+            echo "选用 24.10.x：$REL"
+            BASE="https://downloads.openwrt.org/releases/$REL/targets/${TARGET}"
+          fi
+          SDK=$(curl -fsSL "$BASE/" \
+            | grep -oE 'openwrt-sdk-[^"<> ]+\.tar\.(xz|zst)' | sort -u | head -1)
+          [ -n "$SDK" ] || { echo "在 $BASE 找不到 SDK 压缩包"; exit 1; }
+          echo "SDK：$SDK"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          mkdir -p sdk
+          # 主线与 24.10.8+ 的 SDK 都是 zstd 压缩（早期是 xz，按后缀兼容）
+          case "$SDK" in
+            *.tar.zst) curl -fsSL "$BASE/$SDK" | tar --zstd -x --strip-components=1 -C sdk ;;
+            *)         curl -fsSL "$BASE/$SDK" | tar -xJ    --strip-components=1 -C sdk ;;
+          esac
+
+      - name: 恢复缓存（下载缓存 + rust host 工具链）
+        uses: actions/cache@v6
+        with:
+          path: |
+            sdk/dl
+            sdk/staging_dir/host
+            sdk/staging_dir/hostpkg
+          key: sdk-${{ matrix.id }}-v1
+          restore-keys: sdk-${{ matrix.id }}-
+
+      - name: 更新并安装 feeds
+        working-directory: sdk
+        run: |
+          # feed 名只允许 [A-Za-z0-9_]（scripts/feeds 解析用 (\w+)，不含连字符），
+          # 故用 modem_pro / ci_stub，包名 modem-pro / odhcp6c 保持不变。
+          # 用最小 feed 包装目录只暴露 modem-pro 包本身，避免 src-link 直接指向仓库根时
+          # 扫到 sdk/（OpenWrt SDK 自带数百个包 Makefile）、.git/、docs/ 造成元数据污染/同名冲突。
+          # 关键根因：OpenWrt 要求包 Makefile 必须位于 feed 的【子目录】下（feed_dir/<pkg>/Makefile），
+          # 不能放在 feed 根。否则 scripts/feeds 扫描（scan.mk 的 `find | grep | sed` 截断逻辑）
+          # 会把 `call BuildPackage` 的 grep 输出（含 `Makefile:$(eval ...)`）误当成包路径，
+          # 导致 .files-packageinfo.mk 报 "target pattern contains no '%'"，install 也找不到包
+          # （WARNING: No feed for package 'modem-pro' found）。
+          # 故把包整体复制到 $FEED_DIR/modem-pro/ 子目录（Makefile 随之进入子目录，相对引用不变）。
+          # 真实复制（禁止 symlink）：symlink 同样会触发上述扫描 bug。
+          FEED_DIR="$GITHUB_WORKSPACE/.ci-feed/modem-pro"
+          PKG_DIR="$FEED_DIR/modem-pro"
+          rm -rf "$GITHUB_WORKSPACE/.ci-feed"
+          mkdir -p "$PKG_DIR"
+          for item in Makefile rust third_party luci files packaging VERSION; do
+            [ -e "$GITHUB_WORKSPACE/$item" ] && cp -r "$GITHUB_WORKSPACE/$item" "$PKG_DIR/$item"
+          done
+          # 清掉可能混入的 Rust/内核模块构建产物 target/（体积爆炸 + 平台残留会污染 feed 索引）
+          find "$PKG_DIR" -name target -type d -prune -exec rm -rf {} + 2>/dev/null
+          echo "src-link modem_pro $FEED_DIR" >> feeds.conf.default
+          echo "src-link ci_stub $GITHUB_WORKSPACE/.ci-stub" >> feeds.conf.default
+          ./scripts/feeds update -a
+          # 精确安装所需包（不 install -a，避免把 third_party/kmods 内核模块也拉进 feeds）
+          ./scripts/feeds install -p packages rust
+          ./scripts/feeds install -p luci luci-base
+          ./scripts/feeds install -p ci_stub odhcp6c
+          ./scripts/feeds install -p modem_pro modem-pro
+
+      - name: 生成配置（选包 + 四家拨号器全开）
+        working-directory: sdk
+        run: |
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_modem-pro=y
+          CONFIG_MODEM_PRO_QUECTEL=y
+          CONFIG_MODEM_PRO_FIBOCOM=y
+          CONFIG_MODEM_PRO_MEIG=y
+          CONFIG_MODEM_PRO_SIMCOM=y
+          EOF
+          make defconfig
+          echo "── 配置核对 ──"
+          grep -E "^CONFIG_PACKAGE_modem-pro=|^CONFIG_MODEM_PRO_" .config
+          grep -qE "^CONFIG_PACKAGE_modem-pro=(y|m)" .config || { echo "defconfig 后 modem-pro 未被选中，依赖可能未满足"; exit 1; }
+
+      - name: 编译 modem-pro（V=s 细粒度日志）
+        working-directory: sdk
+        run: |
+          set -o pipefail
+          make package/modem-pro/compile V=s -j"$(nproc)" 2>&1 | tee build.log
+
+      - name: 收集产物 + 校验和
+        working-directory: sdk
+        run: |
+          mkdir -p output
+          find bin/packages -type f \( -name "${PKG}-*.apk" -o -name "${PKG}_*.ipk" \) \
+            -exec cp -v {} output/ \;
+          ls -lh output/
+          if [ -z "$(ls -A output 2>/dev/null)" ]; then
+            echo "没有产物：bin/packages 里找不到 modem-pro 包"
+            exit 1
+          fi
+          (cd output && sha256sum * > SHA256SUMS.txt)
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.id }}
+          path: sdk/output/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: 发布 Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: 汇总全部产物
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: modem-pro ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: dist/*
+          body: |
+            modem-pro ${{ github.ref_name }}（OpenWrt 官方 SDK 云编译）
+
+            ## 产物说明
+
+            | 文件 | 适用于 |
+            | --- | --- |
+            | `modem-pro-*.apk` | OpenWrt 主线 / snapshots（25.x，apk 包管理器） |
+            | `modem-pro_*.ipk` | OpenWrt 24.10.x（opkg 包管理器） |
+
+            两者均为 **aarch64_generic**（Cortex-A53 及以上 64 位通用，无内核模块依赖），
+            内含 modemd 守护进程、四家厂商拨号器、netifd 协议脚本与 LuCI 前端（菜单已汉化）。
+
+            ## 安装
+
+            ```sh
+            # OpenWrt 25.x（apk）
+            apk add --allow-untrusted /tmp/modem-pro-*.apk
+
+            # OpenWrt 24.10（opkg）
+            opkg install /tmp/modem-pro_*.ipk
+            ```
+
+            完整安装验证清单见仓库 [docs/BUILD.md](../../blob/main/docs/BUILD.md)。

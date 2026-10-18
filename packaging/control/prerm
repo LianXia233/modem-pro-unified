@@ -1,0 +1,10 @@
+#!/bin/sh
+# modem-pro 卸载前（prerm）。IPKG_INSTROOT 非空 = 离线 rootfs，跳过。
+[ -n "$IPKG_INSTROOT" ] && exit 0
+
+/etc/init.d/modemd stop 2>/dev/null
+/etc/init.d/modemd disable 2>/dev/null
+
+rm -f /tmp/luci-indexcache /tmp/luci-indexcache.* 2>/dev/null
+rm -rf /tmp/luci-modulecache 2>/dev/null
+exit 0

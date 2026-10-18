@@ -1,0 +1,44 @@
+{
+	"admin/modemd": {
+		"title": "5G 终端",
+		"order": 26,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-modemd" ]
+		}
+	},
+	"admin/modemd/overview": {
+		"title": "设备中心",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "modemd/overview"
+		},
+		"depends": {
+			"acl": [ "luci-app-modemd" ]
+		}
+	},
+	"admin/modemd/service": {
+		"title": "服务控制",
+		"order": 2,
+		"action": {
+			"type": "view",
+			"path": "modemd/service"
+		},
+		"depends": {
+			"acl": [ "luci-app-modemd" ]
+		}
+	},
+	"admin/modemd_auth/session": {
+		"action": {
+			"type": "function",
+			"module": "luci.controller.modemd_auth",
+			"function": "action_session"
+		},
+		"auth": {
+			"methods": [ "cookie:sysauth_https", "cookie:sysauth_http" ]
+		}
+	}
+}
