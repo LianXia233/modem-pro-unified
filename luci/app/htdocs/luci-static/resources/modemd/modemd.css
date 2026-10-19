@@ -747,3 +747,60 @@
 #traffic-chart {
 	min-height: 120px;
 }
+
+/* ---- 实时速率卡片的「左表盘 + 右曲线」布局 ----
+   左列两个瞬时指标上下排，右列曲线占满两行，累计量单独一行。
+   窄屏塌成单列（曲线在表盘下面），避免把两块都挤扁。 */
+.mp-traffic-layout {
+	display: grid;
+	grid-template-columns: minmax(0, 4.5fr) minmax(0, 9fr);
+	gap: 14px;
+	align-items: stretch;
+}
+.mp-traffic-meters {
+	display: grid;
+	grid-template-rows: 1fr 1fr;
+	gap: 14px;
+	min-width: 0;
+}
+/* grid item 默认 min-width:auto，SVG 会把整列撑破 —— 必须显式归零 */
+.mp-traffic-chart {
+	min-width: 0;
+	min-height: 150px;
+	display: flex;
+	align-items: center;
+}
+.mp-traffic-chart > svg { width: 100%; height: auto; }
+.mp-traffic-totals {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: 14px;
+	margin-top: 14px;
+}
+@media (max-width: 720px) {
+	.mp-traffic-layout { grid-template-columns: 1fr; }
+	.mp-traffic-meters { grid-template-rows: auto auto; }
+	.mp-traffic-totals { grid-template-columns: 1fr; }
+}
+
+/* ---- 表格滚动容器（cells 页的 8 列小区表）----
+   横向：min-width 保证列不被压扁（8 列挤成一条读不出来）；
+   纵向：限高 + 表头 sticky，邻区几十个也不会把整页拉得很长。 */
+.mp-table-scroll {
+	max-width: 100%;
+	max-height: 560px;
+	overflow: auto;
+	border-radius: var(--mp-radius-sm, 6px);
+	-webkit-overflow-scrolling: touch;
+}
+.mp-table-scroll .mp-table {
+	min-width: 760px;
+	margin-top: 0;
+}
+.mp-table-scroll thead th {
+	position: sticky;
+	top: 0;
+	z-index: 1;
+	background: var(--mp-surface, #fff);
+	box-shadow: inset 0 -1px 0 var(--mp-border-glass);
+}

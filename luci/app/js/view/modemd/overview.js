@@ -278,7 +278,12 @@ return view.extend({
 				E('div', { 'id': 'net-raw-box', 'style': 'margin-top:12px' }, [])
 			]),
 
-			/* 6. 实时流量与速率卡片 (Real-time Traffic) */
+			/* 6. 实时速率与流量 + 实时速率曲线（**一张卡片**）
+			 *
+			 * 早先是两张独立的卡：上面四个指标、下面一张曲线。
+			 * 它们读的是同一个 `/api/traffic`（后端 1 秒一拍），拆开摆着
+			 * 反而让人以为是两份不同的数据，也白占一屏高度。合并后：
+			 * 指标 → 曲线 → 说明，从上到下是同一条链路的同一份数字。 */
 			E('div', { 'class': 'mp-card' }, [
 				E('div', { 'class': 'mp-card-hd' }, [
 					E('h3', { 'class': 'mp-card-title' }, [
@@ -286,6 +291,15 @@ return view.extend({
 						'实时速率与流量'
 					]),
 					E('div', { 'class': 'mp-card-actions' }, [
+						E('span', { 'class': 'mp-legend-item' }, [
+							E('span', { 'class': 'mp-legend-dot', 'style': 'background:#f59e0b' }),
+							'上行'
+						]),
+						E('span', { 'class': 'mp-legend-item' }, [
+							E('span', { 'class': 'mp-legend-dot', 'style': 'background:#3b82f6' }),
+							'下行'
+						]),
+						E('span', { 'id': 'traffic-iface', 'class': 'mp-badge' }, '接口识别中…'),
 						E('button', {
 							'class': 'mp-btn mp-btn-ghost mp-btn-sm',
 							'title': '清零模组累计流量计数器（AT+QGDCNT=0）',
@@ -302,35 +316,30 @@ return view.extend({
 						}, '累计清零')
 					])
 				]),
-				E('div', { 'id': 'traffic-grid', 'class': 'mp-grid-4' }, [
-					metricBox('上行速率', '0', 'bps', '实时发送速率', icons.arrowUp(16)),
-					metricBox('下行速率', '0', 'bps', '实时接收速率', icons.arrowDown(16)),
-					metricBox('本次累计上传', '0 B', '', '已发数据量'),
-					metricBox('本次累计下载', '0 B', '', '已收数据量')
-				])
-			]),
-
-			/* 6b. 实时速率曲线（最近 60 秒，后端 1 秒一拍的环形缓冲） */
-			E('div', { 'class': 'mp-card' }, [
-				E('div', { 'class': 'mp-card-hd' }, [
-					E('h3', { 'class': 'mp-card-title' }, [ icons.get('pulse', 17), '实时速率曲线' ]),
-					E('div', { 'class': 'mp-card-actions' }, [
-						E('span', { 'class': 'mp-legend-item' }, [
-							E('span', { 'class': 'mp-legend-dot', 'style': 'background:#f59e0b' }),
-							'上行'
-						]),
-						E('span', { 'class': 'mp-legend-item' }, [
-							E('span', { 'class': 'mp-legend-dot', 'style': 'background:#3b82f6' }),
-							'下行'
-						]),
-						E('span', { 'id': 'traffic-iface', 'class': 'mp-badge' }, '接口识别中…')
+				/* 布局：左列上下两个「瞬时」指标，右列曲线占满两行；累计量单独一行。
+				 *
+				 *   [上行速率] [        曲线        ]
+				 *   [下行速率] [        曲线        ]
+				 *   [累计上传] [    累计下载        ]
+				 *
+				 * 这样「此刻多快」和「曲线怎么走」在同一视线高度上，
+				 * 不用上下扫；累计量是「换了多少」的汇总，放最后一排。
+				 * 窄屏（<720px）自动塌成单列，见 modemd.css 的 .mp-traffic-layout。 */
+				E('div', { 'class': 'mp-traffic-layout' }, [
+					E('div', { 'class': 'mp-traffic-meters' }, [
+						metricBox('上行速率', '0', 'bps', '实时发送速率', icons.arrowUp(16)),
+						metricBox('下行速率', '0', 'bps', '实时接收速率', icons.arrowDown(16))
+					]),
+					E('div', { 'id': 'traffic-chart', 'class': 'mp-traffic-chart' }, [
+						E('div', { 'style': 'padding:28px 0;text-align:center;color:var(--mp-neutral-500);font-size:12.5px' }, '等待采样…')
 					])
 				]),
-				E('div', { 'id': 'traffic-chart', 'style': 'width:100%' }, [
-					E('div', { 'style': 'padding:28px 0;text-align:center;color:var(--mp-neutral-500);font-size:12.5px' }, '等待采样…')
+				E('div', { 'id': 'traffic-grid-total', 'class': 'mp-traffic-totals' }, [
+					metricBox('本次累计上传', '0 B', '', '已发数据量'),
+					metricBox('本次累计下载', '0 B', '', '已收数据量')
 				]),
-				E('div', { 'style': 'margin-top:6px;font-size:11.5px;color:var(--mp-neutral-500)' },
-					'数据来自本机网卡计数（后台每 1 秒采样，与页面是否打开无关）；曲线保留最近 60 秒。')
+				E('div', { 'style': 'margin-top:8px;font-size:11.5px;color:var(--mp-neutral-500)' },
+					'数据来自本机网卡计数（后台每 1 秒采样，与页面是否打开无关）；曲线保留最近 60 秒，与上面的四个数字同源。')
 			]),
 
 			/* 7. 双列布局：SIM 卡信息 + 模组硬件 */
@@ -625,13 +634,19 @@ return view.extend({
 
 		/* 实时流量与速率 */
 		var tr = net.traffic || {};
-		var trafGrid = document.getElementById('traffic-grid');
-		if (trafGrid) {
-			trafGrid.innerHTML = '';
-			trafGrid.appendChild(metricBox('实时上行', tr.up_text || fmt.bpsRate(tr.up_bps), '', '瞬时发送速率', icons.arrowUp(16)));
-			trafGrid.appendChild(metricBox('实时下行', tr.down_text || fmt.bpsRate(tr.down_bps), '', '瞬时接收速率', icons.arrowDown(16)));
-			trafGrid.appendChild(metricBox('累计已发送', fmt.bytes(tr.sent), '', '会话发送总量'));
-			trafGrid.appendChild(metricBox('累计已接收', fmt.bytes(tr.recv), '', '会话接收总量'));
+		/* 瞬时指标进左列表盘，累计量进下面一行 —— 两个容器分开更新，
+		   否则 4 个格子会全塞进累计容器、把新布局撑乱。 */
+		var meters = document.querySelector('.mp-traffic-meters');
+		if (meters) {
+			meters.innerHTML = '';
+			meters.appendChild(metricBox('上行速率', tr.up_text || fmt.bpsRate(tr.up_bps), 'bps', '瞬时发送速率', icons.arrowUp(16)));
+			meters.appendChild(metricBox('下行速率', tr.down_text || fmt.bpsRate(tr.down_bps), 'bps', '瞬时接收速率', icons.arrowDown(16)));
+		}
+		var trafTotal = document.getElementById('traffic-grid-total');
+		if (trafTotal) {
+			trafTotal.innerHTML = '';
+			trafTotal.appendChild(metricBox('本次累计上传', fmt.bytes(tr.sent), '', '已发数据量'));
+			trafTotal.appendChild(metricBox('本次累计下载', fmt.bytes(tr.recv), '', '已收数据量'));
 		}
 
 		/* 实时速率曲线：/api/traffic 的 history（后端 1 秒一拍、保留 60 个点）。

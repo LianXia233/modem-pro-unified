@@ -30,6 +30,17 @@ function rowKv(k, v, extra) {
 	]);
 }
 
+/* 秒数 → 人读时长。负数 / 缺省一律 `-`，0 秒显示「刚刚」。 */
+function durText(sec) {
+	if (sec == null || sec < 0) return '-';
+	if (sec < 5) return '刚刚';
+	if (sec < 60) return sec + ' 秒';
+	if (sec < 3600) return Math.floor(sec / 60) + ' 分 ' + (sec % 60) + ' 秒';
+	var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60);
+	if (h < 24) return h + ' 小时 ' + m + ' 分';
+	return Math.floor(h / 24) + ' 天 ' + (h % 24) + ' 小时';
+}
+
 return view.extend({
 	load: function () {
 		fmt.ensureCss();
@@ -312,7 +323,14 @@ return view.extend({
 					rowKv('IPv4 本机地址', st.ipv4 || '未分配'),
 					rowKv('IPv6 本机地址', st.ipv6 || '未分配'),
 					rowKv('已分配 CID', st.cid != null ? String(st.cid) : '-'),
-					rowKv('在线持续时长', st.elapsed_sec ? (Math.floor(st.elapsed_sec / 3600) + '小时 ' + Math.floor((st.elapsed_sec % 3600) / 60) + '分') : '-')
+					/* 在线时长：
+					   · 本程序自己拨的号 → 用 connected_at 算的真实会话时长；
+					   · netifd 按 UCI 拉起的链路 → 没有 connected_at，后端用
+					     「本程序第一次观察到它在线」起算，所以如实标成「观测」。
+					   早先 `elapsed_sec ? … : '-'` 在 0 秒时也会显示 `-`，
+					   刚连上那一刻看起来像「读不到」。 */
+					rowKv('在线持续时长', durText(st.elapsed_sec),
+						st.link_source === 'netifd' ? '（观测值）' : '')
 				]),
 				st.steps && st.steps.length ? E('div', { 'style': 'margin-top:14px;padding-top:10px;border-top:1px solid var(--mp-border-glass-subtle)' }, [
 					E('div', { 'style': 'font-size:12.5px;font-weight:600;color:var(--mp-neutral-700);margin-bottom:6px' }, '拨号流程步骤记录:'),

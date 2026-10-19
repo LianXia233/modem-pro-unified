@@ -1671,7 +1671,26 @@ impl Modem {
             take(&|a| a.contains(':'), &mut st.ipv6);
         }
 
-        // ⑤ 驱动/通信类型（RNDIS / QMI / MBIM…）。
+        // ⑤ 在线时长。
+        //
+        //    netifd 拉起的链路没有 `connected_at`（本程序没拨过号），
+        //    页面「在线持续时长」就永远是 `-`。这里用「本程序第一次观察到
+        //    它在线」的时刻起算 —— 语义上要说清楚：这是**观测时长**，
+        //    不是运营商侧的真实会话时长（后者只有模组自己知道）。
+        if st.state == DIAL_CONNECTED {
+            let mut g = self.link_since.lock().unwrap_or_else(|e| e.into_inner());
+            let since = *g.get_or_insert_with(Instant::now);
+            // 只补「本来没有」的那种：本程序自己拨号时 connected_at 是有值的，
+            // 那套时长更准（含拨号耗时），不要被覆盖。
+            if st.connected_at.is_empty() && st.elapsed_sec <= 0 {
+                st.elapsed_sec = since.elapsed().as_secs() as i64;
+            }
+        } else {
+            // 断开就清基线：下次连上重新起算，避免把断线期间也算进去
+            *self.link_since.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+
+        // ⑥ 驱动/通信类型（RNDIS / QMI / MBIM…）。
         //
         //    同样只有「本程序自己拨号」时才填过，netifd 拉起的链路是空的。
         //    走 `usb_type(false)`：命中 30 秒缓存就立即返回，未命中才探测一次

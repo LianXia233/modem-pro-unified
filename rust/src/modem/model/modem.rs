@@ -83,6 +83,12 @@ pub struct Modem {
     pub(super) rate_total: Mutex<Option<RateTotal>>,
     /// 正在进行的主动扫网的取消标志（见 model/netscan.rs）
     pub(super) netscan_stop: Mutex<Option<Arc<AtomicBool>>>,
+    /// 「本程序第一次观察到链路在线」的时刻（见 model/dial.rs）。
+    ///
+    /// 只给 netifd 拉起的链路用：那种情况 `dial_state.connected_at` 是空的
+    /// （本程序没拨过号），于是页面「在线持续时长」永远是 `-`。
+    /// 用观测起点算时长，并在输出里标明这是「本程序观测到的」，不是运营商侧的真实时长。
+    pub(super) link_since: Mutex<Option<Instant>>,
     /// 拨号状态机（见 model/dial.rs；零值 = 没拨过号）
     pub(super) dial_state: Mutex<DialState>,
     /// 拨号流程进行中（拨号要连发几条 AT，不允许并发）
@@ -152,6 +158,7 @@ impl Modem {
             traffic_prev: Mutex::new(None),
             rate_total: Mutex::new(None),
             netscan_stop: Mutex::new(None),
+            link_since: Mutex::new(None),
             dial_state: Mutex::new(DialState::default()),
             dial_busy: AtomicBool::new(false),
             dial_type: Mutex::new(None),

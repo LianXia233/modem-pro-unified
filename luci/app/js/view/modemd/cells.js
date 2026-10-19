@@ -49,6 +49,10 @@ function cellCard(title, cells, isServing) {
 				title + ' (' + (cells ? cells.length : 0) + ' 个)'
 			])
 		]),
+		/* 套一层滚动容器：8 列在窄屏必然超宽，小区多时又很长。
+		   · 横向：min-width 保证列不被压扁，超出就横向滚；
+		   · 纵向：max-height + 表头 sticky，几十个邻区也不会把整页撑长。 */
+		E('div', { 'class': 'mp-table-scroll' }, [
 		E('table', { 'class': 'mp-table' }, [
 			E('thead', {}, [
 				E('tr', {}, [
@@ -63,6 +67,7 @@ function cellCard(title, cells, isServing) {
 				])
 			]),
 			E('tbody', {}, rows)
+		])
 		])
 	]);
 }

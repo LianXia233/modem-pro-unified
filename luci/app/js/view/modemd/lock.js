@@ -97,16 +97,16 @@ return view.extend({
 
 			/* 2. 子页签导航 */
 			E('div', { 'class': 'mp-subtabs' }, [
-				E('button', { 'class': 'mp-subtab-btn active', 'data-tab': 'status', 'click': function (e) { self.switchTab('status', e.target); } }, [
+				E('button', { 'class': 'mp-subtab-btn active', 'data-tab': 'status' }, [
 					E('span', { 'innerHTML': icons.pulse(15) }), ' 锁网状态'
 				]),
-				E('button', { 'class': 'mp-subtab-btn', 'data-tab': 'band', 'click': function (e) { self.switchTab('band', e.target); } }, [
+				E('button', { 'class': 'mp-subtab-btn', 'data-tab': 'band' }, [
 					E('span', { 'innerHTML': icons.antenna(15) }), ' 锁频段'
 				]),
-				E('button', { 'class': 'mp-subtab-btn', 'data-tab': 'cell', 'click': function (e) { self.switchTab('cell', e.target); } }, [
+				E('button', { 'class': 'mp-subtab-btn', 'data-tab': 'cell' }, [
 					E('span', { 'innerHTML': icons.tower(15) }), ' 锁小区 (基站)'
 				]),
-				E('button', { 'class': 'mp-subtab-btn', 'data-tab': 'mode', 'click': function (e) { self.switchTab('mode', e.target); } }, [
+				E('button', { 'class': 'mp-subtab-btn', 'data-tab': 'mode' }, [
 					E('span', { 'innerHTML': icons.settings(15) }), ' 组网模式偏好'
 				])
 			]),
@@ -309,7 +309,26 @@ return view.extend({
 			])
 		]);
 
-		this.drawBands(lockSt);
+		/* ⚠️ 必须把 root 传进去，不能用 `document.getElementById`：
+		   render 返回的节点**此刻还没挂到 document 上**，全局查找一定拿到 null，
+		   drawBands 就静默 return 了 —— 表现为「锁频段」子页一片空白，
+		   连「未获取到频段分组信息」的提示都不出现（那条提示也在同一个函数里）。 */
+		this.drawBands(lockSt, root);
+
+		/* 子页签切换：**必须显式 addEventListener**。
+		 *
+		 * 原先写成 `E('button', { 'click': function (e) { … } })` ——
+		 * LuCI 的 `E()` 不会把裸函数绑成事件监听（它认的是 `ui.createHandlerFn`
+		 * 包过的处理器），于是四个标签点了全无反应，「锁频段」子页永远打不开，
+		 * 用户看到的就是「lock 页面没有频段选项」。
+		 * 顺带修掉 `e.target` 的老问题：点到的往往是内部的 `<span>` 图标，
+		 * `classList.add('active')` 加在 span 上不算数，标签也不高亮。 */
+		root.querySelectorAll('.mp-subtab-btn').forEach(function (btn) {
+			btn.addEventListener('click', function () {
+				self.switchTab(btn.dataset.tab, btn);
+			});
+		});
+
 		return root;
 	},
 
@@ -322,8 +341,10 @@ return view.extend({
 		if (target) target.style.display = 'block';
 	},
 
-	drawBands: function (st) {
-		var container = document.getElementById('band-groups-container');
+	/* `root` = render 返回的根节点。传了就只在它内部找（DOM 尚未挂载时也能用），
+	   没传才退回全局查找（刷新场景）。 */
+	drawBands: function (st, root) {
+		var container = (root || document).querySelector('#band-groups-container');
 		if (!container) return;
 		container.innerHTML = '';
 
