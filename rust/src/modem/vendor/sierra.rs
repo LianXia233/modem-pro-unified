@@ -69,10 +69,35 @@ impl VendorSpec for Spec {
         use crate::modem::atplan::{add_from_vendor, replace, AtCmdSpec};
         let mut v = crate::modem::atplan::base_specs(ctx);
 
-        add_from_vendor(&mut v, ctx, "usbnet", "USB 网卡模式", "usbcomp", "model::usbnet", "AT!USBCOMP 组合");
-        add_from_vendor(&mut v, ctx, "iccid", "ICCID", "uims", "model::siminfo::parse_iccid", "AT!UIMS?");
-        replace(&mut v, AtCmdSpec::on(
-            "lock_band", "锁频段", "AT!BAND?", "model::lock::parse_sierra_band", "band 索引", "厂商指令集"));
+        add_from_vendor(
+            &mut v,
+            ctx,
+            "usbnet",
+            "USB 网卡模式",
+            "usbcomp",
+            "model::usbnet",
+            "AT!USBCOMP 组合",
+        );
+        add_from_vendor(
+            &mut v,
+            ctx,
+            "iccid",
+            "ICCID",
+            "uims",
+            "model::siminfo::parse_iccid",
+            "AT!UIMS?",
+        );
+        replace(
+            &mut v,
+            AtCmdSpec::on(
+                "lock_band",
+                "锁频段",
+                "AT!BAND?",
+                "model::lock::parse_sierra_band",
+                "band 索引",
+                "厂商指令集",
+            ),
+        );
 
         v
     }

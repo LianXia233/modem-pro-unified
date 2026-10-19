@@ -192,12 +192,7 @@ impl QmiLink {
         let frame = qmi::wda_set_data_format(tid, client, settings);
         let deadline = Instant::now() + CTL_TIMEOUT;
         self.write_frame(&frame, deadline)?;
-        let payload = self.read_response(
-            qmi::SVC_WDA,
-            qmi::WDA_SET_DATA_FORMAT,
-            tid,
-            deadline,
-        )?;
+        let payload = self.read_response(qmi::SVC_WDA, qmi::WDA_SET_DATA_FORMAT, tid, deadline)?;
         qmi::result(&payload)
             .map_err(|(r, e)| format!("Set Data Format 失败 result={r} error={e}"))?;
         // 设备会回它实际接受的聚合窗口；拿它覆盖请求值（与驱动 rx_urb_size 对齐）
@@ -616,8 +611,8 @@ mod tests {
         assert!(wda_pos < bind_pos, "先设数据格式再绑 mux");
         assert!(bind_pos < start_pos, "绑 mux 必须早于 Start");
         assert!(
-            seen.iter().any(|(s, m, _, _)| *s == qmi::SVC_WDS_IPV6
-                && *m == qmi::WDS_BIND_MUX_DATA_PORT),
+            seen.iter()
+                .any(|(s, m, _, _)| *s == qmi::SVC_WDS_IPV6 && *m == qmi::WDS_BIND_MUX_DATA_PORT),
             "v6 client 也要绑 mux"
         );
         // 用的是设备分配的 WDA client id（3），而不是 WDS 的 1

@@ -130,7 +130,12 @@ mod tests {
         // 但 MBIM 是协议标准，原生后端对任何厂商都实现，不能因此拒绝
         assert_eq!(select(Vendor::Fibocom).links[0], DataLink::Qmi);
         assert_eq!(select(Vendor::Simcom).links[0], DataLink::Qmi);
-        for v in [Vendor::Fibocom, Vendor::Simcom, Vendor::TDTech, Vendor::Unknown] {
+        for v in [
+            Vendor::Fibocom,
+            Vendor::Simcom,
+            Vendor::TDTech,
+            Vendor::Unknown,
+        ] {
             assert!(
                 supports(v, DataLink::Mbim),
                 "{v:?} 的 MBIM 不该被厂商策略挡住（原生实现与厂商无关）"

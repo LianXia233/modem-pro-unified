@@ -111,20 +111,84 @@ impl VendorSpec for Spec {
         use crate::modem::atplan::{add_from_vendor, replace, AtCmdSpec};
         let mut v = crate::modem::atplan::base_specs(ctx);
 
-        add_from_vendor(&mut v, ctx, "neighbour", "邻区", "neighbour", "model::cells::parse_neighbour", "QENG 邻区列表");
-        add_from_vendor(&mut v, ctx, "ca", "载波聚合 CA", "qcainfo", "model::cells::parse_ca", "分量载波列表");
-        replace(&mut v, AtCmdSpec::on("iccid", "ICCID", "AT+QCCID", "model::siminfo::parse_iccid", "+QCCID: 裸数字", "厂商指令集"));
-        replace(&mut v, AtCmdSpec::on(
-            "ambr", "签约速率 AMBR", "AT+QNWCFG=\"nr5g_ambr\"", "model::network::parse_ambr", "AMBR + CQI", "厂商指令集"));
-        replace(&mut v, AtCmdSpec::on(
-            "imei_set", "IMEI 改写", "AT+EGMR=1,7,\"<15 位>\"", "model::imei::write", "高通通用，需重启", "厂商手册"));
-        replace(&mut v, if ctx.legacy_lte {
-            AtCmdSpec::on("lock_band", "锁频段", "AT+QCFG=\"band\",0,<hex 位图>,0", "model::lock::parse_qcfg_band", "lte 旧款位图", "厂商指令集")
-        } else {
-            let mut s = AtCmdSpec::on("lock_band", "锁频段", "AT+QNWPREFCFG=\"lte_band\"", "model::lock::parse_qnwpref", "LTE / NR5G 频段列表", "厂商指令集");
-            s.candidates = vec!["AT+QNWPREFCFG=\"lte_band\"".into(), "AT+QNWPREFCFG=\"nr5g_band\"".into()];
-            s
-        });
+        add_from_vendor(
+            &mut v,
+            ctx,
+            "neighbour",
+            "邻区",
+            "neighbour",
+            "model::cells::parse_neighbour",
+            "QENG 邻区列表",
+        );
+        add_from_vendor(
+            &mut v,
+            ctx,
+            "ca",
+            "载波聚合 CA",
+            "qcainfo",
+            "model::cells::parse_ca",
+            "分量载波列表",
+        );
+        replace(
+            &mut v,
+            AtCmdSpec::on(
+                "iccid",
+                "ICCID",
+                "AT+QCCID",
+                "model::siminfo::parse_iccid",
+                "+QCCID: 裸数字",
+                "厂商指令集",
+            ),
+        );
+        replace(
+            &mut v,
+            AtCmdSpec::on(
+                "ambr",
+                "签约速率 AMBR",
+                "AT+QNWCFG=\"nr5g_ambr\"",
+                "model::network::parse_ambr",
+                "AMBR + CQI",
+                "厂商指令集",
+            ),
+        );
+        replace(
+            &mut v,
+            AtCmdSpec::on(
+                "imei_set",
+                "IMEI 改写",
+                "AT+EGMR=1,7,\"<15 位>\"",
+                "model::imei::write",
+                "高通通用，需重启",
+                "厂商手册",
+            ),
+        );
+        replace(
+            &mut v,
+            if ctx.legacy_lte {
+                AtCmdSpec::on(
+                    "lock_band",
+                    "锁频段",
+                    "AT+QCFG=\"band\",0,<hex 位图>,0",
+                    "model::lock::parse_qcfg_band",
+                    "lte 旧款位图",
+                    "厂商指令集",
+                )
+            } else {
+                let mut s = AtCmdSpec::on(
+                    "lock_band",
+                    "锁频段",
+                    "AT+QNWPREFCFG=\"lte_band\"",
+                    "model::lock::parse_qnwpref",
+                    "LTE / NR5G 频段列表",
+                    "厂商指令集",
+                );
+                s.candidates = vec![
+                    "AT+QNWPREFCFG=\"lte_band\"".into(),
+                    "AT+QNWPREFCFG=\"nr5g_band\"".into(),
+                ];
+                s
+            },
+        );
 
         v
     }

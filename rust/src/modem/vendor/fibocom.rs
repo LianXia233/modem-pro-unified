@@ -148,8 +148,24 @@ impl VendorSpec for Spec {
         use crate::modem::atplan::{add_from_vendor, replace, AtCmdSpec};
         let mut v = crate::modem::atplan::base_specs(ctx);
 
-        add_from_vendor(&mut v, ctx, "ca", "载波聚合 CA", "gtcainfo", "model::cells::parse_ca", "分量载波列表");
-        add_from_vendor(&mut v, ctx, "serving", "服务小区（GTCCINFO）", "gtccinfo", "model::cells::parse_serving", "厂商私有（MTK 平台）");
+        add_from_vendor(
+            &mut v,
+            ctx,
+            "ca",
+            "载波聚合 CA",
+            "gtcainfo",
+            "model::cells::parse_ca",
+            "分量载波列表",
+        );
+        add_from_vendor(
+            &mut v,
+            ctx,
+            "serving",
+            "服务小区（GTCCINFO）",
+            "gtccinfo",
+            "model::cells::parse_serving",
+            "厂商私有（MTK 平台）",
+        );
         let imei = if ctx.mtk {
             "AT+EGMREXT=1,7,\"<15 位>\""
         } else if ctx.legacy_lte {
@@ -157,10 +173,28 @@ impl VendorSpec for Spec {
         } else {
             "AT+GTSN=<15 位>"
         };
-        replace(&mut v, AtCmdSpec::on(
-            "imei_set", "IMEI 改写", imei, "model::imei::write", "同族只读 AT+EGMREXT=0,7 快照", "厂商指令集"));
-        replace(&mut v, AtCmdSpec::on(
-            "lock_band", "锁频段", "AT+QNWPREFCFG=\"lte_band\"", "model::lock::parse_qnwpref", "LTE / NR5G 频段列表", "厂商指令集"));
+        replace(
+            &mut v,
+            AtCmdSpec::on(
+                "imei_set",
+                "IMEI 改写",
+                imei,
+                "model::imei::write",
+                "同族只读 AT+EGMREXT=0,7 快照",
+                "厂商指令集",
+            ),
+        );
+        replace(
+            &mut v,
+            AtCmdSpec::on(
+                "lock_band",
+                "锁频段",
+                "AT+QNWPREFCFG=\"lte_band\"",
+                "model::lock::parse_qnwpref",
+                "LTE / NR5G 频段列表",
+                "厂商指令集",
+            ),
+        );
 
         v
     }

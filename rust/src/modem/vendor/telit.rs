@@ -79,9 +79,33 @@ impl VendorSpec for Spec {
         use crate::modem::atplan::add_from_vendor;
         let mut v = crate::modem::atplan::base_specs(ctx);
 
-        add_from_vendor(&mut v, ctx, "ca", "载波聚合 CA", "cainfoext", "model::cells::parse_ca", "#CAINFOEXT");
-        add_from_vendor(&mut v, ctx, "lock_band", "锁频段", "bnd", "model::lock::parse_telit_band", "AT#BND 枚举");
-        add_from_vendor(&mut v, ctx, "usbnet", "USB 网卡模式", "usbcfg", "model::usbnet", "AT#USBCFG");
+        add_from_vendor(
+            &mut v,
+            ctx,
+            "ca",
+            "载波聚合 CA",
+            "cainfoext",
+            "model::cells::parse_ca",
+            "#CAINFOEXT",
+        );
+        add_from_vendor(
+            &mut v,
+            ctx,
+            "lock_band",
+            "锁频段",
+            "bnd",
+            "model::lock::parse_telit_band",
+            "AT#BND 枚举",
+        );
+        add_from_vendor(
+            &mut v,
+            ctx,
+            "usbnet",
+            "USB 网卡模式",
+            "usbcfg",
+            "model::usbnet",
+            "AT#USBCFG",
+        );
 
         v
     }

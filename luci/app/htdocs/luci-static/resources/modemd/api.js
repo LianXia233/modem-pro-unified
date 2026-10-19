@@ -96,10 +96,20 @@ var Api = baseclass.extend({
 
 	/* GET /api/xxx?modem_id=0&...；params 会被 urlencode 进 path */
 	get: function (path, params) {
+		/* 注意：encodeURIComponent 不会编码 ! ' ( ) * 这五个字符，
+		   而 ucode 代理（modemd_api.uc 的 PATH_RE）只放行
+		   [A-Za-z0-9_/.,?=&%:+~-]，遇到它们会直接 400。
+		   目前所有 GET 参数都是数字或已知枚举，踩不到；这里补一层是为了
+		   以后新增带文本的查询参数时不再掉进同一个坑。 */
+		function enc(v) {
+			return encodeURIComponent(v).replace(/[!'()*]/g, function (c) {
+				return '%' + c.charCodeAt(0).toString(16).toUpperCase();
+			});
+		}
 		var q = [];
 		for (var k in (params || {})) {
 			if (params[k] != null)
-				q.push(encodeURIComponent(k) + '=' + encodeURIComponent(params[k]));
+				q.push(enc(k) + '=' + enc(params[k]));
 		}
 		return this.request(q.length ? path + '?' + q.join('&') : path, { method: 'GET' });
 	},

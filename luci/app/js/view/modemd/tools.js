@@ -57,7 +57,7 @@ return view.extend({
 			api.get('/api/usb').catch(function () { return {}; }),
 			api.get('/api/pcie').catch(function () { return {}; }),
 			api.get('/api/changes', { limit: 100 }).catch(function () { return { entries: [] }; }),
-			api.get('/api/logs', { lines: 100 }).catch(function () { return { log: '' }; })
+			api.get('/api/logs', { lines: 100 }).catch(function () { return { lines: [] }; })
 		]);
 	},
 
@@ -408,7 +408,9 @@ return view.extend({
 							'click': ui.createHandlerFn(self, function () {
 								api.post('/api/netscan/stop', { modem_id: id }).then(function () {
 									ui.addNotification(null, E('p', {}, '已向模组请求中断搜网'), 'info');
-								});
+								}).catch(function (e) {
+										ui.addNotification(null, E('p', {}, '操作失败: ' + (e.message || e)), 'error');
+								});;
 							})
 						}, '停止搜网')
 					]),
@@ -501,7 +503,9 @@ return view.extend({
 									api.post('/api/quota/reset', { modem_id: id }).then(function () {
 										ui.addNotification(null, E('p', {}, '本周期用量已清零'), 'info');
 										window.location.reload();
-									});
+									}).catch(function (e) {
+										ui.addNotification(null, E('p', {}, '操作失败: ' + (e.message || e)), 'error');
+								});;
 								})
 							}, '本周期用量清零'),
 							E('button', {
@@ -510,7 +514,9 @@ return view.extend({
 									api.post('/api/quota/unblock', { modem_id: id }).then(function () {
 										ui.addNotification(null, E('p', {}, '已解除本周期阻断'), 'info');
 										window.location.reload();
-									});
+									}).catch(function (e) {
+										ui.addNotification(null, E('p', {}, '操作失败: ' + (e.message || e)), 'error');
+								});;
 								})
 							}, '解除阻断')
 						])
@@ -600,12 +606,19 @@ return view.extend({
 									}
 									if (!confirm('请确认已知晓改写 IMEI 风险，确定将 IMEI 改写为 ' + newImei + ' 吗？')) return;
 									btn.disabled = true;
-									api.post('/api/imei/set', { modem_id: id, imei: newImei }).then(function () {
+									/* 改写 IMEI 要「备份 → 写入 → 回读确认」三个串口往返，
+									   同步 POST 会撞上 ucode 代理的 20 秒超时 —— 走异步任务。 */
+									task.run(api, 'imei.set', { modem_id: id, imei: newImei }, {
+										onTick: function (t) {
+											if (t && t.progress) btn.textContent = t.progress;
+										}
+									}).then(function () {
 										ui.addNotification(null, E('p', {}, 'IMEI 改写成功'), 'info');
 										window.location.reload();
 									}).catch(function (e) {
 										ui.addNotification(null, E('p', {}, '改写失败: ' + (e.message || e)), 'error');
 										btn.disabled = false;
+										btn.textContent = '写入新 IMEI';
 									});
 								})
 							}, '写入新 IMEI'),
@@ -615,7 +628,7 @@ return view.extend({
 								'click': ui.createHandlerFn(self, function (btn) {
 									if (!confirm('确定要恢复出厂原始备份的 IMEI 吗？')) return;
 									btn.disabled = true;
-									api.post('/api/imei/restore', { modem_id: id }).then(function () {
+									task.run(api, 'imei.restore', { modem_id: id }).then(function () {
 										ui.addNotification(null, E('p', {}, '原始 IMEI 已恢复'), 'info');
 										window.location.reload();
 									}).catch(function (e) {
@@ -668,7 +681,9 @@ return view.extend({
 											'click': ui.createHandlerFn(self, function () {
 												api.post('/api/schedule/run', { id: tsk.id }).then(function () {
 													ui.addNotification(null, E('p', {}, '任务动作已立即执行'), 'info');
-												});
+												}).catch(function (e) {
+										ui.addNotification(null, E('p', {}, '操作失败: ' + (e.message || e)), 'error');
+								});;
 											})
 										}, '立即执行'),
 										E('button', {
@@ -676,7 +691,9 @@ return view.extend({
 											'click': ui.createHandlerFn(self, function () {
 												api.post('/api/schedule/toggle', { id: tsk.id, enabled: !tsk.enabled }).then(function () {
 													window.location.reload();
-												});
+												}).catch(function (e) {
+										ui.addNotification(null, E('p', {}, '操作失败: ' + (e.message || e)), 'error');
+								});;
 											})
 										}, tsk.enabled ? '停用' : '启用'),
 										E('button', {
@@ -685,7 +702,9 @@ return view.extend({
 												if (!confirm('确定删除定时任务 ' + tsk.name + ' 吗？')) return;
 												api.post('/api/schedule/delete', { id: tsk.id }).then(function () {
 													window.location.reload();
-												});
+												}).catch(function (e) {
+										ui.addNotification(null, E('p', {}, '操作失败: ' + (e.message || e)), 'error');
+								});;
 											})
 										}, '删除')
 									])
@@ -711,14 +730,18 @@ return view.extend({
 								api.post('/api/usb/clear').then(function () {
 									ui.addNotification(null, E('p', {}, '热插拔事件已清空'), 'info');
 									window.location.reload();
-								});
+								}).catch(function (e) {
+										ui.addNotification(null, E('p', {}, '操作失败: ' + (e.message || e)), 'error');
+								});;
 							})
 						}, '清空事件')
 					]),
 					E('div', { 'style': 'margin-bottom:12px' }, [
 						E('div', { 'style': 'font-size:12.5px;font-weight:600;margin-bottom:6px' }, '已检测 USB 设备列表:'),
 						E('div', { 'class': 'mp-code-box', 'style': 'max-height:160px' },
-							(usbDev.devices && usbDev.devices.length) ? usbDev.devices.map(function(d){ return d.vid_pid + ' · ' + (d.product || d.vendor || 'USB设备') + ' · ' + (d.driver || '无驱动'); }).join('\n') : '暂无 USB 模组设备'
+							(usbDev.devices && usbDev.devices.length) ? usbDev.devices.map(function(d){ return (d.vid && d.pid ? d.vid + ':' + d.pid : (d.vid_pid || '未知设备'))
+									+ ' · ' + (d.product || d.vendor_cn || d.vendor || d.family || 'USB设备')
+									+ ' · ' + ((d.drivers && d.drivers.length) ? d.drivers.join(', ') : '无驱动'); }).join('\n') : '暂无 USB 模组设备'
 						)
 					])
 				]),
@@ -728,7 +751,11 @@ return view.extend({
 					]),
 					E('div', { 'class': 'mp-kv-grid' }, [
 						rowKv('PCIe 驱动支持', pcieDev.supported ? '支持' : '内核未提供或无需特殊驱动'),
-						rowKv('已检测设备', pcieDev.device ? (pcieDev.device.slot + ' ' + (pcieDev.device.vendor || '') + ' ' + (pcieDev.device.device || '')) : '无 PCIe 模组')
+						rowKv('已检测设备', (pcieDev.devices && pcieDev.devices.length)
+						? pcieDev.devices.map(function (d) {
+							return d.bdf + (d.pid ? ' [' + d.vid + ':' + d.pid + ']' : '') + (d.driver ? ' 驱动=' + d.driver : '');
+					}).join(' / ')
+					: '无 PCIe 模组')
 					]),
 					pcieDev.supported ? E('div', { 'style': 'margin-top:10px' }, [
 						E('button', {
@@ -736,7 +763,9 @@ return view.extend({
 							'click': ui.createHandlerFn(self, function (btn) {
 								if (!confirm('确定执行 PCIe 模组软复位 (remove & rescan) 吗？')) return;
 								btn.disabled = true;
-								api.post('/api/pcie/reset').then(function () {
+								api.post('/api/pcie/reset', {
+								bdf: (pcieDev.devices && pcieDev.devices[0]) ? pcieDev.devices[0].bdf : ''
+							}).then(function () {
 									ui.addNotification(null, E('p', {}, 'PCIe 模组已复位重扫'), 'info');
 									window.location.reload();
 								}).catch(function (e) {
@@ -777,11 +806,11 @@ return view.extend({
 						]),
 						E('tbody', {}, (changes.entries && changes.entries.length) ? changes.entries.map(function (ch) {
 							return E('tr', {}, [
-								E('td', { 'style': 'font-size:12px;color:var(--mp-neutral-500)' }, ch.time || '-'),
+								E('td', { 'style': 'font-size:12px;color:var(--mp-neutral-500)' }, ch.at || '-'),
 								E('td', { 'style': 'font-weight:600' }, ch.field || '-'),
-								E('td', {}, String(ch.old || '-')),
-								E('td', { 'style': 'font-weight:600' }, String(ch.val || '-')),
-								E('td', {}, ch.diff != null ? String(ch.diff) : '-')
+								E('td', {}, String(ch.from != null ? ch.from : '-')),
+								E('td', { 'style': 'font-weight:600' }, String(ch.to != null ? ch.to : '-')),
+								E('td', {}, ch.delta ? String(ch.delta) : '-')
 							]);
 						}) : [
 							E('tr', {}, [
@@ -804,7 +833,7 @@ return view.extend({
 									btn.disabled = true;
 									api.get('/api/logs', { lines: 200 }).then(function (r) {
 										var el = document.getElementById('log-box-text');
-										if (el) el.textContent = (r && r.log) || '(无日志)';
+										if (el) el.textContent = (r && r.lines && r.lines.length) ? r.lines.join('\n') : '(无日志)';
 									}).finally(function () { btn.disabled = false; });
 								})
 							}, [ icons.get('refresh', 13), ' 刷新日志' ])
@@ -814,7 +843,7 @@ return view.extend({
 						'id': 'log-box-text',
 						'class': 'mp-code-box mp-code-box-dark',
 						'style': 'min-height:360px;max-height:600px'
-					}, (logs && logs.log) ? logs.log : '暂无日志输出')
+					}, (logs && logs.lines && logs.lines.length) ? logs.lines.join('\n') : '暂无日志输出')
 				])
 			])
 		]);

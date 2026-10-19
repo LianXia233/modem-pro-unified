@@ -366,7 +366,7 @@ return view.extend({
 				E('div', { 'style': 'display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--mp-neutral-700)' }, [
 					icons.get('pulse', 18),
 					E('span', { 'style': 'font-weight:600' }, '最近网络变化:'),
-					E('span', { 'id': 'recent-change-text' }, (changes.entries && changes.entries[0]) ? (changes.entries[0].time + ' · ' + changes.entries[0].field + ' 从 ' + changes.entries[0].old + ' 变更为 ' + changes.entries[0].val) : '暂无波动记录')
+					E('span', { 'id': 'recent-change-text' }, (changes.entries && changes.entries[0]) ? (changes.entries[0].at + ' · ' + changes.entries[0].label + ' 从 ' + changes.entries[0].from + ' 变更为 ' + changes.entries[0].to) : '暂无波动记录')
 				]),
 				E('a', { 'class': 'mp-btn mp-btn-ghost mp-btn-sm', 'href': '#tab=tools' }, '查看全部记录')
 			])
@@ -567,11 +567,14 @@ return view.extend({
 		var simKv = document.getElementById('sim-kv');
 		if (simKv) {
 			simKv.innerHTML = '';
-			simKv.appendChild(kvItem('SIM 卡在位状态', curModem.sim_state || (curModem.running ? '正常就绪' : '未检测到')));
-			simKv.appendChild(kvItem('ICCID 卡号', curModem.iccid || '-'));
-			simKv.appendChild(kvItem('IMSI 国际识别码', curModem.imsi || '-'));
-			simKv.appendChild(kvItem('SIM 本机电话号', curModem.phone_number || '卡内未存'));
-			simKv.appendChild(kvItem('SIM 归属运营商', curModem.sim_operator || net.operator || '-'));
+			/* SIM 身份来自 /api/modem/status（后端已归档进 blocks.modem）：
+			   ModemView 里只有 id/at_port/model/running，没有这些字段 */
+			var mdm = B.modem || {};
+			simKv.appendChild(kvItem('SIM 卡在位状态', mdm.sim_state || (mdm.sim_present ? '正常就绪' : (curModem.running ? '正常就绪' : '未检测到'))));
+			simKv.appendChild(kvItem('ICCID 卡号', mdm.iccid || '-'));
+			simKv.appendChild(kvItem('IMSI 国际识别码', mdm.imsi || '-'));
+			simKv.appendChild(kvItem('SIM 本机电话号', mdm.number || '卡内未存'));
+			simKv.appendChild(kvItem('SIM 归属运营商', mdm.operator || net.operator || '-'));
 		}
 
 		/* 模组硬件 */
@@ -580,10 +583,12 @@ return view.extend({
 			modKv.innerHTML = '';
 			modKv.appendChild(kvItem('模组型号', curModem.model || '-'));
 			modKv.appendChild(kvItem('设备厂商', curModem.vendor_name || curModem.vendor || '-'));
-			modKv.appendChild(kvItem('IMEI 设备序列号', curModem.imei || '-'));
+			modKv.appendChild(kvItem('IMEI 设备序列号', mdm.imei || '-'));
 			modKv.appendChild(kvItem('当前 AT 命令端口', curModem.at_port || '-', curModem.at_port_manual ? '(已手动锁定)' : '(自动探测)'));
-			modKv.appendChild(kvItem('芯片工作温度', curModem.temperature ? (curModem.temperature + ' ℃') : (curModem.temp_max ? (curModem.temp_max / 1000).toFixed(1) + ' ℃' : '-')));
-			modKv.appendChild(kvItem('供电电压', curModem.voltage ? (curModem.voltage + ' mV') : '-'));
+			/* temp_max 是 Sensor {name, celsius}，celsius 已是摄氏度整数（不是毫度）；
+			   supply_voltage 是后端格式化好的 "3.800 V" 字符串，不再拼单位 */
+			modKv.appendChild(kvItem('芯片工作温度', mdm.temp_max ? (mdm.temp_max.celsius + ' ℃ · ' + mdm.temp_max.name) : '-'));
+			modKv.appendChild(kvItem('供电电压', mdm.supply_voltage || '-'));
 		}
 
 		var mModelBadge = document.getElementById('mod-model-badge');

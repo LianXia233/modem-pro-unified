@@ -179,7 +179,9 @@ fn usb_dev_dir(p: &Path) -> PathBuf {
         })
         .unwrap_or(false);
     if is_usb_iface {
-        p.parent().map(Path::to_path_buf).unwrap_or_else(|| p.to_path_buf())
+        p.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| p.to_path_buf())
     } else {
         p.to_path_buf()
     }
@@ -350,7 +352,9 @@ fn resolve_pdn(device: &str, cfg: i64, qmap_mode: i64) -> i64 {
     match cfg {
         n if n > 0 => n,
         -1 => pdn_from_iface(device).unwrap_or(0),
-        _ => pdn_from_iface(device).or((qmap_mode == 1).then_some(1)).unwrap_or(0),
+        _ => pdn_from_iface(device)
+            .or((qmap_mode == 1).then_some(1))
+            .unwrap_or(0),
     }
 }
 
@@ -623,7 +627,12 @@ mod tests {
     fn vendor_mbim_is_not_gated_by_external_dialer_sources() {
         // 外部时代「MBIM 一律 quectel-CM」；原生后端自己实现 MBIM，
         // Fibocom 的 MBIM 模组不能再因为「fibocom-dial 没 mbim-cm.c」被拒
-        for v in [Vendor::Fibocom, Vendor::Simcom, Vendor::TDTech, Vendor::Unknown] {
+        for v in [
+            Vendor::Fibocom,
+            Vendor::Simcom,
+            Vendor::TDTech,
+            Vendor::Unknown,
+        ] {
             assert!(
                 vendors::supports(v, DataLink::Mbim),
                 "{v:?} 应该能走原生 MBIM"

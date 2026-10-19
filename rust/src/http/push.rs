@@ -45,6 +45,34 @@ pub fn push_network(state: &AppState, modem: &Modem) {
     push_network_state(state, modem, &st);
 }
 
+/// 推 SIM / 模组硬件状态（ICCID / IMSI / IMEI / 温度 / 电压）。
+///
+/// 概览页的「SIM 卡信息」和「模组硬件参数」两张卡片就靠它。这些数据**变化极慢**
+/// （换卡、换模组才会变），所以后台按 [`MODEM_REFRESH_EVERY`] 这种分钟级节流，
+/// 其余时候靠 `modem.refresh` 任务与 `/api/modem/status` 的查询顺手刷新。
+///
+/// 一次查询要跑 `AT+CCID` / `AT+CIMI` / `AT+CPIN?` / `AT+CNUM` / 温度等好几个
+/// 往返，别跟信号那个秒级节拍混在一起。
+pub fn push_modem(state: &AppState, modem: &Modem) {
+    match modem.modem_status(state.allow_roaming()) {
+        Ok(st) => {
+            let data = serde_json::to_value(st).unwrap_or(Value::Null);
+            if data.is_null() {
+                return;
+            }
+            state.cache.put("modem", modem.id, data.clone());
+            state.ws.broadcast("modem", Some(modem.id), data);
+        }
+        Err(e) => log::debug!("后台查模组状态失败（模组 {}）: {e}", modem.id),
+    }
+}
+
+/// 后台刷 `modem` 块的节流间隔（秒）：5 分钟。
+///
+/// SIM 身份与硬件参数不会自己变，分钟级足够；页面首次打开靠 `modem.refresh`
+/// 任务立刻取一次，这里的循环只负责「长时间开着也不会变旧」。
+pub(crate) const MODEM_REFRESH_EVERY: i64 = 300;
+
 /// 推上行 / 下行速度（每轮周期推送都会采样，前端才能持续看到实时速度）。
 pub fn push_traffic(state: &AppState, modem: &Modem) {
     let view = modem.traffic_view();

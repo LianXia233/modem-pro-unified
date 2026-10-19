@@ -142,11 +142,34 @@ impl VendorSpec for Spec {
         use crate::modem::atplan::{add_from_vendor, replace, AtCmdSpec};
         let mut v = crate::modem::atplan::base_specs(ctx);
 
-        add_from_vendor(&mut v, ctx, "serving", "服务小区（SPPHYCHINFO）", "spphychinfo", "model::cells::parse_serving", "展锐物理层信息");
-        replace(&mut v, AtCmdSpec::off(
-            "imei_set", "IMEI 改写", "本厂商未提供可验证的 IMEI 写指令（只读）"));
-        replace(&mut v, AtCmdSpec::on(
-            "lock_mode", "组网模式偏好（SPRAT）", "AT+SPRAT?", "model::mode::sprat", "展锐 RAT 枚举", "厂商指令集"));
+        add_from_vendor(
+            &mut v,
+            ctx,
+            "serving",
+            "服务小区（SPPHYCHINFO）",
+            "spphychinfo",
+            "model::cells::parse_serving",
+            "展锐物理层信息",
+        );
+        replace(
+            &mut v,
+            AtCmdSpec::off(
+                "imei_set",
+                "IMEI 改写",
+                "本厂商未提供可验证的 IMEI 写指令（只读）",
+            ),
+        );
+        replace(
+            &mut v,
+            AtCmdSpec::on(
+                "lock_mode",
+                "组网模式偏好（SPRAT）",
+                "AT+SPRAT?",
+                "model::mode::sprat",
+                "展锐 RAT 枚举",
+                "厂商指令集",
+            ),
+        );
 
         v
     }

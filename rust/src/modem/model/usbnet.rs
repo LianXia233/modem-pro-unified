@@ -102,10 +102,7 @@ impl Modem {
         if supports_qcfg(vendor) {
             for m in &modes {
                 if !blocked.contains_key(&m.value) {
-                    mode_cmds.insert(
-                        m.value.clone(),
-                        format!("AT+QCFG=\"usbnet\",{}", m.value),
-                    );
+                    mode_cmds.insert(m.value.clone(), format!("AT+QCFG=\"usbnet\",{}", m.value));
                 }
             }
         }

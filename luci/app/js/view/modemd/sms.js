@@ -16,6 +16,14 @@
  *     模板变量定制、发送测试消息、登出）
  */
 
+/* 存储区代号 → 中文名（后端 SmsStorage 返回的是 SM / ME / MT 原文） */
+function memLabel(m) {
+	if (m === 'SM') return 'SIM 卡 (SM)';
+	if (m === 'ME') return '模组内置 (ME)';
+	if (m === 'MT') return '混合存储 (MT)';
+	return m || 'SM';
+}
+
 return view.extend({
 	load: function () {
 		fmt.ensureCss();
@@ -162,23 +170,28 @@ return view.extend({
 					E('div', { 'style': 'display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px' }, [
 						E('div', { 'style': 'display:flex;align-items:center;gap:12px;font-size:13px' }, [
 							E('span', { 'style': 'font-weight:600' }, '短信存储区:'),
-							E('span', { 'class': 'mp-badge mp-badge-primary' }, storage.cur ? (storage.cur === 'SM' ? 'SIM 卡 (SM)' : storage.cur) : 'SM'),
-							storage.counts ? E('span', { 'style': 'color:var(--mp-neutral-500)' }, '容量: ' + storage.counts) : ''
+							/* 后端 SmsStorage 的字段是 current（= mem1）与 mem1_used / mem1_total，
+							   没有 cur / counts —— 之前读错导致徽章永远显示默认 SM、容量不显示 */
+							E('span', { 'class': 'mp-badge mp-badge-primary' }, memLabel(storage.current || storage.mem1 || 'SM')),
+							(storage.mem1_total > 0)
+								? E('span', { 'style': 'color:var(--mp-neutral-500)' }, '容量: ' + storage.mem1_used + ' / ' + storage.mem1_total)
+								: ''
 						]),
 						E('div', { 'style': 'display:flex;align-items:center;gap:8px' }, [
 							E('label', { 'style': 'font-size:12px;color:var(--mp-neutral-500)' }, '切换存储区:'),
-							E('select', { 'id': 'sel-sms-mem', 'class': 'mp-select', 'style': 'min-width:120px' }, [
-								E('option', { 'value': 'SM', 'selected': storage.cur === 'SM' }, 'SIM 卡 (SM)'),
-								E('option', { 'value': 'ME', 'selected': storage.cur === 'ME' }, '模组内置 (ME)'),
-								E('option', { 'value': 'MT', 'selected': storage.cur === 'MT' }, '混合存储 (MT)')
-							]),
+							E('select', { 'id': 'sel-sms-mem', 'class': 'mp-select', 'style': 'min-width:120px' },
+								(storage.supported && storage.supported.length ? storage.supported : ['SM', 'ME', 'MT']).map(function (m) {
+									return E('option', { 'value': m, 'selected': (storage.current || storage.mem1) === m }, memLabel(m));
+								})
+							),
 							E('button', {
 								'class': 'mp-btn mp-btn-ghost mp-btn-sm',
 								'click': ui.createHandlerFn(self, function (btn) {
 									var mem = document.getElementById('sel-sms-mem').value;
 									btn.disabled = true;
-									api.post('/api/sms/storage', { modem_id: id, mem: mem }).then(function () {
-										ui.addNotification(null, E('p', {}, '已切到存储区 ' + mem), 'info');
+									/* 切存储区要下发 AT+CPMS 再回读确认，同步 POST 会撞上代理 20s 超时 */
+									task.run(api, 'sms.storage.set', { modem_id: id, mem: mem }).then(function () {
+										ui.addNotification(null, E('p', {}, '已切到存储区 ' + memLabel(mem)), 'info');
 										window.location.reload();
 									}).catch(function (e) {
 										ui.addNotification(null, E('p', {}, '切换失败: ' + (e.message || e)), 'error');

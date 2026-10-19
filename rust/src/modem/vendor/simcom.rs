@@ -77,11 +77,34 @@ impl VendorSpec for Spec {
         use crate::modem::atplan::{add_from_vendor, replace, AtCmdSpec};
         let mut v = crate::modem::atplan::base_specs(ctx);
 
-        replace(&mut v, AtCmdSpec::on(
-            "lock_band", "锁频段", "AT+CNBP?", "model::lock::parse_cnbp", "位图（需先解锁 AT+CNBP=0）", "厂商指令集"));
-        replace(&mut v, AtCmdSpec::off(
-            "imei_set", "IMEI 改写", "本厂商未提供可验证的 IMEI 写指令（只读）"));
-        add_from_vendor(&mut v, ctx, "signal", "信号（CPSI）", "cpsi", "model::cells::parse_cpsi", "系统信息（含信号）");
+        replace(
+            &mut v,
+            AtCmdSpec::on(
+                "lock_band",
+                "锁频段",
+                "AT+CNBP?",
+                "model::lock::parse_cnbp",
+                "位图（需先解锁 AT+CNBP=0）",
+                "厂商指令集",
+            ),
+        );
+        replace(
+            &mut v,
+            AtCmdSpec::off(
+                "imei_set",
+                "IMEI 改写",
+                "本厂商未提供可验证的 IMEI 写指令（只读）",
+            ),
+        );
+        add_from_vendor(
+            &mut v,
+            ctx,
+            "signal",
+            "信号（CPSI）",
+            "cpsi",
+            "model::cells::parse_cpsi",
+            "系统信息（含信号）",
+        );
 
         v
     }

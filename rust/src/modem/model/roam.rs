@@ -52,7 +52,11 @@ impl Modem {
 
 /// 由 [`RoamState`] 与开关值构造视图。
 pub fn build_view(state: RoamState, allowed: bool) -> RoamView {
-    let applies = true;
+    // 「漫游策略是否适用」：只有判据齐全时才成立。
+    // `scope == "unknown"` 意味着 IMSI 或注册网 PLMN 至少缺一个，国别判不出来
+    // （`roam_state` 里写明「所以不拦」）—— 那时策略谈不上适用，写死 true 会让
+    // 界面把「判不出」显示成「已按策略处理」。
+    let applies = matches!(state.scope.as_str(), "domestic" | "global");
     let blocked = state.roaming && !allowed && state.scope == "global";
     RoamView {
         roaming: state.roaming,

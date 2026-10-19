@@ -9,6 +9,11 @@ PROG=/usr/bin/modemd
 CONFIG=/etc/modemd/config.toml
 
 start_service() {
+	# 配置里的 log_file 默认落在 /var/log；OpenWrt 上 /var 是 tmpfs 软链到 /tmp，
+	# 有些精简固件开机时还没有这个目录 —— 缺了它日志会静默丢（只能 logread 看）。
+	# 这里补一下：目录已存在时 mkdir -p 是空操作，无副作用。
+	[ -d /var/log ] || mkdir -p /var/log 2>/dev/null
+
 	procd_open_instance
 	procd_set_param command "$PROG" -config "$CONFIG"
 	procd_set_param respawn 3600 5 5
@@ -26,9 +31,11 @@ reload_service() {
 	start
 }
 
-service_triggers() {
-	procd_add_reload_trigger "modemd"
-}
+# ⚠️ 这里**不要**加 procd_add_reload_trigger "modemd"：那个函数监视的是
+# UCI 配置文件 /etc/config/modemd，而本服务用的是 /etc/modemd/config.toml，
+# 那条触发器会永久空转（历史上的写法）。
+# config.toml 的变更已由上面的 procd_set_param file "$CONFIG" 覆盖：
+# 改动后 procd 会自动重启本服务，无需额外的 reload trigger。
 
 extra_command "status" "显示守护进程状态" do_status
 

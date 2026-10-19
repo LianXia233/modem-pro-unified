@@ -41,6 +41,10 @@ fn fresh_ms(kind: &str) -> u64 {
 }
 
 pub fn handle(req: Request, state: &AppState, query: &HashMap<String, String>) -> Result<()> {
+    // 「页面还开着」的信号：LuCI 走 HTTP 轮询（它连不上 WS），后台采样循环
+    // 靠这个判断有没有人在看（见 AppState::note_http_seen 的注释）。
+    state.note_http_seen();
+
     let modems = state.mgr.all();
     let wanted = query
         .get("modem_id")
@@ -97,6 +101,12 @@ pub fn handle(req: Request, state: &AppState, query: &HashMap<String, String>) -
         .filter_map(|t| serde_json::to_value(t).ok())
         .collect();
 
+    // 拨号状态是本地推断（接口名 / 地址 / 网关），**一条 AT 都不发**，
+    // 所以可以顺手归档：这样 `ages.dial` / `stale.dial` 才是真的，
+    // 而不是一个「永远 null、永远过期」的占位块。
+    let dial = json!({ "state": modem.dial_status() });
+    state.cache.put("dial", modem.id, dial.clone());
+
     response::ok(
         req,
         json!({
@@ -106,8 +116,7 @@ pub fn handle(req: Request, state: &AppState, query: &HashMap<String, String>) -
             "blocks": blocks,
             "ages": ages,
             "stale": stale,
-            // 拨号状态是本地推断（接口名 / 地址 / 网关），不发 AT
-            "dial": { "state": modem.dial_status() },
+            "dial": dial,
             "tasks": tasks,
         }),
     )

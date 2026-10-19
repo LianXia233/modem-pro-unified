@@ -115,6 +115,30 @@ pub struct TrafficPrev {
     pub rx: u64,
 }
 
+/// 速率式模组的本地积分累计量（存在 `Modem` 上）。
+///
+/// ## 为什么需要积分
+///
+/// 广和通的 `AT+GTSTATIS` 只回**瞬时速率**（bps），没有累计计数器。
+/// 而页面上的「累计已发送 / 已接收」不能永远显示 0 —— 早先 `traffic_view()`
+/// 直接取 `s.tx_bytes`（速率式路径下恒 0），于是广和通用户看到的累计流量
+/// 一直为零，配额页也就无从判断。
+///
+/// ## 局限性（如实说明，不假装是精确值）
+///
+/// 这是「采样点速率 × 采样间隔」的梯形近似：
+/// - 只在**有人查询 / 采样循环运行时**推进，没人看的那段时间会被漏掉；
+/// - 速率本身是模组按自己窗口算的平均值，与我们的 `dt` 不同步。
+///
+/// 因此该值标 `estimated=true`，语义是「本次上电以来的估算量」，
+/// 不是「本月账单用量」。要做账请以运营商侧为准。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RateTotal {
+    pub at: i64,
+    pub sent: u64,
+    pub recv: u64,
+}
+
 impl Modem {
     /// 流量视图：累计字节 + 实测速率。
     ///
@@ -137,13 +161,27 @@ impl Modem {
         let now = crate::logging::unix_now();
         let mut view = base;
         if s.kind == KIND_RATE {
-            view.sent = s.tx_bytes;
-            view.recv = s.rx_bytes;
+            // 速率式：模组只给瞬时速率，累计量靠本地积分（速率 × 间隔）
+            let mut g = self.rate_total.lock().unwrap();
+            let mut total = g.unwrap_or_default();
+            let dt = if total.at > 0 {
+                (now - total.at).max(0) as f64
+            } else {
+                0.0
+            };
+            // bps × 秒 / 8 = 字节；用 f64 累加避免整数截断把小流量抹成 0
+            total.sent += (s.tx_rate_bps as f64 * dt / 8.0) as u64;
+            total.recv += (s.rx_rate_bps as f64 * dt / 8.0) as u64;
+            total.at = now;
+            *g = Some(total);
+
+            view.sent = total.sent;
+            view.recv = total.recv;
             view.up_bps = s.tx_rate_bps;
             view.down_bps = s.rx_rate_bps;
             view.up_text = fmt_bps(s.tx_rate_bps);
             view.down_text = fmt_bps(s.rx_rate_bps);
-            view.interval_s = 0.0;
+            view.interval_s = dt;
         } else {
             view.sent = s.tx_bytes;
             view.recv = s.rx_bytes;

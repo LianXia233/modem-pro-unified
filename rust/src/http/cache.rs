@@ -69,17 +69,32 @@ impl StateCache {
     }
 
     /// 模组消失时清掉它的条目（拔卡后别拿着旧号码当现况）。
-    /// 当前只有热插拔路径会调用；快照页不会读到已消失模组的条目（按 id 查），
-    /// 这里保留成显式 API 是为了「模组被删」这个事实只表达一次。
-    #[allow(dead_code)]
+    /// 调用方是 `http/loops.rs::spawn_hotplug_notify`：巡检回收掉的模组，
+    /// 它的信号 / 网络缓存要跟着清，否则会攒下一批永远没人读的条目。
+    /// 「模组被删」这个事实只在 `ModemManager::reap_gone` 里表达一次。
     pub fn forget(&self, modem_id: u32) {
         let mut g = self.inner.lock().unwrap();
         g.retain(|(_, id), _| *id != modem_id);
     }
 
-    /// 全部种类（`/api/snapshot` 的 `ages` 字段用）。
+    /// 全部种类（`/api/snapshot` 的 `ages` / `stale` 字段用）。
+    ///
+    /// ⚠️ 这里的每一项都**必须有真正的写入方**，否则快照里会出现一个
+    /// `ages[kind]=null, stale[kind]=true` 的「永远过期」块，页面据此显示
+    /// 「数据有 N 秒旧」却永远追不上，排障时也会被误导。
+    ///
+    /// | kind | 写入方 |
+    /// | --- | --- |
+    /// | `signal` | `handlers/signal.rs`、`push.rs`、任务 `signal.refresh` |
+    /// | `network` | `handlers/network_status.rs`、`push.rs`、任务 `network.refresh` |
+    /// | `cells` | 任务 `cells.scan`、`push.rs` |
+    /// | `lock` | `handlers/lock_status.rs`、任务 `lock.status` / `lock.band` |
+    /// | `usbnet` | `handlers/usbnet.rs`（同步 AT 查询后归档） |
+    /// | `netscan` | 任务 `netscan` |
+    /// | `dial` | `handlers/snapshot.rs`（本地推断，不发 AT）、任务 `dial.connect` / `dial.disconnect` |
+    /// | `modem` | `handlers/modem_status.rs`、任务 `modem.refresh`（SIM / 温度 / 电压） |
     pub const KINDS: &'static [&'static str] = &[
-        "signal", "network", "cells", "lock", "usbnet", "netscan", "dial",
+        "signal", "network", "cells", "lock", "usbnet", "netscan", "dial", "modem",
     ];
 }
 

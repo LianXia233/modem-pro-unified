@@ -92,13 +92,24 @@ else
   endef
 endif
 
+# modem-pro 的运行时依赖（少一个都不会在编译期报错，而是装到设备上才「打不开」）：
+#   · ucode-mod-fs：控制器 modemd_api.uc 里 require('fs') + fs.popen
+#   · uhttpd-mod-ucode：ucode 控制器由 uhttpd 通过 ubus 调用（缺它 /cgi-bin/luci/... 直接 500）
+#   · rpcd + uhttpd-mod-ubus：登录态与 ubus 转发（鉴权、服务启停都走它）
+#   · netifd：modem_pro 协议脚本（files/lib/netifd/proto/modem_pro.sh）的宿主
+#   · wwan / usbutils：拨号与 USB 设备枚举（/api/usb、AT 口探测）
+#   · kmod-*：QMI / MBIM / RNDIS / ECM 数据面与 USB 串口（AT 口）驱动
+#   · odhcp6c：mp-client.sh 里的 DHCPv6 客户端（IPv6 前缀获取）
 define Package/modem-pro
   SECTION:=net
   CATEGORY:=Network
   SUBMENU:=Modem Manager
   TITLE:=Unified 5G modem manager (modemd + LuCI)
   URL:=https://github.com/LianXia233/modem-pro-unified
-  DEPENDS:=+luci-base +odhcp6c
+  DEPENDS:=+luci-base +rpcd +uhttpd-mod-ubus +uhttpd-mod-ucode +ucode-mod-fs +ucode-mod-math \
+           +netifd +wwan +usbutils +odhcp6c \
+           +kmod-usb-net-qmi-wwan +kmod-usb-net-cdc-mbim +kmod-usb-net-rndis \
+           +kmod-usb-net-cdc-ether +kmod-usb-serial-option
 endef
 
 define Package/modem-pro/config

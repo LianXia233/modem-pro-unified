@@ -100,6 +100,30 @@ pub fn i64_param(params: &HashMap<String, String>, key: &str, default: i64) -> i
         .unwrap_or(default)
 }
 
+/// 取整数参数，但**非法值要报错**（与 [`i64_param`] 的「回落默认」相反）。
+///
+/// 两个函数的分工：
+/// - [`i64_param`]：写操作的容错口径，非法值按默认走（页面漏传一个开关不该整单失败）；
+/// - 本函数：查询参数的严格口径，`?limit=abc` 要如实告诉调用方「你传错了」，
+///   否则用户会以为「我传了 999 却只拿到 200」是服务端的锅。
+///
+/// 原先它定义在 `handlers/changes.rs` 里，`handlers/signal_history.rs` 需要
+/// 跨 handler 模块 `super::changes::int_param(...)` 去调 —— 那是模块职责错位：
+/// 一个通用的参数解析工具不该挂在某个具体接口的实现文件里。
+pub fn strict_i64_param(
+    query: &HashMap<String, String>,
+    key: &str,
+    default: i64,
+) -> std::result::Result<i64, String> {
+    match query.get(key) {
+        Some(v) if !v.trim().is_empty() => v
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| format!("{key} must be an integer")),
+        _ => Ok(default),
+    }
+}
+
 /// 取浮点参数（空串 / 非法 / 非有限 → None）。
 pub fn f64_param(params: &HashMap<String, String>, key: &str) -> Option<f64> {
     let v = params.get(key)?.trim().parse::<f64>().ok()?;

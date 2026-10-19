@@ -72,7 +72,7 @@ pub struct CellScanResult {
 }
 
 /// 没有载波聚合时的说明（与厂商无关的事实，别写成"不支持"）。
-const CA_EMPTY_NOTE: &str = "空闲态下模组通常只上报主载波；进入连接态并由网络配置辅载波后，\n才会出现 SCC（本页数据来自基站扫描，不含实时 CA 查询）";
+const CA_EMPTY_NOTE: &str = "空闲态下模组通常只上报主载波；进入连接态并由网络配置辅载波后，\n才会出现 SCC。本页已按厂商指令实时查询（见 model/ca.rs），仍为空说明模组本轮未上报";
 
 fn is_zero(v: &i32) -> bool {
     *v == 0
@@ -80,7 +80,8 @@ fn is_zero(v: &i32) -> bool {
 
 impl CellScanResult {
     /// 由小区列表构造结果（按服务/邻区分类并统计）。
-    pub fn from_cells(modem_id: u32, cells: Vec<CellInfo>) -> Self {
+    /// `ca` 是本次扫描顺带查到的载波聚合状态（见 [`super::ca`]）。
+    pub fn from_cells(modem_id: u32, cells: Vec<CellInfo>, ca: Option<super::ca::CaInfo>) -> Self {
         let mut serving = Vec::new();
         let mut neighbours = Vec::new();
         for c in &cells {
@@ -117,7 +118,9 @@ impl CellScanResult {
             operator,
             net_info: None,
             network_reg: None,
-            ca_active: false,
+            // 扫描完顺手查一次 CA：扫描本身就说明「用户在看小区」，
+            // 且此时刚进过连接态，SCC 最容易拿到（见 model/ca.rs）
+            ca_active: ca.map(|c| c.ca_active).unwrap_or(false),
             ca_cmds: Vec::new(),
             ca_note: String::new(),
         }
@@ -165,7 +168,10 @@ impl Modem {
                 }
             }
         }
-        let mut result = CellScanResult::from_cells(self.id, cells);
+        // 扫描完顺手查一次 CA：扫描本身就说明「用户在看小区」，此时刚过连接态，
+        // 是最容易拿到 SCC 的时机（解析见 model/ca.rs）
+        let ca = self.ca_status();
+        let mut result = CellScanResult::from_cells(self.id, cells, ca);
         result.ca_cmds = self.ca_cmds();
         result.ca_note = CA_EMPTY_NOTE.to_string();
         // 扫描页底部那三行（运营商 / 网络接入信息 / 注册状态）：扫描本来就慢，
@@ -260,15 +266,12 @@ fn is_duplex_token(tok: &str) -> bool {
 }
 
 /// MCC+MNC → 中国运营商名（认不出返回空串）。
+///
+/// 只是 [`super::siminfo::operator_from_plmn`] 的一个转发壳：运营商表**只有一份**，
+/// 免得两处各维护一张、口径打架（历史上这里把 46004/46008 判成广电，
+/// 而 SIM 侧判成移动，同一张卡两个页面显示两家运营商）。
 pub fn operator_name(mcc: &str, mnc: &str) -> String {
-    match format!("{mcc}{mnc}").as_str() {
-        "46000" | "46002" | "46007" => "中国移动",
-        "46001" | "46006" | "46009" => "中国联通",
-        "46003" | "46005" | "46011" => "中国电信",
-        "46004" | "46008" => "中国广电",
-        _ => "",
-    }
-    .to_string()
+    super::siminfo::operator_from_plmn(mcc, mnc).unwrap_or_default()
 }
 
 /// 由频点号推算频段号（3GPP TS 36.101 / TS 38.104 常用频段）。

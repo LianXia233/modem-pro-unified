@@ -2763,3 +2763,121 @@ QModem 为 MPL-2.0；`rust/src/modem/modem_catalog.json` 与 `catalog.rs` 的数
 
 本仓库在其基础上做「整合为单仓库 + 后端 Rust 重写」，目标是与上述契约逐字兼容。
 上游仓库未声明开源许可证，本仓库的 MIT 许可证仅覆盖本仓库自身的代码。
+
+---
+
+## 46. 全链路契约审查与修复（2026-10-20，1.0.0-6）
+
+### 46.1 审查方法（不是「读代码猜」，是跑起来打）
+
+1. 读 `README` / `docs/*` / `rust/src/**` / `luci/**`，梳理「LuCI JS → ucode 代理 → wget →
+   modemd HTTP」这条唯一数据通道；
+2. 用 `cargo check` / `test` / `clippy` 建基线；
+3. **真实启动 `modemd`**（临时配置：`127.0.0.1:19527`、`require_luci_login=false`、日志落 `/tmp`），
+   用 `curl` 把 LuCI 实际调用的 **79 个**接口逐个打一遍，校验「HTTP 码 + JSON 合法性 + 信封三键」；
+4. 对前端读取的每个字段，回到后端结构体核对**字段名是否真的存在**；
+5. 改了鉴权之后，用「回环 / 非回环 / 伪造 `X-Real-IP`」三种请求验证闸门。
+
+### 46.2 根因（按影响排序）
+
+| # | 现象 | 根因 | 位置 |
+| --- | --- | --- | --- |
+| 1 | 局域网内任何人可无密码改 IMEI / 发短信 | 网关把请求转给内部 tiny_http，`remote_addr` 恒为 127.0.0.1，而闸门用它判「本机免登录」 | `gateway.rs` + `auth.rs` |
+| 2 | LuCI 页面数据块永远为空 | 采样循环以 `ws.active_count()>0` 为闸门，而 LuCI 只走 HTTP 轮询、不连 WS | `loops.rs` |
+| 3 | 接口失败时页面显示「modemd 无响应」 | handler 裸 `?` 返回 `Err`，`Request` 已被 drop，网关写不了任何字节 | 10 个 handler |
+| 4 | 概览页 SIM / 硬件 9 项恒为 `-` | 前端读 `ModemView`（只有 id/at_port/model/running），这些字段在 `ModemStatus` 里 | `overview.js` |
+| 5 | 波动记录、日志、短信存储区、USB、PCIe 恒为空/`undefined` | 前端字段名与后端结构体不一致（5 组） | 见 CHANGELOG 表 |
+| 6 | 模组拔出后重插再也发现不了 | `discover()` 只增不删，旧口一直占着 `known` | `manager.rs` |
+| 7 | 组网线程偶发永久挂起、掉线不自愈 | `uci` / `ifstatus` / `network reload` 无超时 | `netprov/uci.rs` |
+| 8 | 载波聚合永远显示「无 CA」 | `ca` / `ca_active` 是结构占位，从未采集 | `network.rs` / `cells.rs` |
+| 9 | 拔卡后 ghost 模组一直发 AT、fd 泄漏 | 同上（缺回收） | `manager.rs` |
+
+### 46.3 改动清单（文件级）
+
+**新增**
+- `rust/build.rs` —— 编译期取真实 rustc 版本（替代写死的 `"stable"`）
+- `rust/src/modem/model/ca.rs` —— 载波聚合查询与解析（广和通按手册逐字段，移远保守解析）
+
+**后端（Rust）**
+- `http/gateway.rs` 注入 `X-Real-IP`（覆盖式）+ 4 个单测
+- `http/auth.rs` 改读 `X-Real-IP`
+- `http/mod.rs` 新增 `last_http_seen` / `viewer_active` / `note_http_seen` + 3 个单测
+- `http/cache.rs` 新增 `modem` 块、补 `dial`/`usbnet` 写入方、`forget` 接上调用者
+- `http/loops.rs` 采样循环改用 `viewer_active`、新增 `modem` 块低频刷新、回收后清缓存
+- `http/response.rs` 新增 `to_value` / `json_body`（先序列化再响应）
+- `http/handlers/*` 10 个文件消灭裸 `?`；`tasks.rs` 新增 6 个任务种类 + 消除重复 `build_spec`
+- `http/handlers/mod.rs` `modem_id` 解析失败不再回落 0
+- `http/handlers/roam_set.rs` `on` 必填
+- `http/request.rs` `strict_i64_param` 上移
+- `modem/manager.rs` 新增 `reap_gone` / `take_reaped`
+- `modem/model/{siminfo,cells,network,netscan,traffic,roam,band,modem}.rs` —— CA 接入、
+  IMEI 进 ModemStatus、运营商表合一、温度按名挑、速率式积分、PLMN 判据
+- `netprov/uci.rs` `run_with_timeout`
+
+**前端（LuCI JS）**
+- `overview.js` SIM/硬件改读 `blocks.modem`；波动记录字段
+- `tools.js` 波动/日志/USB/PCIe 字段；IMEI 走任务；7 处补 `.catch`
+- `sms.js` 存储区字段；切换走任务
+- `lock.js` 锁频段走任务；空分组跳过
+- `dial.js` 拨号/断开走任务
+- `api.js` URL 编码加固
+- `menu.d/luci-app-modemd.json` proxy 补 ACL
+
+**打包**
+- `Makefile` DEPENDS 补全；`init.d` 去空转触发器 + 建 `/var/log`；
+  `config.toml` 补 `dial_enabled`/`allow_roaming` + 如实标注未实现项
+
+### 46.4 验证结果
+
+| 项 | 结果 |
+| --- | --- |
+| `cargo build` | 通过 |
+| `cargo test` | **616 通过 / 0 失败**（本轮新增 20 个） |
+| `cargo clippy --all-targets` | **0 警告** |
+| `rustfmt --check`（本轮改动的 40 个文件） | 全部合规 |
+| 79 个接口端到端 | 全部返回完整信封 |
+| 未注册路径 | 404 + 信封 |
+| 鉴权三场景 | 回环 200 / 非回环 401 / 伪造头 401 |
+| LuCI JS 语法 | 15 个文件 `node --check` 通过 |
+
+### 46.5 实机验证（ImmortalWrt SNAPSHOT / 6.18.55 / aarch64_cortex-a53 / FM350-GL）
+
+交叉编译 `aarch64-unknown-linux-musl`（`rust-lld` 作 linker，与 Makefile 同款方案），
+部署到 `/tmp` 用独立端口 + 独立 `pid_file` 起临时实例，**生产服务先停、验证后恢复**。
+
+| 验证项 | 结果 |
+| --- | --- |
+| aarch64 二进制可运行 | ✅ `platform: linux/aarch64` |
+| 真实 rustc 版本 | ✅ `runtime: rustc 1.93.0`（旧版恒为 `rustc stable`） |
+| `blocks.modem` 真实数据 | ✅ iccid `89860xxxxxxxxxxxxxxx` / imsi `46011xxxxxxxxxx` / **imei `86933xxxxxxxxxx`** |
+| `imei` 新字段（`AT+CGSN`） | ✅ 与 `AT+CGSN` 原文 `86933xxxxxxxxxx` 一致 |
+| `roam_applies` 真实判据 | ✅ `false`（`roam_scope: "none"`）；旧版恒 `true` |
+| `temp_key` 按名挑 | ✅ `ltepa_ntc` / `md_5g` / `soc_max`；旧版是无脑前三项 |
+| `AT+GTCAINFO?` | ⚠️ 当前未注册 → 只回 `OK`、无 `PCC/SCC` 行；解析器正确返回「未上报」 |
+| 鉴权：非回环未登录 | ✅ 401 + `need_login` |
+| 鉴权：伪造 `X-Real-IP` | ✅ 仍 401（覆盖式注入生效） |
+| 鉴权：回环 | ✅ 200（ucode 代理路径不受影响） |
+| 未注册路径 | ✅ 404 + 信封 |
+| 自动组网未改用户 UCI | ✅ `/etc/config/network` 时间戳未变；`modem0` 是用户手工配置 |
+| 生产服务恢复 | ✅ `running`、`/api/version` 200、FM350-GL 正常识别 |
+
+**实机额外发现并已修复**：`discover()` 同步挡在 `http::serve` 之前，这台机器 7 个
+`ttyUSB` 里只有 1 个是 AT 口，启动到 HTTP 可用要 **40 秒**（期间 LuCI 全黑）。
+改为 HTTP 先起、首次发现走后台，实测**就绪 0 秒**；并给 `discover()` 加互斥锁，
+避免启动/巡检/页面三路并发把同一台设备登记两次。
+
+### 46.6 仍未验证（不要在交付里说成已验证）
+
+1. **CA 的 `PCC/SCC` 解析分支**：实机只走到「空闲态无上报」，**没拿到真实辅载波报文**。
+   需要拨号进入连接态、且网络确实配置了 SCC，再抓一次 `AT+GTCAINFO?` 逐字段核对
+   （重点：`SCCn` 的 `ul_bandwidth` 位置、尾部可选的 `rssnr/rsrp/rsrq`）。
+2. **模组热插拔回收**：未实机插拔。需要确认列表减少、fd 归还、重插能重新发现、
+   `StateCache` 条目被清。
+3. **任务化慢操作的进度文案**：`dial.connect` / `lock.band` / `imei.set` 的 `onTick`
+   在真机上的观感未看（这次模组未注册，没有拨号）。
+4. **`X-Real-IP` 依赖网关是唯一入口**：若将来让 tiny_http 直接对外监听，或前置 nginx
+   透传 `X-Real-IP`，闸门会被绕过。当前内部端口是 `127.0.0.1:0` 随机端口，安全。
+   **改架构时必须同步复核这条链路。**
+5. **LuCI 前端未在真机浏览器里点过**：本次只做了 `node --check` 语法与字段契约核对，
+   没有实际打开页面看渲染（设备只开放了 SSH，LuCI 需隧道）。
+6. `netprov` 的 uci 超时值（10s / 30s）是估值，需在慢速闪存设备上确认不误杀。

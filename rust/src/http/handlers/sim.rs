@@ -14,7 +14,12 @@ pub fn handle(req: Request, state: &AppState, query: &HashMap<String, String>) -
     let Some(modem) = modem_by_query(state, query) else {
         return response::fail(req, -1, "modem not found");
     };
-    let status = modem.modem_status(state.cfg.net.allow_roaming)?;
+    // AT 会话失败（串口忙 / 模组拔出）必须变成信封里的 msg：
+    // 用 `?` 会把 Request 丢回网关层，连接上什么都不会写。
+    let status = match modem.modem_status(state.cfg.net.allow_roaming) {
+        Ok(s) => s,
+        Err(e) => return response::fail(req, -1, &e.to_string()),
+    };
     let (last_event, last_event_at) = modem.sim_last_event();
     let checked_at = modem.sim_checked_at();
     let mut data = json!({

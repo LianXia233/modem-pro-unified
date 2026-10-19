@@ -405,6 +405,10 @@ return view.extend({
 			wrap.querySelectorAll('.mp-chip.active').forEach(function (c) {
 				picked.push(parseInt(c.dataset.band, 10));
 			});
+			/* 一个频段都没勾 = 这一组不锁。后端要求「bands 非空或显式 unlock=true」，
+			   下发空数组会被拒，还会让下面的 Promise.all 把已成功的分组一起报失败。
+			   要解除整组请用「解除锁定」按钮。 */
+			if (!picked.length) continue;
 			jobs.push({ tech: g.tech || (key.indexOf('nr') >= 0 ? 'NR' : 'LTE'), bands: picked });
 		}
 
@@ -413,8 +417,10 @@ return view.extend({
 			return;
 		}
 
+		/* 锁频段要重启射频（秒~十秒级），同步 POST 会撞上 ucode 代理的 20 秒超时，
+		   而且一次只能占一个串口 —— 改走异步任务，页面轮询进度。 */
 		return Promise.all(jobs.map(function (j) {
-			return api.post('/api/lock/band', {
+			return task.run(api, 'lock.band', {
 				modem_id: id,
 				tech: j.tech,
 				bands: j.bands

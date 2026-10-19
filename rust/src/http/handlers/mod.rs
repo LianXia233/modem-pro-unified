@@ -68,15 +68,15 @@ pub mod session;
 pub mod signal;
 pub mod signal_history;
 pub mod sim;
-pub mod snapshot;
 pub mod sms_delete;
 pub mod sms_read;
 pub mod sms_send;
 pub mod sms_storage;
 pub mod sms_storage_set;
+pub mod snapshot;
+pub mod tasks;
 pub mod traffic_reset;
 pub mod usb;
-pub mod tasks;
 pub mod usb_bind;
 pub mod usb_clear;
 pub mod usbnet;
@@ -92,12 +92,23 @@ use std::sync::Arc;
 use crate::http::AppState;
 use crate::modem::model::{ChangeEntry, Modem};
 
-/// 从 query 的 `modem_id`（缺省 0）取模组。
+/// 从 query / 表单的 `modem_id`（不给就当 0）取模组。
+///
+/// ⚠️ **`modem_id` 给错了必须返回 `None`，不能回落成 0**：
+/// 这个函数的调用方里有一大批是写操作（锁频段、改 IMEI、删短信、切飞行模式…），
+/// 回落 0 等于把「锁 3 号模组的频段」悄悄执行成「锁 0 号模组的频段」，
+/// 而调用方只会看到 `modem not found` 之外的正常返回。宁可让请求失败并被看见。
 pub fn modem_by_query(state: &AppState, query: &HashMap<String, String>) -> Option<Arc<Modem>> {
-    let id = query
+    let raw = query
         .get("modem_id")
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(0);
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let id = match raw {
+        // 没给 = 单模组场景的默认值，与既有行为一致
+        None => 0,
+        // 给了但解析不了 = 调用方出错，让它看见「找不到」，不要猜
+        Some(s) => s.parse::<u32>().ok()?,
+    };
     state.mgr.get(id)
 }
 

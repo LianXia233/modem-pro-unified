@@ -143,11 +143,12 @@ pub fn handle(req: Request, state: Arc<AppState>) -> Result<()> {
         ("GET", "/api/version") => handlers::version::handle(req, &state),
         // 异步化：快照（缓存优先，不发 AT）+ 任务（慢操作提交 → 轮询）
         ("GET", "/api/snapshot") => handlers::snapshot::handle(req, &state, &query),
+        // 任务接口收 `Arc<AppState>`：任务闭包要 'static，得把状态搬进工作线程
         ("GET", "/api/tasks") | ("POST", "/api/tasks") => {
-            handlers::tasks::handle(req, &state, &query)
+            handlers::tasks::handle(req, state.clone(), &query)
         }
-        ("GET", "/api/tasks/get") => handlers::tasks::handle(req, &state, &query),
-        ("POST", "/api/tasks/cancel") => handlers::tasks::handle(req, &state, &query),
+        ("GET", "/api/tasks/get") => handlers::tasks::handle(req, state.clone(), &query),
+        ("POST", "/api/tasks/cancel") => handlers::tasks::handle(req, state.clone(), &query),
         ("GET", "/api/modems") => handlers::modems::handle(req, &state, &query),
         ("GET", "/api/modem/info") => handlers::modem_info::handle(req, &state, &query),
         ("GET", "/api/modem/status") => handlers::modem_status::handle(req, &state, &query),

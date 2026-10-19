@@ -79,6 +79,19 @@ pub struct AppState {
     pub(crate) cache: Arc<cache::StateCache>,
     /// 异步任务注册表：慢操作提交 → 轮询，不占 HTTP 线程与串口队列（见 http/tasks.rs）
     pub(crate) tasks: Arc<tasks::Registry>,
+    /// 最近一次「有人在通过 HTTP 看」的时刻（Unix 秒）；0 = 从没有过。
+    ///
+    /// ## 为什么需要它
+    ///
+    /// LuCI 前端走的是 **HTTP 轮询**（`modemd.store` 每 3 秒拉一次 `/api/snapshot`），
+    /// 它不连 WebSocket —— 跨端口跨源，而 ucode 代理是「一次请求一次 `wget`」，
+    /// 天生转不了长连接。可后台采样循环原本只用 `ws.active_count()` 判断「有没有人在看」，
+    /// 于是 LuCI 用户**一次采样都触发不了**：快照里的 `blocks` 永远是空的，
+    /// `ages` 永远 `null`、`stale` 永远 `true`，页面只能一片 `-`。
+    ///
+    /// 把「刚有人拉过快照」也算作「有人在看」，两类前端的口径就统一了，
+    /// 「没人在看就别发 AT」的初衷也仍然成立（关掉页面 N 秒后自动停）。
+    pub(crate) last_http_seen: std::sync::atomic::AtomicI64,
 }
 
 impl AppState {
@@ -112,6 +125,40 @@ impl AppState {
         let raw = guard.as_deref().unwrap_or(self.cfg.net.wan_mode.as_str());
         crate::config::WanMode::parse(raw)
     }
+
+    /// 记一次「有人在通过 HTTP 看」（拉快照 / 查状态都算）。
+    ///
+    /// 由 `/api/snapshot` 与几个高频只读接口调用：它们是「页面还开着」的可靠信号。
+    pub(crate) fn note_http_seen(&self) {
+        self.last_http_seen.store(
+            crate::logging::unix_now(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// 有没有「人在看」：WebSocket 主动客户端，或最近 `within` 秒内拉过 HTTP 接口。
+    ///
+    /// 后台循环用它决定要不要发 AT。两类前端统一在这里判，别再各自只看 WS
+    /// （那样 LuCI 的 HTTP 轮询会被整轮跳过，见 [`Self::last_http_seen`]）。
+    pub(crate) fn viewer_active(&self, within: i64) -> bool {
+        if self.ws.active_count() > 0 {
+            return true;
+        }
+        http_seen_recent(
+            self.last_http_seen
+                .load(std::sync::atomic::Ordering::Relaxed),
+            crate::logging::unix_now(),
+            within,
+        )
+    }
+}
+
+/// 「最近有没有人通过 HTTP 看过」的纯判断（抽成自由函数是为了能单测）。
+///
+/// `last == 0` 表示从没有人拉过接口 —— 那不算「有人在看」，
+/// 否则服务刚启动（时间戳还没被写过）会被误判成「正有人盯着」。
+fn http_seen_recent(last: i64, now: i64, within: i64) -> bool {
+    last > 0 && now.saturating_sub(last) <= within.max(1)
 }
 
 /// 启动 HTTP 服务（阻塞）。`config_path` 只用来定位台账文件（与配置文件同目录）。
@@ -152,6 +199,7 @@ pub fn serve(
         wechat,
         cache: Arc::new(cache::StateCache::new()),
         tasks: Arc::new(tasks::Registry::new()),
+        last_http_seen: std::sync::atomic::AtomicI64::new(0),
     });
     log::info!("流量配额台账：{}", state.quota.path());
     log::info!("IMEI 备份台账：{}", state.imei.path());
@@ -187,5 +235,40 @@ fn cfg_schedule_interval(state: &AppState) -> i64 {
         10
     } else {
         n
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::http_seen_recent;
+
+    #[test]
+    fn http_seen_recent_boundaries() {
+        // 从没人拉过接口（时间戳还是 0）= 没人在看，不能算「正有人盯着」
+        assert!(!http_seen_recent(0, 1000, 60));
+        // 刚拉过（差值 0）→ 在看
+        assert!(http_seen_recent(1000, 1000, 60));
+        // 窗口内 → 在看（含边界）
+        assert!(http_seen_recent(1000, 1060, 60));
+        // 超窗口 → 不在看（页面已关，停发 AT 省串口）
+        assert!(!http_seen_recent(1000, 1061, 60));
+    }
+
+    #[test]
+    fn http_seen_recent_survives_clock_rollback() {
+        // NTP 校时把时钟往回调时，now - last 为负，saturating_sub 饱和到 0，
+        // 于是判为「刚有人看过」→ 继续采样。
+        //
+        // 这是**有意的**降级，不是 bug：时钟异常时我们无从知道最后一次访问是多久前，
+        // 此时停掉所有后台采样（页面静默失去数据）比多采一轮糟得多。
+        // 用 saturating_sub 而非 `-`，也顺带杜绝了 i64 下溢。
+        assert!(http_seen_recent(1000, 500, 60));
+    }
+
+    #[test]
+    fn http_seen_recent_ignores_nonpositive_window() {
+        // within <= 0 时兜底成 1 秒，避免「永远不在看」把后台采样彻底关死
+        assert!(http_seen_recent(1000, 1000, 0));
+        assert!(!http_seen_recent(1000, 1002, 0));
     }
 }

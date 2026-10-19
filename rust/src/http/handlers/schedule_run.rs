@@ -19,19 +19,20 @@ struct RunReq {
 
 pub fn handle(mut req: Request, state: &AppState, _query: &HashMap<String, String>) -> Result<()> {
     let body = request::read_body(&mut req);
-    let parsed: RunReq = serde_json::from_str(&body)
-        .map_err(|e| crate::error::msg(format!("请求体应为 JSON：{e}")))?;
+    let parsed: RunReq = match serde_json::from_str(&body) {
+        Ok(p) => p,
+        Err(e) => return response::fail(req, -1, &format!("请求体应为 JSON：{e}")),
+    };
     let run = match schedule::run_now(state, parsed.id.trim()) {
         Ok(run) => run,
         Err(e) => return response::fail(req, -1, &e.to_string()),
     };
+    let view = match response::to_value(schedule::view(state)) {
+        Ok(j) => j,
+        Err(e) => return response::fail(req, -1, &e),
+    };
     if !run.ok {
-        return response::fail_data(
-            req,
-            -1,
-            serde_json::to_value(schedule::view(state))?,
-            &run.msg,
-        );
+        return response::fail_data(req, -1, view, &run.msg);
     }
-    response::ok_msg(req, serde_json::to_value(schedule::view(state))?, "已执行")
+    response::ok_msg(req, view, "已执行")
 }

@@ -50,11 +50,29 @@ pub fn is_public_path(path: &str) -> bool {
     )
 }
 
-fn client_is_localhost(req: &Request) -> bool {
-    match req.remote_addr() {
-        Some(addr) => addr.ip().is_loopback(),
-        None => false,
+/// 请求的真实来源地址。
+///
+/// 优先读网关注入的 `X-Real-IP`：普通 HTTP 请求是先被 `gateway::proxy` 转给
+/// 内部 tiny_http 的，`req.remote_addr()` 在那条链路上**恒为 127.0.0.1**。
+/// 早先直接用它判「本机请求」，导致 `require_luci_login` 对所有请求都放行
+/// —— 默认 `listen = "0.0.0.0:9527"` 下，局域网内任何人都能无密码调用
+/// 全部接口（改 IMEI / 发短信 / 切飞行模式）。
+///
+/// `X-Real-IP` 由网关**覆盖式**写入（先删客户端自带的那行），所以外部伪造无效。
+/// 读不到这个头时（理论只有直连内部端口的测试会这样）才退回 `remote_addr`。
+fn client_addr(req: &Request) -> Option<std::net::IpAddr> {
+    for header in req.headers() {
+        if header.field.equiv("X-Real-IP") {
+            if let Ok(ip) = header.value.as_str().trim().parse() {
+                return Some(ip);
+            }
+        }
     }
+    req.remote_addr().map(|a| a.ip())
+}
+
+fn client_is_localhost(req: &Request) -> bool {
+    client_addr(req).map(|ip| ip.is_loopback()).unwrap_or(false)
 }
 
 /// 从 Cookie 头里取一个值。

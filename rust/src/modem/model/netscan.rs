@@ -297,7 +297,15 @@ pub fn parse_cnwsearch(resp: &str) -> Vec<CellInfo> {
                 }
                 continue;
             };
-            if plmn.is_none() && t.len() >= 5 && t.len() <= 6 && v > 0 {
+            // PLMN 与频点的取值区间是**重叠**的（PLMN 5~6 位，NR-ARFCN 常见 6 位），
+            // 所以按长度分派，而不是「5~6 位一律先判 PLMN」：
+            //   · 5 位  → MCC(3) + MNC(2)，这是 PLMN 最常见的形态
+            //   · ≥6 位 → 先当频点（NR-ARFCN 普遍是 6 位，如 627264）
+            // 早先的写法会把 627264 认成国家码，凭空编出 MCC=627 / MNC=264，
+            // 而真正的频点反倒因为 earfcn 已空过站而留在 0。
+            // 已知取舍：3 位 MNC 的 6 位 PLMN（如 460000）会被当成频点 ——
+            // 但「编造一个不存在的运营商」比「偶尔认不出 PLMN」危害大得多。
+            if plmn.is_none() && t.len() == 5 && v > 0 {
                 plmn = Some(t.to_string());
             } else if earfcn.is_none() && v > 1000 && v < 10_000_000 {
                 earfcn = Some(v);
@@ -435,5 +443,27 @@ OK"#;
     fn cnwsearch_skips_unparsable_lines() {
         assert!(parse_cnwsearch("+CNWSEARCH: 0\r\nOK\r\n").is_empty());
         assert!(parse_cnwsearch("ERROR").is_empty());
+    }
+
+    #[test]
+    fn arfcn_is_not_mistaken_for_plmn() {
+        // 频点排在 PLMN **前面**的行（部分固件就这么排）。
+        // 旧的判据「5~6 位一律先判 PLMN」会把 627264 当国家码，
+        // 编出 mcc=627 / mnc=264，真正的频点反倒留在 0。
+        let cells = parse_cnwsearch("+CNWSEARCH: 1,627264,46011,702,-88,-11\r\nOK\r\n");
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].mcc, "460", "不该拿频点当前三位");
+        assert_eq!(cells[0].mnc, "11");
+        assert_eq!(cells[0].earfcn, 627264, "6 位应优先当频点");
+        assert_eq!(cells[0].pcid, 702);
+    }
+
+    #[test]
+    fn five_digit_value_is_read_as_plmn() {
+        // 5 位仍按 PLMN 收（MCC 3 位 + MNC 2 位，最常见的形态）
+        let cells = parse_cnwsearch("+CNWSEARCH: 1,46000,1850,120,-95,-12\r\nOK\r\n");
+        assert_eq!(cells[0].mcc, "460");
+        assert_eq!(cells[0].mnc, "00");
+        assert_eq!(cells[0].earfcn, 1850);
     }
 }

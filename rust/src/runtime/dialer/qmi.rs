@@ -640,12 +640,24 @@ mod tests {
         assert_eq!(m.client, 4);
         assert_eq!(m.message, WDA_SET_DATA_FORMAT);
         // 链路层协议写死 IP(2)
-        assert_eq!(find_tlv(&m.payload, 0x11, false), Some(&2u32.to_le_bytes()[..]));
+        assert_eq!(
+            find_tlv(&m.payload, 0x11, false),
+            Some(&2u32.to_le_bytes()[..])
+        );
         // 上下行聚合协议都是 QMAP 0x05
-        assert_eq!(find_tlv(&m.payload, 0x12, false), Some(&5u32.to_le_bytes()[..]));
-        assert_eq!(find_tlv(&m.payload, 0x13, false), Some(&5u32.to_le_bytes()[..]));
+        assert_eq!(
+            find_tlv(&m.payload, 0x12, false),
+            Some(&5u32.to_le_bytes()[..])
+        );
+        assert_eq!(
+            find_tlv(&m.payload, 0x13, false),
+            Some(&5u32.to_le_bytes()[..])
+        );
         // 最大报文数 = 窗口 / 512；最大尺寸 = 窗口
-        assert_eq!(find_tlv(&m.payload, 0x15, false), Some(&32u32.to_le_bytes()[..]));
+        assert_eq!(
+            find_tlv(&m.payload, 0x15, false),
+            Some(&32u32.to_le_bytes()[..])
+        );
         assert_eq!(
             find_tlv(&m.payload, 0x16, false),
             Some(&(16 * 1024u32).to_le_bytes()[..])
@@ -653,7 +665,10 @@ mod tests {
         // 端点 TLV：ep_type=HSUSB(2) + iface_id=4
         let ep = find_tlv(&m.payload, 0x17, false).expect("端点 TLV");
         assert_eq!(ep.len(), 8);
-        assert_eq!(u32::from_le_bytes([ep[0], ep[1], ep[2], ep[3]]), EP_TYPE_HSUSB);
+        assert_eq!(
+            u32::from_le_bytes([ep[0], ep[1], ep[2], ep[3]]),
+            EP_TYPE_HSUSB
+        );
         assert_eq!(u32::from_le_bytes([ep[4], ep[5], ep[6], ep[7]]), 4);
         // QOS 头 = 0
         assert_eq!(find_tlv(&m.payload, 0x10, false), Some(&[0u8][..]));
@@ -665,7 +680,10 @@ mod tests {
         let mut buf = wda_set_data_format(1, 2, &s);
         let m = take(&mut buf).expect("完整帧");
         let ep = find_tlv(&m.payload, 0x17, false).expect("端点 TLV");
-        assert_eq!(u32::from_le_bytes([ep[0], ep[1], ep[2], ep[3]]), EP_TYPE_PCIE);
+        assert_eq!(
+            u32::from_le_bytes([ep[0], ep[1], ep[2], ep[3]]),
+            EP_TYPE_PCIE
+        );
         assert_eq!(
             find_tlv(&m.payload, 0x16, false),
             Some(&(32 * 1024u32).to_le_bytes()[..])
@@ -681,7 +699,10 @@ mod tests {
         assert_eq!(m.client, 5);
         assert_eq!(m.message, WDS_BIND_MUX_DATA_PORT);
         assert_eq!(find_tlv(&m.payload, 0x11, false), Some(&[0x83u8][..]));
-        assert_eq!(find_tlv(&m.payload, 0x13, false), Some(&1u32.to_le_bytes()[..]));
+        assert_eq!(
+            find_tlv(&m.payload, 0x13, false),
+            Some(&1u32.to_le_bytes()[..])
+        );
         let ep = find_tlv(&m.payload, 0x10, false).expect("端点 TLV");
         assert_eq!(ep.len(), 8);
     }

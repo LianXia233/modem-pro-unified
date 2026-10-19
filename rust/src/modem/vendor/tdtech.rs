@@ -96,12 +96,53 @@ impl VendorSpec for Spec {
         use crate::modem::atplan::{add_from_vendor, replace, AtCmdSpec};
         let mut v = crate::modem::atplan::base_specs(ctx);
 
-        add_from_vendor(&mut v, ctx, "neighbour", "邻区", "monnc", "model::cells::parse_neighbour", "^MONNC 邻区表");
-        add_from_vendor(&mut v, ctx, "iccid", "ICCID", "iccid", "model::siminfo::parse_iccid", "^ICCID: 数字");
-        add_from_vendor(&mut v, ctx, "temp", "模组温度", "chiptemp", "model::siminfo::parse_temp", "^CHIPTEMP 多传感器");
-        add_from_vendor(&mut v, ctx, "ambr", "签约速率 AMBR", "dsambr", "model::network::parse_ambr", "AMBR");
-        replace(&mut v, AtCmdSpec::on(
-            "imei_set", "IMEI 改写", "AT^PHYNUM=IMEI,\"<15 位>\"", "model::imei::write", "巴龙系", "厂商指令集"));
+        add_from_vendor(
+            &mut v,
+            ctx,
+            "neighbour",
+            "邻区",
+            "monnc",
+            "model::cells::parse_neighbour",
+            "^MONNC 邻区表",
+        );
+        add_from_vendor(
+            &mut v,
+            ctx,
+            "iccid",
+            "ICCID",
+            "iccid",
+            "model::siminfo::parse_iccid",
+            "^ICCID: 数字",
+        );
+        add_from_vendor(
+            &mut v,
+            ctx,
+            "temp",
+            "模组温度",
+            "chiptemp",
+            "model::siminfo::parse_temp",
+            "^CHIPTEMP 多传感器",
+        );
+        add_from_vendor(
+            &mut v,
+            ctx,
+            "ambr",
+            "签约速率 AMBR",
+            "dsambr",
+            "model::network::parse_ambr",
+            "AMBR",
+        );
+        replace(
+            &mut v,
+            AtCmdSpec::on(
+                "imei_set",
+                "IMEI 改写",
+                "AT^PHYNUM=IMEI,\"<15 位>\"",
+                "model::imei::write",
+                "巴龙系",
+                "厂商指令集",
+            ),
+        );
 
         v
     }

@@ -10,11 +10,96 @@
 //! `pkg.section.key='value'` 行格式，解析它只要几十行纯函数。
 //! 代价是每次组网要 fork 两个 `uci` —— 但组网循环 ≤15 秒一轮，可接受。
 
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use crate::error::{msg, Result};
 
 use super::{ExistingIface, UciOp};
+
+/// 普通 `uci` 子命令的超时（秒）。
+///
+/// `uci show` / `uci commit` 在操作 `/etc/config/*` 这种小文件时是毫秒级的，
+/// 给 10 秒是很大的裕量：真超了说明文件系统卡住或配置被写坏，
+/// 那时也不该让组网线程无限等下去。
+const UCI_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `/etc/init.d/network reload` 的超时（秒）。
+///
+/// 它要重建接口、可能触发 DHCP，比单条 uci 慢得多；给 30 秒。
+const NETWORK_RELOAD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 带超时的外部命令执行。
+///
+/// ## 为什么必须有它
+///
+/// `std::process::Command` 的 `output()` / `status()` 会**一直阻塞到子进程退出**。
+/// 这些命令跑在组网线程里（`netprov/provision.rs`），一旦卡住：
+///
+/// - 组网这一轮永远回不来，后面所有轮次都不再执行；
+/// - 更要命的是该轮尾部的**拨号器对账**也不跑了 —— 掉线无法自愈，
+///   而日志里干干净净，看不出「线程挂了」，只能看到「网络不动了」。
+///
+/// 这里用「看护线程 + `recv_timeout`」，超时后 kill 掉子进程：
+/// 既不引入第三方依赖（`wait_timeout` 那一类），也不会留下孤儿进程。
+///
+/// `program` / `args` 在超时分支里还要用来拼错误消息，所以线程里用的是
+/// 它们的**owned 副本**（`String` / `Vec<String>`），不借外面的引用。
+fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Result<Output> {
+    let child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| msg(format!("起不了 {program}: {e}")))?;
+
+    // `Child::wait_with_output` 要拿所有权，而超时分支还得留一份句柄去 kill，
+    // 所以用 `Option` 包起来：等待线程 take 走，超时分支仍能 as_mut() 拿到。
+    let shared: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(Some(child)));
+    let waiter = shared.clone();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let res = match waiter.lock() {
+            Ok(mut g) => match g.take() {
+                Some(c) => c.wait_with_output(),
+                None => Err(std::io::Error::other("子进程句柄已被取走")),
+            },
+            // 锁被别的 panic 污染：子进程状态不明，如实报，不假装成功
+            Err(_) => Err(std::io::Error::other("子进程的锁被污染")),
+        };
+        let _ = tx.send(res);
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(res) => res.map_err(|e| msg(format!("{program} 执行失败: {e}"))),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // 超时：先杀子进程，等待线程随即返回并结束，不留孤儿
+            if let Ok(mut g) = shared.lock() {
+                if let Some(c) = g.as_mut() {
+                    let _ = c.kill();
+                }
+            }
+            Err(msg(format!(
+                "{program} {} 执行超时（超过 {} 秒），已终止",
+                args.join(" "),
+                timeout.as_secs()
+            )))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(msg(format!("{program} 的等待线程提前退出")))
+        }
+    }
+}
+
+/// 跑一条外部命令并只要「退出码是否为 0」（stdout/stderr 丢弃）。
+fn ok_with_timeout(program: &str, args: &[&str], timeout: Duration) -> bool {
+    run_with_timeout(program, args, timeout)
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
 
 /// `uci` 可执行文件是否可用（顺带测一下 `--version` 能不能跑）。
 ///
@@ -23,32 +108,22 @@ pub fn available() -> bool {
     if !cfg!(unix) {
         return false;
     }
-    Command::new("uci")
-        .arg("-V")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    ok_with_timeout("uci", &["-V"], UCI_TIMEOUT)
 }
 
 /// 跑一条 `uci`，返回 stdout（trim 后）。
 fn run(args: &[&str]) -> Result<String> {
-    let out = Command::new("uci").args(args).output();
-    match out {
-        Ok(o) => {
-            let text = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if o.status.success() {
-                Ok(text)
-            } else {
-                let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                Err(msg(format!(
-                    "uci {} 失败: {}",
-                    args.join(" "),
-                    if err.is_empty() { "无 stderr" } else { &err }
-                )))
-            }
-        }
-        Err(e) => Err(msg(format!("跑不了 uci {}: {e}", args.join(" ")))),
+    let out = run_with_timeout("uci", args, UCI_TIMEOUT)?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if out.status.success() {
+        return Ok(text);
     }
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    Err(msg(format!(
+        "uci {} 失败: {}",
+        args.join(" "),
+        if err.is_empty() { "无 stderr" } else { &err }
+    )))
 }
 
 /// 读 `network` + `firewall` 的现状。
@@ -75,13 +150,7 @@ pub fn interface_loaded(name: &str) -> bool {
     if name.trim().is_empty() {
         return false;
     }
-    Command::new("ifstatus")
-        .arg(name.trim())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    ok_with_timeout("ifstatus", &[name.trim()], UCI_TIMEOUT)
 }
 
 /// 把 `uci show network` / `uci show firewall` 的文本解析成现状清单。
@@ -334,10 +403,7 @@ pub fn reload_network() -> Result<()> {
     // ⚠️ 这里要跑的是 init 脚本，**不是** uci 子命令：早先写成
     // `uci -c /etc/init.d/network reload`，实机直接回 "Usage: uci …"，
     // 结果 UCI 写进去了却没生效（接口一直是 DOWN）。
-    let out = Command::new("/etc/init.d/network")
-        .arg("reload")
-        .output()
-        .map_err(|e| msg(format!("跑不了 /etc/init.d/network reload: {e}")))?;
+    let out = run_with_timeout("/etc/init.d/network", &["reload"], NETWORK_RELOAD_TIMEOUT)?;
     if out.status.success() {
         return Ok(());
     }

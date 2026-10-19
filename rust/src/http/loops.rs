@@ -61,6 +61,17 @@ const NETPROV_INTERVAL: u64 = 15;
 /// 洪水丢弃告警的限流间隔：同一模组这么久才再喊一次（否则会被刷屏）。
 const URC_DROP_WARN_EVERY: Duration = Duration::from_secs(30);
 
+/// 「还有人在看」的判定窗口（秒）。
+///
+/// 采样循环原来是「有 WebSocket 主动客户端才发 AT」，可 LuCI 前端只走
+/// **HTTP 轮询**（它连不上 WS：跨端口跨源，ucode 代理也转不了长连接）——
+/// 于是 LuCI 用户一次采样都触发不了，快照里的块永远是空的。
+///
+/// 现在改成「有 WS 客户端，**或**最近这么久内有人拉过 HTTP 接口」。
+/// 取 60 秒的理由：LuCI 前台轮询 3 秒、后台 15 秒，留足 4 倍裕量，
+/// 页面开着就一直在采；关掉页面 1 分钟后自动停发 AT，省串口。
+pub(crate) const VIEWER_WINDOW_S: i64 = 60;
+
 /// `+CMTI` 触发重读短信的最小间隔：群发时会连续来好几条，每条的索引都指向
 /// 同一个列表，重读一次就够，反复读只会把串口占满。
 const SMS_REFRESH_MIN_GAP: Duration = Duration::from_secs(10);
@@ -219,6 +230,14 @@ fn spawn_hotplug_notify(state: &Arc<AppState>, interval: i64) {
         let mut last = signature(&state);
         loop {
             std::thread::sleep(Duration::from_secs(every));
+            // 巡检回收掉的模组：它们的状态缓存要跟着清。
+            //
+            // 放在推送判断**之前** —— 清缓存不该受「有没有人连着 WebSocket」影响，
+            // 否则 LuCI 的 HTTP 轮询用户（连不上 WS）那边会一直攒着已拔掉模组的条目。
+            // `forget` 此前一直是 `#[allow(dead_code)]`：终于有调用方了。
+            for id in state.mgr.take_reaped() {
+                state.cache.forget(id);
+            }
             if state.ws.client_count() == 0 {
                 continue;
             }
@@ -252,9 +271,12 @@ fn spawn_push(state: &Arc<AppState>, interval: i64) {
     let state = state.clone();
     std::thread::spawn(move || {
         let mut last_net: HashMap<u32, i64> = HashMap::new();
+        let mut last_modem: HashMap<u32, i64> = HashMap::new();
         loop {
             std::thread::sleep(Duration::from_secs(interval as u64));
-            if state.ws.active_count() == 0 {
+            // 有 WebSocket 客户端，或最近有人拉过 HTTP 接口（LuCI 的轮询）：
+            // 两类前端都算「有人在看」，别再只认 WS（见 VIEWER_WINDOW_S）。
+            if !state.viewer_active(VIEWER_WINDOW_S) {
                 continue;
             }
             let net_due = network_due(&state, &mut last_net);
@@ -266,9 +288,36 @@ fn spawn_push(state: &Arc<AppState>, interval: i64) {
                 if net_due.contains(&modem.id) {
                     super::push::push_network(&state, &modem);
                 }
+                // SIM / 硬件参数按分钟级节流（换卡才会变，不跟秒级节拍抢串口），
+                // 且只在缓存里还没有时才立刻补一次 —— 页面刚打开时靠它填首屏。
+                if modem_due(&state, &mut last_modem, &modem) {
+                    super::push::push_modem(&state, &modem);
+                }
             }
         }
     });
+}
+
+/// 本轮该不该刷 `modem` 块（SIM / 硬件参数）。
+///
+/// 两个条件满足其一：
+/// - 缓存里还没有这个模组的 `modem` 块 —— 说明页面刚打开还没采过，立刻补一次；
+/// - 距上次刷新已超过 [`super::push::MODEM_REFRESH_EVERY`]。
+///
+/// 「没采过就立刻采」这一条是有意的：否则 LuCI 首屏的 SIM 卡信息要干等 5 分钟。
+fn modem_due(
+    state: &AppState,
+    last: &mut HashMap<u32, i64>,
+    modem: &crate::modem::model::Modem,
+) -> bool {
+    let now = crate::logging::unix_now();
+    let prev = last.get(&modem.id).copied().unwrap_or(0);
+    let never = state.cache.get("modem", modem.id).is_none();
+    if never || now - prev >= super::push::MODEM_REFRESH_EVERY {
+        last.insert(modem.id, now);
+        return true;
+    }
+    false
 }
 
 /// 流量采样循环：单独一个更短的节拍（默认 1 秒）。
@@ -283,7 +332,7 @@ fn spawn_traffic(state: &Arc<AppState>, interval: i64) {
     let state = state.clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(interval as u64));
-        if state.ws.active_count() == 0 {
+        if !state.viewer_active(VIEWER_WINDOW_S) {
             continue;
         }
         for modem in state.mgr.all() {
@@ -331,7 +380,8 @@ fn spawn_change(state: &Arc<AppState>, interval: i64) {
         let mut last_net: HashMap<u32, i64> = HashMap::new();
         loop {
             std::thread::sleep(Duration::from_secs(interval as u64));
-            if state.ws.active_count() > 0 {
+            // 只在没人在看时补采样：有人看的时候查询会顺手记录，不必重复占串口
+            if state.viewer_active(VIEWER_WINDOW_S) {
                 continue;
             }
             let net_due = network_due(&state, &mut last_net);

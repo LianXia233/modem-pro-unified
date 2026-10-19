@@ -48,16 +48,13 @@ pub fn handle(req: Request, state: &AppState, query: &HashMap<String, String>) -
 }
 
 /// 取整数型 query 参数（缺省用 `default`；非整数报错）。
+/// 严格整数参数（转发到 [`crate::http::request::strict_i64_param`]）。
+///
+/// 保留这个转发壳是为了不动既有调用点；实现只此一份。
 pub fn int_param(
     query: &HashMap<String, String>,
     key: &str,
     default: i64,
 ) -> std::result::Result<i64, String> {
-    match query.get(key) {
-        Some(v) if !v.is_empty() => v
-            .trim()
-            .parse::<i64>()
-            .map_err(|_| format!("{key} must be an integer")),
-        _ => Ok(default),
-    }
+    crate::http::request::strict_i64_param(query, key, default)
 }

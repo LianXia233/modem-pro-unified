@@ -53,8 +53,22 @@ pub fn run() -> error::Result<()> {
         atport.clone(),
         atport_bind.clone(),
     ));
-    mgr.discover(true);
-    log::info!("启动发现完成：模组 {} 个", mgr.count());
+    // 首次发现放到**后台**：HTTP 必须先起来。
+    //
+    // 原来是同步 `discover(true)` 挡在 `http::serve` 前面。实机（FM350-GL）上
+    // 这台机器有 7 个 `/dev/ttyUSB*`，只有 ttyUSB4 是 AT 口，其余每个都要等
+    // 探测超时 —— 启动到 HTTP 可用整整 **40 秒**，这 40 秒里 LuCI 所有页面都是
+    // 「modemd 无响应」。放到后台后页面秒开，模组列表几秒后自己填上
+    //（页面本来就在轮询 `/api/snapshot`，`modems` 会随之更新）。
+    //
+    // `discover` 内部有互斥锁，与后面的周期巡检、页面的 `?discover=1` 并发安全。
+    {
+        let mgr = mgr.clone();
+        std::thread::spawn(move || {
+            mgr.discover(true);
+            log::info!("启动发现完成：模组 {} 个", mgr.count());
+        });
+    }
 
     runtime::scheduler::spawn_scan(mgr.clone(), cfg.server.scan_interval);
 

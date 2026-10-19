@@ -13,6 +13,20 @@
 ///
 /// FM350 在 NR 制式下 `+GTCCINFO` 的 `<band>` 字段实测为空，只能靠 ARFCN 反推。
 /// 返回 `None` 表示落在本地表未覆盖的范围 —— 不做猜测，宁可显示空。
+///
+/// ## 与 `cells::band_from_earfcn` 的关系（别当成重复实现删掉）
+///
+/// 两份**都保留**，职责不同：
+///
+/// | | 本函数 | `cells::band_from_earfcn` |
+/// | --- | --- | --- |
+/// | 返回 | `Option<&'static str>`（`"n77/n78"`） | `i32`（`78`） |
+/// | 用途 | 给人看的标签，重叠频段显式标出 | 填 `CellInfo.band`、喂给锁频段与 `band_label` |
+/// | 换算 | MHz 浮点区间 | ARFCN 整数区间直判 |
+///
+/// 重叠区（如 3300–3800 MHz 同时属于 n77 与 n78）本函数标 `"n77/n78"`，
+/// 而 `cells` 那份必须落到一个整数上、取更常见的 n78 —— 这是**表达方式**的差异，
+/// 不是谁算错了。当前生产路径走 `cells` 那份；本函数有完整单测，作为参考实现保留。
 pub fn nr_band_from_arfcn(arfcn: i64) -> Option<&'static str> {
     // FR1 栅格：0 - 3000 MHz 用 5 kHz 步长；3000 - 24250 MHz 用 15 kHz 步长
     // （后者覆盖 n77/n78/n79）。
@@ -47,6 +61,9 @@ pub fn nr_band_from_arfcn(arfcn: i64) -> Option<&'static str> {
 /// 由 E-UTRA EARFCN 反推频段号（3GPP TS 36.101 表 5.7.3-1 的取值区间）。
 ///
 /// 直接按区间判定，不引入浮点换算，也就不会出现边界误差。
+///
+/// 与 [`nr_band_from_arfcn`] 同理：返回字符串标签，`cells::band_from_earfcn`
+/// 返回整数号，两者并存、各司其职（详见上一个函数的对照表）。
 pub fn lte_band_from_earfcn(earfcn: i64) -> Option<&'static str> {
     Some(match earfcn {
         0..=599 => "B1",

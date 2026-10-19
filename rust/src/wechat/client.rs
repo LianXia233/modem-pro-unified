@@ -406,8 +406,7 @@ impl WeChatClient {
         }
         let sender = msg.sender.trim().to_string();
         *self.last_sender.lock().unwrap() = sender.clone();
-        *self.last_incoming.lock().unwrap() =
-            Some((sender, crate::logging::timestamp()));
+        *self.last_incoming.lock().unwrap() = Some((sender, crate::logging::timestamp()));
         true
     }
 

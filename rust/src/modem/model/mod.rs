@@ -6,6 +6,7 @@ pub(crate) use addr::format_ipv6_bytes;
 mod airplane;
 mod band;
 mod bind;
+pub mod ca;
 mod cells;
 pub mod changes;
 mod device;
@@ -43,6 +44,7 @@ pub use bind::{
     bind_l2p, unbind_l2p, BindEntry, BindState, EMBIND_READ, EMBIND_TEST, L2P_CCMNI, L2P_LHIF,
     L2P_MBIM, L2P_RNDIS,
 };
+pub use ca::{parse_ca, CaInfo};
 pub use cells::{CellInfo, CellScanResult};
 pub use changes::{ChangeEntry, ChangeState, GLOBAL_MAX};
 pub use device::{ClockSyncResult, RebootResult};

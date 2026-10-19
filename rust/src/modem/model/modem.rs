@@ -17,7 +17,7 @@ use super::dial::{DialState, DialTypeInfo};
 use super::lock::{DialectInfo, LockStatus};
 use super::sim::SimIdentity;
 use super::sms::{self, ConcatInfo, Sms, SmsStorage};
-use super::traffic::TrafficPrev;
+use super::traffic::{RateTotal, TrafficPrev};
 use super::ussd::UssdResult;
 use super::view::ModemView;
 
@@ -54,6 +54,11 @@ pub struct Modem {
     pub(super) sms_mem_active: Mutex<Option<String>>,
     /// 上一次流量采样（速率是差分出来的，见 model/traffic.rs）
     pub(super) traffic_prev: Mutex<Option<TrafficPrev>>,
+    /// 速率式模组的**本地积分**累计量（见 model/traffic.rs）。
+    ///
+    /// 广和通只回瞬时速率（`AT+GTSTATIS`），没有累计计数器；而页面的
+    /// 「累计已发送 / 已接收」不能永远是 0 —— 这里按「速率 × 采样间隔」积分。
+    pub(super) rate_total: Mutex<Option<RateTotal>>,
     /// 正在进行的主动扫网的取消标志（见 model/netscan.rs）
     pub(super) netscan_stop: Mutex<Option<Arc<AtomicBool>>>,
     /// 拨号状态机（见 model/dial.rs；零值 = 没拨过号）
@@ -118,6 +123,7 @@ impl Modem {
             sms_mem_pref: Mutex::new(String::new()),
             sms_mem_active: Mutex::new(None),
             traffic_prev: Mutex::new(None),
+            rate_total: Mutex::new(None),
             netscan_stop: Mutex::new(None),
             dial_state: Mutex::new(DialState::default()),
             dial_busy: AtomicBool::new(false),

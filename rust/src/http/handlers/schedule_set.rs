@@ -27,8 +27,12 @@ struct SetReq {
 
 pub fn handle(mut req: Request, state: &AppState, _query: &HashMap<String, String>) -> Result<()> {
     let body = request::read_body(&mut req);
-    let mut parsed: SetReq = serde_json::from_str(&body)
-        .map_err(|e| crate::error::msg(format!("请求体应为 JSON 任务：{e}")))?;
+    // 解析失败必须回信封：`?` 会把 Request 丢回网关层，连接上什么都不会写，
+    // 页面只看到「modemd 无响应」，真正的 JSON 格式问题反而看不到。
+    let mut parsed: SetReq = match serde_json::from_str(&body) {
+        Ok(p) => p,
+        Err(e) => return response::fail(req, -1, &format!("请求体应为 JSON 任务：{e}")),
+    };
     let mut t = parsed.task;
     if t.start_actions.is_empty() {
         if let Some(a) = parsed.start_action.take() {
@@ -65,5 +69,5 @@ pub fn handle(mut req: Request, state: &AppState, _query: &HashMap<String, Strin
 
     let v = schedule::view(state);
     schedule::push_view(state, &v);
-    response::ok(req, serde_json::to_value(v)?)
+    response::json_body(req, v)
 }

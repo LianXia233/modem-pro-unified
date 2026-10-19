@@ -167,8 +167,12 @@ return view.extend({
 							btn.disabled = true;
 							var orig = btn.textContent;
 							btn.textContent = '拨号中…';
-							return api.post('/api/dial/connect', { modem_id: id }).then(function (d) {
-								ui.addNotification(null, E('p', {}, (d && d.msg) || '已交办内置拨号器，正在建立会话'), 'info');
+							return task.run(api, 'dial.connect', { modem_id: id }, {
+							onTick: function (t) {
+								if (t && t.progress) btn.textContent = t.progress;
+							}
+						}).then(function (d) {
+								ui.addNotification(null, E('p', {}, (d && d.msg) || '拨号完成，正在建立数据会话'), 'info');
 								store.refresh();
 								window.setTimeout(function () { window.location.reload(); }, 2000);
 							}).catch(function (e) {
@@ -183,7 +187,7 @@ return view.extend({
 							btn.disabled = true;
 							var orig = btn.textContent;
 							btn.textContent = '断开中…';
-							return api.post('/api/dial/disconnect', { modem_id: id }).then(function (d) {
+							return task.run(api, 'dial.disconnect', { modem_id: id }).then(function (d) {
 								ui.addNotification(null, E('p', {}, (d && d.msg) || '数据连接已断开'), 'info');
 								store.refresh();
 								window.setTimeout(function () { window.location.reload(); }, 1500);

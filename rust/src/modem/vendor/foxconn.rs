@@ -74,9 +74,33 @@ impl VendorSpec for Spec {
         use crate::modem::atplan::add_from_vendor;
         let mut v = crate::modem::atplan::base_specs(ctx);
 
-        add_from_vendor(&mut v, ctx, "usbnet", "USB 网卡模式", "usbswitch", "model::usbnet", "AT!USBSWITCH 枚举");
-        add_from_vendor(&mut v, ctx, "lock_mode", "组网模式偏好", "slmode", "model::mode::foxconn", "AT!SLMODE 枚举");
-        add_from_vendor(&mut v, ctx, "signal", "信号（CESQ）", "cesq", "model::signal::parse_cesq", "rsrq/rsrp");
+        add_from_vendor(
+            &mut v,
+            ctx,
+            "usbnet",
+            "USB 网卡模式",
+            "usbswitch",
+            "model::usbnet",
+            "AT!USBSWITCH 枚举",
+        );
+        add_from_vendor(
+            &mut v,
+            ctx,
+            "lock_mode",
+            "组网模式偏好",
+            "slmode",
+            "model::mode::foxconn",
+            "AT!SLMODE 枚举",
+        );
+        add_from_vendor(
+            &mut v,
+            ctx,
+            "signal",
+            "信号（CESQ）",
+            "cesq",
+            "model::signal::parse_cesq",
+            "rsrq/rsrp",
+        );
 
         v
     }

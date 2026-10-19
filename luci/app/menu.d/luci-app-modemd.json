@@ -118,6 +118,11 @@
 				"cookie:sysauth_https",
 				"cookie:sysauth_http"
 			]
+		},
+		"depends": {
+			"acl": [
+				"luci-app-modemd"
+			]
 		}
 	}
 }

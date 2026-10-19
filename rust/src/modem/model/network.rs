@@ -222,6 +222,12 @@ impl Modem {
         let cells = self.cells_cached();
         let serving = cells.serving.first().cloned();
 
+        // 载波聚合：实时查一次（此前 `ca` / `ca_active` 是恒空占位）。
+        // 指令按厂商挑，解析见 model/ca.rs。手册标的耗时 < 1s，
+        // 相对本函数已有的 6~8 条 AT 是可接受的增量；查询失败只是这两项为空，
+        // 不会连累其余字段。
+        let ca = self.ca_status();
+
         // 漫游范围：不漫游时不用多读 IMSI
         let roam_scope = if roaming {
             let imsi = self
@@ -237,7 +243,11 @@ impl Modem {
         let air = self.airplane();
         let duplex = f.net_tech.as_deref().map(duplex_of);
         let cfun = if air.supported {
-            if air.enabled { 4 } else { 1 }
+            if air.enabled {
+                4
+            } else {
+                1
+            }
         } else {
             0
         };
@@ -266,8 +276,10 @@ impl Modem {
             neighbour_count: cells.neighbour_count,
             // 没扫过就是空串（cells_cached 的空结果不带时间戳）
             scanned_at: self.cell_scan_at().unwrap_or_default(),
-            ca: Vec::new(),
-            ca_active: false,
+            // 实时 CA 查询（此前这两项是恒空占位）：指令按厂商挑，
+            // 解析见 model/ca.rs（广和通那段照官方手册 §11.1.16）
+            ca: ca.as_ref().map(|c| c.ccs.clone()).unwrap_or_default(),
+            ca_active: ca.as_ref().map(|c| c.ca_active).unwrap_or(false),
             apn,
             ipv4,
             ipv6,

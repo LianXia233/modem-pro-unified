@@ -18,6 +18,16 @@ pub struct ModemManager {
     atport_bind: Arc<AtPortBindStore>,
     modems: RwLock<BTreeMap<u32, Arc<Modem>>>,
     next_id: RwLock<u32>,
+    /// 本轮巡检回收掉的模组 id（等 `http::serve` 侧的循环取走清缓存）。
+    reaped: std::sync::Mutex<Vec<u32>>,
+    /// 发现流程的互斥锁：**一次只允许一个 discover 在跑**。
+    ///
+    /// 存在的理由：启动发现（后台线程）、周期巡检、页面的
+    /// `GET /api/modems?discover=1` 三方可能同时进来；而 `discover` 内部是
+    /// 「读一次 known 快照 → 逐个探测 → 插入」的非原子流程，两个线程会各自
+    /// 看到对方还没插入的口，于是**同一台设备被登记两次**（id 不同、抢同一个
+    /// tty）—— 表现为列表里冒出幽灵模组、AT 应答互相串扰。
+    discovering: std::sync::Mutex<()>,
 }
 
 impl ModemManager {
@@ -28,6 +38,8 @@ impl ModemManager {
             atport_bind,
             modems: RwLock::new(BTreeMap::new()),
             next_id: RwLock::new(0),
+            reaped: std::sync::Mutex::new(Vec::new()),
+            discovering: std::sync::Mutex::new(()),
         }
     }
 
@@ -50,7 +62,15 @@ impl ModemManager {
     /// 若台账里有它的命令口且与探到的不同，整口换过去（并回收被换口上的
     /// 「幻影模组」—— 简化模型下同一物理设备的多个 tty 会各自成一个模组）。
     pub fn discover(&self, _force: bool) -> usize {
+        // 串行化：见 `discovering` 字段的说明。持锁期间不要再调 `reap_gone`
+        // 之外会重入的公开方法。
+        let _serial = self.discovering.lock().unwrap_or_else(|e| e.into_inner());
         let baud = self.cfg.serial.baud;
+        // ① 先回收消失的模组，**再**统计已知口。
+        //
+        // 顺序要紧：`known` 里要是还留着已拔掉设备的口，
+        // `discover_new` 就会一直跳过它 —— 同一台设备重插后再也发现不了。
+        self.reap_gone();
         let known: BTreeSet<String> = self
             .modems
             .read()
@@ -81,6 +101,62 @@ impl ModemManager {
             added += 1;
         }
         added
+    }
+
+    /// 回收「设备已经不在了」的模组，返回被摘掉的 id 列表。
+    ///
+    /// ## 为什么必须有这一步
+    ///
+    /// 早先 `discover()` 只增不删，于是拔卡 / 拔模组之后：
+    ///
+    /// - 它仍留在列表里，`is_running()` 恒为 true，后台每个循环都要对它发一次 AT
+    ///   （每次都超时，白等一个 `command_timeout`）；
+    /// - 它的串口句柄从不释放（fd 泄漏，反复热插拔会攒到 ulimit）；
+    /// - 最要命的是：它的口一直在 `known` 集合中，**同一台设备重插后再也发现不了**
+    ///   —— 用户看到的就是「拔了再插，模组不见了」，只能重启 modemd。
+    ///
+    /// ## 判据为什么只看「设备文件在不在」
+    ///
+    /// 用「打不开串口」当判据会误杀：设备正忙（另一个进程占着）、权限临时受限、
+    /// 模组正在重启，都会让 `open` 失败，但设备其实还在 —— 那样会把一台好模组
+    /// 反复删掉再重建，界面上 id 一直跳。只看设备文件是否存在则没有这个歧义：
+    /// 拔掉了文件才消失。
+    pub fn reap_gone(&self) -> Vec<u32> {
+        let gone: Vec<u32> = {
+            let g = self.modems.read().unwrap();
+            g.values()
+                .filter(|m| !super::discovery::port_exists(&m.port()))
+                .map(|m| m.id)
+                .collect()
+        };
+        if gone.is_empty() {
+            return gone;
+        }
+        let mut removed = Vec::new();
+        {
+            let mut w = self.modems.write().unwrap();
+            for id in &gone {
+                if let Some(m) = w.remove(id) {
+                    // `Arc<Modem>` 的引用计数归零后，里面的 `AtPort` 被 drop，
+                    // serialport 会替我们关掉 fd —— 不需要手动 close。
+                    log::info!(
+                        "模组 id={id}（at={}）的设备已消失，已回收（串口随对象释放）",
+                        m.port()
+                    );
+                    removed.push(*id);
+                }
+            }
+        }
+        // 攒起来等调用方取走（清缓存）：`http::serve` 那侧的巡检循环会定期拿
+        self.reaped.lock().unwrap().extend(removed.iter().copied());
+        removed
+    }
+
+    /// 取走「本轮巡检回收掉的模组 id」（调用方据此清 `StateCache`）。
+    ///
+    /// 取走即清，所以同一批 id 只会被清理一次。
+    pub fn take_reaped(&self) -> Vec<u32> {
+        std::mem::take(&mut *self.reaped.lock().unwrap())
     }
 
     /// 按台账里这台模组的手动指定切口（没有指定 / 指定为空 = 自动探测，不动）。

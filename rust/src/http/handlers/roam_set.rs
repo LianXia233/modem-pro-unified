@@ -18,7 +18,24 @@ pub fn handle(mut req: Request, state: &AppState, query: &HashMap<String, String
     let Some(modem) = modem_by_query(state, &params) else {
         return response::fail(req, -1, "modem not found");
     };
-    let on = request::bool_param(&params, "on", true);
+    // ⚠️ 这个开关**不能**用「缺省 true」：漏传 `on` 会被解释成「开启数据漫游」，
+    // 在国际漫游下意味着悄悄放行流量。必须显式给值，给了但认不出也要报错。
+    let on = match params
+        .get("on")
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("1") | Some("true") | Some("on") | Some("yes") | Some("y") => true,
+        Some("0") | Some("false") | Some("off") | Some("no") | Some("n") => false,
+        Some(other) => {
+            return response::fail(
+                req,
+                -1,
+                &format!("on 参数无法识别：{other}（用 true / false）"),
+            )
+        }
+        None => return response::fail(req, -1, "缺少 on 参数（true / false）"),
+    };
 
     // 先写配置（失败也要把开关状态如实回给界面，不能假装成功）
     let written = patch::set_raw(

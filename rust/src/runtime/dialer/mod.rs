@@ -82,7 +82,10 @@ impl std::fmt::Display for PlanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PlanError::MbimNeedsApn => {
-                write!(f, "MBIM 模式必须给 APN（否则设备会拒绝 CONNECT），请先配置 APN")
+                write!(
+                    f,
+                    "MBIM 模式必须给 APN（否则设备会拒绝 CONNECT），请先配置 APN"
+                )
             }
             PlanError::NoDevice => write!(f, "没能确定这个模组的数据网卡"),
             PlanError::NoWdm(why) => write!(f, "{why}"),
@@ -124,9 +127,7 @@ fn warn_legacy_bin_once(state: &AppState) {
     if raw.is_empty() || is_native_bin_name(raw) || WARNED.swap(true, Ordering::Relaxed) {
         return;
     }
-    log::warn!(
-        "配置 host_dial_bin = {raw:?} 已失效：厂商拨号器已移除，改用内置 QMI/MBIM 实现"
-    );
+    log::warn!("配置 host_dial_bin = {raw:?} 已失效：厂商拨号器已移除，改用内置 QMI/MBIM 实现");
 }
 
 /// 拨号器托管器（一个进程一个，挂在全局 [`supervisor`] 上）。
@@ -196,7 +197,6 @@ impl DialerSupervisor {
     /// 非 Unix：没有 sysfs / 控制口，什么都不做（与旧实现一致）。
     #[cfg(not(unix))]
     pub fn reconcile(&self, _state: &AppState) {}
-
 }
 
 #[cfg(unix)]

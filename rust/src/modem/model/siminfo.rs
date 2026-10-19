@@ -39,6 +39,13 @@ pub struct RoamState {
 pub struct ModemStatus {
     pub modem_id: u32,
     pub queried_at: String,
+    /// 设备序列号（IMEI）。
+    ///
+    /// 概览页「模组硬件参数」卡片要显示它。放这里的理由：这是**只读身份**，
+    /// 一条 `AT+CGSN` 就够；而 `/api/imei` 属于「改写域」（带备份台账、Luhn
+    /// 校验位、可恢复标记），不该为了刷个概览就去动那套语义。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imei: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub iccid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -96,6 +103,8 @@ impl Modem {
             .and_then(parse_cnum)
             .map(|n| (n, "cnum".to_string()));
 
+        // 只读 IMEI：概览页的硬件参数卡片要显示它（写入相关语义仍归 `/api/imei`）
+        let imei = self.imei();
         let operator = imsi.as_deref().and_then(operator_from_imsi);
         let temps = self.query_temps();
         let temp_max = temps.iter().max_by_key(|s| s.celsius).cloned();
@@ -113,10 +122,12 @@ impl Modem {
             .map(|raw| regstate::parse(&raw, "+CGREG"))
             .unwrap_or_default();
         let roam = roam_state(ps.roaming, imsi.as_deref(), net_select.plmn.as_deref());
+        let roam_applies = matches!(roam.scope.as_str(), "domestic" | "global");
 
         Ok(ModemStatus {
             modem_id: self.id,
             queried_at: crate::logging::timestamp(),
+            imei,
             iccid,
             imsi,
             operator,
@@ -135,7 +146,10 @@ impl Modem {
             net_select,
             roam,
             roam_allowed: allow_roaming,
-            roam_applies: true,
+            // 「漫游策略是否适用」= 判据够不够（IMSI 与注册网 PLMN 都拿到才算）。
+            // 原来这里写死 `true`，等于把「判不出来所以不拦」说成「判过且适用」，
+            // 界面上的漫游提示会永远显示「已按策略处理」。
+            roam_applies,
         })
     }
 
@@ -374,12 +388,18 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// 由 IMSI 前 5 位推出运营商名（与网络侧 PLMN 互相印证）。
-pub fn operator_from_imsi(imsi: &str) -> Option<String> {
-    if imsi.len() < 5 {
-        return None;
-    }
-    let name = match &imsi[..5] {
+/// MCC+MNC → 中国运营商名（认不出返回 `None`）。
+///
+/// ## 这是全仓库**唯一**的一张运营商表
+///
+/// 早先 `cells.rs::operator_name` 里还有第二张，两表口径冲突：
+/// `46004` / `46008` 在 `cells.rs` 被判成「中国广电」，在这里被判成「中国移动」——
+/// 同一张卡，`/api/cells` 和 `/api/modem/status` 会显示成两家运营商。
+///
+/// 以本表为准（46004 / 46008 是中国移动的 4G / 物联网号段；广电是 46015）。
+/// `cells.rs::operator_name` 现在只是它的一个转發壳，页面口径因此统一。
+pub fn operator_from_plmn(mcc: &str, mnc: &str) -> Option<String> {
+    let name = match format!("{mcc}{mnc}").as_str() {
         "46000" | "46002" | "46004" | "46007" | "46008" => "中国移动",
         "46001" | "46006" | "46009" => "中国联通",
         "46003" | "46005" | "46011" => "中国电信",
@@ -389,9 +409,43 @@ pub fn operator_from_imsi(imsi: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+/// 由 IMSI 前 5 位推出运营商名（与网络侧 PLMN 互相印证）。
+pub fn operator_from_imsi(imsi: &str) -> Option<String> {
+    if imsi.len() < 5 {
+        return None;
+    }
+    operator_from_plmn(&imsi[..3], &imsi[3..5])
+}
+
 /// 挑出机身 / 5G 基带 / CPU 三个关键温度（能识别几个算几个）。
+///
+/// 早先这里直接 `temps.iter().take(3)` —— 取的是列表**前三项**，跟注释里写的
+/// 「按名称挑机身 / 5G 基带 / CPU」完全不是一回事。不同固件的上报顺序不一样
+/// （广和通按 sensor id 升序、移远按 slot 序），前三项经常是无关的通路。
+/// 现在按名字匹配；一个都对不上时才退回前三项，保证界面不至于全空。
 fn select_key_temps(temps: &[Sensor]) -> Vec<Sensor> {
-    temps.iter().take(3).cloned().collect()
+    const WANTED: [&[&str]; 3] = [
+        &["机身", "board", "case", "shell", "pa", "tsens"],
+        &["5g", "nr", "md_5g", "modem", "基带"],
+        &["cpu", "ap", "soc", "little", "big"],
+    ];
+    let mut picked: Vec<Sensor> = Vec::new();
+    for keys in WANTED {
+        let hit = temps.iter().find(|s| {
+            let n = s.name.to_ascii_lowercase();
+            keys.iter().any(|k| n.contains(k))
+        });
+        if let Some(s) = hit {
+            // 同一个传感器不会被两类同时挑中（分类互斥），这里只防重复
+            if !picked.iter().any(|p| p.name == s.name) {
+                picked.push(s.clone());
+            }
+        }
+    }
+    if picked.is_empty() {
+        return temps.iter().take(3).cloned().collect();
+    }
+    picked
 }
 
 /// 漫游判据：数据域漫游 + 卡归属 MCC + 注册网 MCC。
@@ -434,6 +488,97 @@ pub fn roam_state(roaming: bool, imsi: Option<&str>, visit_plmn: Option<&str>) -
 
 #[cfg(test)]
 mod tests {
+    use super::{operator_from_plmn, select_key_temps, Sensor};
+
+    #[test]
+    fn operator_table_is_single_source_of_truth() {
+        // 46004 / 46008 是中国移动的 4G / 物联网号段，广电是 46015。
+        // 这里同时钉住 `cells.rs::operator_name`（它是本表的转发壳），
+        // 保证两个页面不会再显示成两家运营商。
+        assert_eq!(operator_from_plmn("460", "04").as_deref(), Some("中国移动"));
+        assert_eq!(operator_from_plmn("460", "08").as_deref(), Some("中国移动"));
+        assert_eq!(operator_from_plmn("460", "15").as_deref(), Some("中国广电"));
+        assert_eq!(
+            crate::modem::model::cells::operator_name("460", "04"),
+            "中国移动"
+        );
+        assert_eq!(operator_from_plmn("999", "99"), None);
+    }
+
+    #[test]
+    fn imsi_and_plmn_agree() {
+        // IMSI 前 5 位与 PLMN 走同一张表
+        assert_eq!(
+            super::operator_from_imsi("460041234567890").as_deref(),
+            Some("中国移动")
+        );
+        assert_eq!(
+            super::operator_from_imsi("460151234567890").as_deref(),
+            Some("中国广电")
+        );
+        assert_eq!(
+            super::operator_from_imsi("4601"),
+            None,
+            "太短的 IMSI 不该瞎猜"
+        );
+    }
+
+    #[test]
+    fn key_temps_are_picked_by_name_not_position() {
+        let temps = vec![
+            Sensor {
+                name: "sensor0".into(),
+                celsius: 31,
+            },
+            Sensor {
+                name: "md_5g".into(),
+                celsius: 52,
+            },
+            Sensor {
+                name: "cpu_little".into(),
+                celsius: 44,
+            },
+            Sensor {
+                name: "board".into(),
+                celsius: 38,
+            },
+        ];
+        let key = select_key_temps(&temps);
+        let names: Vec<&str> = key.iter().map(|s| s.name.as_str()).collect();
+        // 旧的 take(3) 会挑出 sensor0/md_5g/cpu_little —— 前两项纯属占位
+        assert!(names.contains(&"board"), "机身温度应按名字挑到：{names:?}");
+        assert!(names.contains(&"md_5g"), "5G 基带应按名字挑到：{names:?}");
+        assert!(names.contains(&"cpu_little"), "CPU 应按名字挑到：{names:?}");
+        assert!(
+            !names.contains(&"sensor0"),
+            "无关通路不该进关键温度：{names:?}"
+        );
+    }
+
+    #[test]
+    fn key_temps_fall_back_to_first_three() {
+        // 名字一个都对不上时退回前三项，界面不至于全空
+        let temps = vec![
+            Sensor {
+                name: "a".into(),
+                celsius: 1,
+            },
+            Sensor {
+                name: "b".into(),
+                celsius: 2,
+            },
+            Sensor {
+                name: "c".into(),
+                celsius: 3,
+            },
+            Sensor {
+                name: "d".into(),
+                celsius: 4,
+            },
+        ];
+        assert_eq!(select_key_temps(&temps).len(), 3);
+    }
+
     use super::{
         gtsen_sensor_name, operator_from_imsi, parse_cbc, parse_cclk, parse_cnum,
         parse_gtsenrdtemp, parse_iccid, parse_imsi, parse_qtemp, roam_state, round1,

@@ -24,6 +24,23 @@
 
 ---
 
+## 错误契约（handler 失败时也必须有响应）
+
+所有接口（含失败路径）都返回同一个信封：
+
+```json
+{ "code": 0 | 非0, "data": <any>, "msg": "<人类可读的原因>" }
+```
+
+- `code == 0` 表示成功；非 0 表示失败，**HTTP 状态码通常仍是 200**（与前端既有约定一致）。
+- 例外：鉴权失败用 **401**、未注册路径用 **404**，且都带信封。
+- ⚠️ **实现约束**：`tiny_http::Request` 是一次性的。handler 一旦带着 `Err` 返回，
+  `Request` 已被 drop，网关层再也写不了任何字节 —— 连接上会是空的，页面只看到
+  「modemd 无响应」。因此 handler 内部**不得**用裸 `?` 传播错误，必须自己
+  `response::fail(...)`（或 `response::to_value` / `json_body` 这两个先序列化再响应的助手）。
+- 自测方法：对任意接口发一个必然失败的请求（如 `?modem_id=abc`），
+  应拿到带 `msg` 的信封而不是空回复。
+
 ## 接口
 
 ### GET /api/snapshot?modem_id=N
@@ -140,7 +157,7 @@ POST /api/tasks/cancel {id:"t1"}                  → {id, cancelled}
 | `duplex` | 从接入技术串拆出的 `FDD` / `TDD`；认不出就省略 |
 | `reg_5g` / `reg_eps` | 5GS / EPS 注册状态；**只在 CS/PS 都报未注册时补查**（5G SA 下 CREG/CGREG 会长期停在 0,0） |
 | `serving` / `serving_count` / `neighbour_count` / `scanned_at` | 服务小区与数量，取自**基站扫描缓存**（没扫过就没有 `scanned_at`，不触发扫描） |
-| `ca` / `ca_active` | 分量载波；当前只做结构占位（实时 `AT+QCAINFO` 解析未实现，通常为空） |
+| `ca` / `ca_active` | 分量载波（实时查询，见 `model/ca.rs`）。`ca_active` 只在**已激活**的辅载波存在时为真；模组不支持 CA 指令或本轮未上报时为 `[]` / `false` |
 | `roam_allowed` / `roam_scope` | 「数据漫游」开关与范围（`none` / `domestic` / `global` / `unknown`） |
 | `airplane` / `cfun` | 飞行模式与 `AT+CFUN?` 原值（1 = 全功能，4 = 飞行） |
 | `raw_net_info` | QNWINFO 原文（去掉命令回显，多行用 ` | ` 连接），页面排查框直接显示 |

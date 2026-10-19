@@ -69,10 +69,32 @@ impl VendorSpec for Spec {
         use crate::modem::atplan::{add_from_vendor, replace, AtCmdSpec};
         let mut v = crate::modem::atplan::base_specs(ctx);
 
-        add_from_vendor(&mut v, ctx, "lock_mode", "组网模式偏好", "slmode", "model::mode::thales", "AT^SLMODE 枚举");
-        add_from_vendor(&mut v, ctx, "usbnet", "USB 网卡模式", "setconfig", "model::usbnet", "AT+SETCONFIG");
-        replace(&mut v, AtCmdSpec::off(
-            "imei_set", "IMEI 改写", "本厂商未提供可验证的 IMEI 写指令（只读）"));
+        add_from_vendor(
+            &mut v,
+            ctx,
+            "lock_mode",
+            "组网模式偏好",
+            "slmode",
+            "model::mode::thales",
+            "AT^SLMODE 枚举",
+        );
+        add_from_vendor(
+            &mut v,
+            ctx,
+            "usbnet",
+            "USB 网卡模式",
+            "setconfig",
+            "model::usbnet",
+            "AT+SETCONFIG",
+        );
+        replace(
+            &mut v,
+            AtCmdSpec::off(
+                "imei_set",
+                "IMEI 改写",
+                "本厂商未提供可验证的 IMEI 写指令（只读）",
+            ),
+        );
 
         v
     }

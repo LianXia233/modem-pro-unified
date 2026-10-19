@@ -45,6 +45,30 @@ pub fn fail_status_data(
     write(req, status, code, data, message)
 }
 
+/// 序列化并回成功；序列化失败时回错误信封而不是把错误抛给网关层。
+///
+/// ## 为什么必须走这里
+///
+/// handler 拿到的是 `Request` 的所有权：一旦它带着 `Err` 返回，`Request` 已经被
+/// drop，网关层再也写不了任何字节 —— 连接上是空的，页面只见「无响应」，
+/// 排障时连一句原因都拿不到。凡是 handler 里原本写 `serde_json::to_value(x)?`
+/// 的地方，一律改成 `response::json_body(req, x)`，把失败变成信封里的 `msg`。
+pub fn json_body(req: Request, value: impl serde::Serialize) -> Result<()> {
+    match serde_json::to_value(value) {
+        Ok(j) => ok(req, j),
+        Err(e) => fail(req, -1, &format!("序列化响应失败：{e}")),
+    }
+}
+
+/// 序列化成 `Value`（**不碰 Request**）。
+///
+/// 用在「结果还要先塞进缓存、再回响应」的 handler 上：因为 `Request` 是一次性的，
+/// 只能先在不消耗它的前提下把数据准备好，再决定回成功还是回失败。
+/// 调用方拿到 `Err` 时，`req` 还活着，可以自己 [`fail`]。
+pub fn to_value<T: serde::Serialize>(value: T) -> std::result::Result<Value, String> {
+    serde_json::to_value(value).map_err(|e| format!("序列化响应失败：{e}"))
+}
+
 /// 成功并下发一个 Set-Cookie（登录用）。
 pub fn with_cookie(req: Request, data: Value, cookie: &str) -> Result<()> {
     let body = json!({ "code": 0, "data": data, "msg": "ok" }).to_string();

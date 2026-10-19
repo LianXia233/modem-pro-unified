@@ -4,6 +4,187 @@
 
 ## [未发布]
 
+### 1.0.0-6：全链路数据契约对齐 + 鉴权闸门修复 + 载波聚合实时采集
+
+本轮以「页面能不能真的读到后端数据」为验收标准做了一次端到端审查：
+启动真实 `modemd` 实例，逐个请求 **79 个** LuCI 实际调用的接口，核对返回信封与字段名。
+
+#### 🔴 安全（两处，均属「配置看起来生效、实际没有」）
+
+- **`require_luci_login` 从未真正生效（P0）**
+  - 根因：普通 HTTP 请求由 `gateway.rs` 转给内部 tiny_http（`127.0.0.1:0`），
+    `req.remote_addr()` 在那条链路上**恒为 127.0.0.1**；而 `auth.rs` 正是用它判断
+    「本机请求免登录」。结果：默认 `listen = "0.0.0.0:9527"` 下，局域网内任何人都能
+    无密码调用全部接口（改 IMEI、发短信、切飞行模式、改配置）。
+  - 修法：网关在转发时**覆盖式**注入 `X-Real-IP`（先删除客户端自带的同名头，防伪造），
+    鉴权闸门改读它。实测：非回环未登录 → 401；伪造 `X-Real-IP: 127.0.0.1` → 仍 401；
+    ucode 代理（真回环）→ 200。
+- **`admin/modemd_api/proxy` 缺 ACL 依赖（P0）**
+  - 此前只有 `auth`，没有 `depends.acl` —— 任何已登录 LuCI 的用户（哪怕没被授予
+    `luci-app-modemd`）都能调用这个直通后端的代理。已补 `depends: {acl: [...]}`。
+
+#### 🔴 后端契约（失败时不再「什么都不回」）
+
+- **handler 返回 `Err` 时连接上零字节（P0）**
+  - `tiny_http::Request` 是**一次性**的：handler 带着 `Err` 返回时 `Request` 已被 drop，
+    网关层再也写不了响应。页面只看到「modemd 无响应」，连一句原因都拿不到。
+  - 逐个消灭了 10 个 handler 里的 30+ 处裸 `?`：`sim` / `signal` / `network_status` /
+    `lock_status` / `wechat`(11 处) / `schedule_set|run|delete|toggle`。
+    新增 `response::to_value` / `json_body` 两个「先序列化、再响应」的助手。
+- **`/api/tasks` 的重复 `build_spec` 与 11 处 `need(&modem)?`**
+  - 改成「先取模组、再组 spec」各一次，失败一律 `response::fail`。
+
+#### 🟢 页面数据（此前恒为空 / 恒为 `-` 的根因）
+
+- **后台采样循环对 LuCI 用户完全空转（P0，本轮最关键的「页面读不到数据」根因）**
+  - 所有采样循环（signal / network / traffic / change）都以 `ws.active_count() > 0`
+    为触发条件；而 **LuCI 前端只走 HTTP 轮询**（跨端口跨源，ucode 代理也转不了长连接），
+    根本不连 WebSocket。于是 LuCI 用户一次采样都触发不了，`/api/snapshot` 的 `blocks`
+    永远为空、`ages` 永远 `null`、`stale` 永远 `true`。
+  - 新增「HTTP 客户端活跃度」：`AppState::last_http_seen`（AtomicI64）+ `viewer_active(60s)`。
+    `/api/snapshot`、`/api/usbnet` 被调用即记一次时间戳。两类前端口径统一，
+    「没人在看就别发 AT」的初衷仍然成立（关页面 60 秒后自动停）。
+- **新增 `modem` 缓存块 + `modem.refresh` 任务**：概览页「SIM 卡信息」「模组硬件参数」
+  两张卡片此前读的是 `ModemView`（只有 id/at_port/model/running），9 项全是 `-`。
+  现在 `/api/modem/status` 的结果归档进 `blocks.modem`，前端改读它。
+  后台按 5 分钟节流刷新，缓存为空时立刻补一次（首屏不必干等）。
+- **`ModemStatus` 补 `imei`**：概览页要显示 IMEI，而它原先只在 `/api/imei`（改写域）里。
+  用一条 `AT+CGSN` 只读补上，不碰备份台账与 Luhn 校验那套语义。
+- **`dial` / `usbnet` 两个缓存块此前从未被写入**：`StateCache::KINDS` 声明了却没人填，
+  快照里是「永远 null、永远过期」的占位块。现在 snapshot 顺手归档 `dial`（本地推断，
+  不发 AT）、`/api/usbnet` 查询后归档。
+
+#### 🟢 载波聚合：从「结构占位」到实时采集
+
+- **新增专用模块 `model/ca.rs`**：`ca` / `ca_active` 此前恒为 `[]` / `false`（API.md 已
+  自认是占位）。现按厂商分派指令并解析：
+  - 广和通 `AT+GTCAINFO?` —— **逐字段照抄官方手册《FIBOCOM FM350 AT Commands v2.2》
+    §11.1.16**（含 LTE/NR 两套字段序、`SCCn` 的三个前导字段、`scell_state` 语义、
+    带宽编码表）；频段编码是「`50` + 频段号」的十进制拼接（`50512` → n512），
+    不是减法（早期实现按 `- 5000` 算会得出 45512，被单测抓出）。
+  - 移远 / 美格 `AT+QCAINFO` —— 本仓库无官方手册，**只认文本模式**（`"PCC"`/`"SCC"`
+    与 `"LTE BAND n"`/`"NR5G BAND n<n>"`），列序一概不猜。
+  - Telit `#CAINFOEXT` 明确返回 `None`（字段布局未移植），**不按错的列序编数据**。
+  - 7 个单测覆盖：激活/未激活 SCC、NR 编码、只有主载波、乱码、未知指令。
+
+#### 🟢 字段契约（前端读错名字，导致固定显示 `-` / `undefined`）
+
+| 页面 | 前端原来读 | 后端实际返回 |
+| --- | --- | --- |
+| 概览 / 工具（波动记录） | `time/old/val/diff` | `at/from/to/delta` |
+| 工具（运行日志） | `log` | `lines[]` |
+| 短信（存储区） | `cur/counts` | `current/mem1_used/mem1_total` |
+| 工具（USB 设备） | `vid_pid/driver` | `vid`+`pid`/`drivers[]` |
+| 工具（PCIe） | `device.slot/vendor/device` | `devices[].bdf/vid/pid` |
+
+另修：`POST /api/pcie/reset` 前端从不传 `bdf`（后端判空必失败）；PCIe 复位按钮现在
+从 `devices[0].bdf` 取值。
+
+#### 🟢 慢操作改走任务（避免撞 ucode 代理 20 秒超时）
+
+新增任务种类：`modem.refresh` / `dial.connect` / `dial.disconnect` / `imei.set` /
+`imei.restore` / `sms.storage.set`。前端对应改为 `task.run(...)` + 进度提示：
+锁频段（重启射频）、拨号/断开、IMEI 改写/恢复、短信存储区切换。
+同步接口保留（不破坏既有契约），只是页面不再走它们。
+
+另修 `lock.js`：某分组一个频段都没勾时会下发 `bands: []`，被后端拒 → 整批
+`Promise.all` 一起 reject、已成功的分组被误报失败。现在空分组直接跳过。
+
+#### 🟢 数据真实性
+
+- **`version.rs` 的 `rustc_version()` 恒返回 `"stable"`** —— 假值。新增 `build.rs` 在
+  编译期执行 `rustc --version` 取真实版本，拿不到就写 `unknown`，不再拿假值充数。
+  （首版实现把 `"rustc "` 前缀也带上了，端到端验证时看到 `rustc rustc 1.93.0`，已修。）
+- **`modem_by_query` 的 `modem_id` 解析失败静默回落 0** —— 会把「锁 3 号模组的频段」
+  悄悄执行成「锁 0 号」。现在给了但解析不了就返回 `None`（找不到模组）。
+- **`POST /api/roam/set` 漏传 `on` 默认开启漫游** —— 国际漫游下等于悄悄放行流量。
+  改为必须显式给值，给了但认不出也报错。
+- **`/api/netscan` 把 6 位 NR-ARFCN 误判成 PLMN**（`627264` → MCC 627 / MNC 264，
+  凭空编出一份不存在的运营商，真正的频点反倒留在 0）。改为按长度分派：
+  5 位优先当 PLMN，6 位优先当频点。
+- **两张互相矛盾的运营商表**：`cells.rs` 把 `46004/46008` 判成「中国广电」，
+  `siminfo.rs` 判成「中国移动」—— 同一张卡两个页面显示两家运营商。
+  现在只有一张表（`siminfo::operator_from_plmn`），`cells::operator_name` 是转发壳。
+- **`select_key_temps` 取的是列表前三项**，与注释写的「按名称挑机身/5G基带/CPU」
+  完全不是一回事（广和通按 sensor id 排序，前三项常是无关通路）。改为按名匹配，
+  一个都对不上才退回前三项。
+- **速率式模组的累计流量恒为 0**（广和通只报瞬时速率）→ 新增本地积分
+  `RateTotal`，标 `estimated`，并在注释里如实写明「只在采样期间推进」的局限。
+- `roam_applies` / `applies` 恒为 `true` → 改为「判据齐全才算适用」
+  （`scope ∈ {domestic, global}`）。
+
+#### 🟢 运行时健壮性
+
+- **模组拔出后永不回收（P0）**：`manager.rs` 的 `discover()` 只增不删，后果是
+  ① 幽灵模组永久堆积、串口 fd 泄漏；② 它的口一直留在 `known` 集合里，
+  **同一台设备重插后再也发现不了**（只能重启 modemd）。
+  新增 `reap_gone()`：只在「设备文件不存在」时回收（不用「打不开」当判据，避免把
+  正忙/权限受限的好模组误删），按 `discover` 的顺序先回收再统计 `known`；
+  回收的 id 由 `take_reaped()` 交给巡检循环清 `StateCache`。
+- **`netprov/uci.rs` 外部命令无超时（P0）**：`uci` / `ifstatus` / `network reload`
+  用 `Command::output()` 无限阻塞。卡住时组网线程永久挂起，连尾部的**拨号器对账**
+  也不跑了 —— 掉线无法自愈且日志干净。
+  新增 `run_with_timeout`（看护线程 + `recv_timeout` + 超时 kill），
+  4 处调用全部覆盖，不引第三方依赖。
+
+#### 🟢 启动速度（实机发现）
+
+- **`discover()` 挡住 HTTP 启动，首次部署时页面 40 秒不可用（实测）**
+  - `lib.rs` 里 `mgr.discover(true)` 同步跑在 `http::serve` **之前**。实机 FM350-GL 有
+    7 个 `/dev/ttyUSB*`，只有 ttyUSB4 是 AT 口，其余每个都要等探测超时 ——
+    从进程启动到 `/api/version` 可用整整 **40 秒**，这期间 LuCI 全部页面都是
+    「modemd 无响应」。
+  - 改为：HTTP 先起，首次发现放后台线程。实测**就绪耗时 0 秒**，模组列表几秒后自己填上
+    （页面本来就在轮询 `/api/snapshot`）。
+  - 顺带给 `discover()` 加了互斥锁：启动发现、周期巡检、页面 `?discover=1` 三方并发时，
+    原先会各自看到对方还没插入的口，导致**同一台设备登记两次**（抢同一个 tty、应答串扰）。
+
+#### 🟢 打包与部署
+
+- `Makefile` 的 `DEPENDS` 从 `+luci-base +odhcp6c` 补全为：
+  `rpcd` / `uhttpd-mod-ubus` / `uhttpd-mod-ucode` / `ucode-mod-fs` / `ucode-mod-math` /
+  `netifd` / `wwan` / `usbutils` / `kmod-usb-net-{qmi-wwan,cdc-mbim,rndis,cdc-ether}` /
+  `kmod-usb-serial-option`。少任何一个都不会编译报错，而是装到设备上才「打不开」。
+- `init.d`：删掉永久空转的 `procd_add_reload_trigger "modemd"`（它监视的是不存在的
+  UCI 配置 `/etc/config/modemd`；`config.toml` 的变更已由 `procd_set_param file` 覆盖）；
+  启动前补 `mkdir -p /var/log`（精简固件上日志会静默丢）。
+- `config.toml`：`[net]` 段补上代码一直在读、但默认配置里缺席的
+  `dial_enabled` / `allow_roaming`；`reset_before_dial` 的两行注释改为如实标注
+  「目前未实现」（此前注释写「默认开」，会误导排障）。
+- `api.js`：`encodeURIComponent` 不编码 `!'()*`，而 ucode 代理的 `PATH_RE` 不放行它们。
+  现补一层，避免将来新增带文本的查询参数时踩坑。
+
+#### 🟢 清理
+
+- `changes::int_param` 上移到 `http::request::strict_i64_param`（原先
+  `signal_history` 要跨 handler 模块调它，属职责错位），原位置保留转发壳。
+- 修掉两处指向已删除文件 `http/smsauth.rs` 的过期注释。
+- `band.rs` 的两个 ARFCN 反推函数与 `cells::band_from_earfcn` 并存，已在注释里写明
+  职责差异（字符串标签 vs 整数号）与「当前生产路径走哪一份」，避免被误当重复实现删掉。
+
+#### 验证
+
+- `cargo build` / `cargo test`：**616 通过 / 0 失败**（新增 20 个单测）。
+- `cargo clippy --all-targets`：**0 警告**。本次改动的 40 个文件 `rustfmt --check` 全部合规。
+- 端到端：真实启动 `modemd`（无模组），**79 个** LuCI 调用接口全部返回完整
+  `{code,data,msg}` 信封；未注册路径 404 + 信封；鉴权三种场景（回环/非回环/伪造头）符合预期。
+- 全部 LuCI JS（15 个文件）`node --check` 通过。
+- **实机验证（ImmortalWrt SNAPSHOT / 内核 6.18.55 / aarch64_cortex-a53 + FM350-GL）**：
+  - 交叉编译 aarch64-musl（`rust-lld` 作 linker）后在设备上实跑新二进制；
+  - `/api/version` 返回 `platform: linux/aarch64`、`runtime: rustc 1.93.0`（真实版本）；
+  - `blocks.modem` 拿到真实 SIM 身份：`iccid 89860xxxxxxxxxxxxxxx`、`imsi 46011xxxxxxxxxx`、
+    **`imei 86933xxxxxxxxxx`**（本轮新增字段，来自 `AT+CGSN`）；
+  - `roam_applies: false`（`roam_scope: "none"`）—— 修复前这里恒为 `true`；
+  - `temp_key` 挑出 `ltepa_ntc` / `md_5g` / `soc_max` —— 修复前是不管名字的「列表前三项」；
+  - `AT+GTCAINFO?` 在当前（未注册）状态下只回 `OK`、无 `PCC/SCC` 行 —— 解析器正确返回
+    「未上报」，没有编造数据；
+  - 鉴权闸门：非回环未登录 401、伪造 `X-Real-IP` 仍 401、回环放行；
+  - 自动组网**没有**改写用户 UCI（`/etc/config/network` 时间戳未变，`modem0` 是用户手工配置）；
+  - 全程未影响生产服务的网络（默认路由走有线 WAN，蜂窝当前未承载流量）。
+- **仍未做实机验证**：CA 的解析分支在实机上只走到「空闲态无上报」这一条，**未拿到真实
+  `PCC/SCC1` 报文**（需要拨号进入连接态 + 网络配置辅载波）；模组热插拔回收未实机复现。
+  详见 `docs/PROGRESS.md` 的「本轮遗留」。
+
 ### 1.0.0-5：LuCI 完整对齐内置 WebUI + 二级菜单无下拉 + 滑动 TAB 栏 + 原生 SVG 信号与白色毛玻璃
 
 - **二级菜单收敛与杜绝 404**：

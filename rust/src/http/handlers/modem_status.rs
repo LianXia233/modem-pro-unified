@@ -15,7 +15,16 @@ pub fn handle(req: Request, state: &AppState, query: &HashMap<String, String>) -
     };
     let allow_roaming = state.allow_roaming();
     match modem.modem_status(allow_roaming) {
-        Ok(v) => response::ok(req, serde_json::to_value(v)?),
+        Ok(v) => {
+            let value = match response::to_value(&v) {
+                Ok(j) => j,
+                Err(e) => return response::fail(req, -1, &e),
+            };
+            // 进缓存：概览页的「SIM 卡信息 / 模组硬件参数」两块卡片靠它一次性拿到，
+            // 不必为了显示 ICCID / IMEI 再单独发一轮 AT（见 http/cache.rs）。
+            state.cache.put("modem", modem.id, value.clone());
+            response::ok(req, value)
+        }
         Err(e) => response::fail(req, -1, &e.to_string()),
     }
 }

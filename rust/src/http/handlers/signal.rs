@@ -18,7 +18,12 @@ pub fn handle(req: Request, state: &AppState, query: &HashMap<String, String>) -
     match modem.signal() {
         Ok(v) => {
             push_changes(state, modem.id, &state.metrics.note_signal(modem.id, &v));
-            let value = serde_json::to_value(v)?;
+            // 序列化失败也要回信封（用 `?` 会让连接上空空如也）。
+            // 先序列化再响应：`Request` 是一次性的，不能先交出去再拿回来。
+            let value = match response::to_value(v) {
+                Ok(j) => j,
+                Err(e) => return response::fail(req, -1, &e),
+            };
             // 进缓存：概览页的快照不再重复发 AT（见 http/cache.rs）
             state.cache.put("signal", modem.id, value.clone());
             response::ok(req, value)

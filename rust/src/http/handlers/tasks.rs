@@ -34,9 +34,12 @@ use super::modem_by_query;
 /// 单条 AT 的长度上限（与 `/api/at` 一致）。
 const MAX_AT_LEN: usize = 128;
 
-pub fn handle(req: Request, state: &AppState, query: &HashMap<String, String>) -> Result<()> {
+/// ⚠️ 与别的 handler 不同，这里收 `Arc<AppState>` 而不是 `&AppState`：
+/// 提交出去的任务闭包要 `'static`（它在工作线程里跑，可能比这次请求活得久），
+/// 所以必须能把整个 `AppState` 安全地搬进去。调用方传 `state.clone()`。
+pub fn handle(req: Request, state: Arc<AppState>, query: &HashMap<String, String>) -> Result<()> {
     match *req.method() {
-        Method::Get => handle_get(req, state, query),
+        Method::Get => handle_get(req, &state, query),
         Method::Post => handle_post(req, state, query),
         _ => response::fail(req, -1, "method not allowed, use GET or POST"),
     }
@@ -62,14 +65,24 @@ fn handle_get(req: Request, state: &AppState, query: &HashMap<String, String>) -
     )
 }
 
-fn handle_post(mut req: Request, state: &AppState, query: &HashMap<String, String>) -> Result<()> {
+fn handle_post(
+    mut req: Request,
+    state: Arc<AppState>,
+    query: &HashMap<String, String>,
+) -> Result<()> {
     let params = request::merge_form(query, &request::read_body(&mut req));
 
     // 取消：/api/tasks/cancel {id}；也兼容「只有 id 没有 kind」的 POST（页面手滑也认）
     let wants_cancel = request::bool_param(&params, "cancel", false)
         || params.contains_key("cancel_id")
-        || (params.get("id").map(|v| !v.trim().is_empty()).unwrap_or(false)
-            && params.get("kind").map(|v| v.trim().is_empty()).unwrap_or(true));
+        || (params
+            .get("id")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+            && params
+                .get("kind")
+                .map(|v| v.trim().is_empty())
+                .unwrap_or(true));
     if wants_cancel {
         let id = params
             .get("id")
@@ -80,7 +93,11 @@ fn handle_post(mut req: Request, state: &AppState, query: &HashMap<String, Strin
         return response::ok_msg(
             req,
             json!({ "id": id, "cancelled": ok }),
-            if ok { "已请求取消" } else { "任务不存在或已结束" },
+            if ok {
+                "已请求取消"
+            } else {
+                "任务不存在或已结束"
+            },
         );
     }
 
@@ -92,23 +109,20 @@ fn handle_post(mut req: Request, state: &AppState, query: &HashMap<String, Strin
         return response::fail(req, -1, "kind required");
     }
 
-    // 需要模组的种类：统一在这里解析一次，缺模组就当场拒（不要到工作线程才发现）
-    let needs_modem = !matches!(kind.as_str(), "none");
-    let modem = if needs_modem {
-        match modem_by_query(state, &params) {
-            Some(m) => Some(m),
-            None => return response::fail(req, -1, "modem not found"),
-        }
-    } else {
-        None
+    // 所有已知种类都需要模组：统一在这里解析一次，缺模组就当场拒
+    // （不要到工作线程才发现，那时错误只能躺在任务结果里等人来翻）。
+    //
+    // ⚠️ 未知种类也必须在这里用「正常响应」拒绝：`?` 会把错误抛给网关层，
+    // 连接上什么都不会写（页面只见空回复，排查不到原因）。所以下面每个可能
+    // 失败的调用都用 `match ... Err(e) => return response::fail(...)`，不用 `?`。
+    let modem = match modem_by_query(&state, &params) {
+        Some(m) => m,
+        None => return response::fail(req, -1, "modem not found"),
     };
-
-    // 未知种类必须在这里用「正常响应」拒绝：`?` 会把错误抛给网关层，
-    // 连接上什么都不会写（页面只见空回复，排查不到原因）。
-    if let Err(e) = build_spec(&kind, modem.as_deref(), &params) {
-        return response::fail(req, -1, &e.to_string());
-    }
-    let spec = build_spec(&kind, modem.as_deref(), &params)?;
+    let spec = match build_spec(&kind, Some(&modem), &params) {
+        Ok(s) => s,
+        Err(e) => return response::fail(req, -1, &e.to_string()),
+    };
     let tasks = &state.tasks;
     let cache = state.cache.clone();
     let cmd_timeout = state.cfg.serial.command_timeout();
@@ -117,7 +131,7 @@ fn handle_post(mut req: Request, state: &AppState, query: &HashMap<String, Strin
     let task = match kind.as_str() {
         // ---- 读取类（结果进缓存，供 /api/snapshot 立即读到）----
         "signal.refresh" => {
-            let m = need(&modem)?;
+            let m = modem.clone();
             tasks.submit(spec, move |_t| {
                 let v = m.signal()?;
                 let j = serde_json::to_value(&v)?;
@@ -125,8 +139,17 @@ fn handle_post(mut req: Request, state: &AppState, query: &HashMap<String, Strin
                 Ok(j)
             })
         }
+        "modem.refresh" => {
+            let m = modem.clone();
+            tasks.submit(spec, move |_t| {
+                let v = m.modem_status(allow_roaming)?;
+                let j = serde_json::to_value(&v)?;
+                cache.put("modem", m.id, j.clone());
+                Ok(j)
+            })
+        }
         "network.refresh" => {
-            let m = need(&modem)?;
+            let m = modem.clone();
             tasks.submit(spec, move |_t| {
                 let v = m.network_status(allow_roaming);
                 let j = serde_json::to_value(&v)?;
@@ -135,7 +158,7 @@ fn handle_post(mut req: Request, state: &AppState, query: &HashMap<String, Strin
             })
         }
         "cells.scan" => {
-            let m = need(&modem)?;
+            let m = modem.clone();
             tasks.submit(spec, move |t| {
                 t.progress("正在扫描基站（约 5~20 秒）");
                 let v = m.scan_cells();
@@ -148,7 +171,7 @@ fn handle_post(mut req: Request, state: &AppState, query: &HashMap<String, Strin
             })
         }
         "lock.status" => {
-            let m = need(&modem)?;
+            let m = modem.clone();
             let refresh = request::bool_param(&params, "refresh", true);
             tasks.submit(spec, move |_t| {
                 let v = m.lock_status(refresh);
@@ -159,7 +182,7 @@ fn handle_post(mut req: Request, state: &AppState, query: &HashMap<String, Strin
         }
         // ---- 写操作 ----
         "at" => {
-            let m = need(&modem)?;
+            let m = modem.clone();
             let cmd = at_command(&params)?;
             tasks.submit(spec, move |t| {
                 t.progress(format!("等待模组应答：{cmd}"));
@@ -176,7 +199,7 @@ fn handle_post(mut req: Request, state: &AppState, query: &HashMap<String, Strin
             })
         }
         "ussd.send" => {
-            let m = need(&modem)?;
+            let m = modem.clone();
             let code = params.get("code").cloned().unwrap_or_default();
             if code.trim().is_empty() {
                 return response::fail(req, -1, "code required");
@@ -190,7 +213,7 @@ fn handle_post(mut req: Request, state: &AppState, query: &HashMap<String, Strin
             })
         }
         "sms.send" => {
-            let m = need(&modem)?;
+            let m = modem.clone();
             let phone = params.get("phone").cloned().unwrap_or_default();
             let content = params.get("content").cloned().unwrap_or_default();
             if phone.trim().is_empty() || content.is_empty() {
@@ -203,7 +226,7 @@ fn handle_post(mut req: Request, state: &AppState, query: &HashMap<String, Strin
             })
         }
         "usbnet.set" => {
-            let m = need(&modem)?;
+            let m = modem.clone();
             let value = request::i64_param(&params, "value", -1) as i32;
             tasks.submit(spec, move |_t| {
                 let st = m.set_usbnet(value)?;
@@ -211,7 +234,7 @@ fn handle_post(mut req: Request, state: &AppState, query: &HashMap<String, Strin
             })
         }
         "lock.band" => {
-            let m = need(&modem)?;
+            let m = modem.clone();
             let tech = params
                 .get("tech")
                 .map(|s| s.trim().to_string())
@@ -230,7 +253,7 @@ fn handle_post(mut req: Request, state: &AppState, query: &HashMap<String, Strin
             })
         }
         "netscan" => {
-            let m = need(&modem)?;
+            let m = modem.clone();
             let tech = params
                 .get("tech")
                 .map(|s| s.trim().to_string())
@@ -245,11 +268,111 @@ fn handle_post(mut req: Request, state: &AppState, query: &HashMap<String, Strin
             })
         }
         "reboot" => {
-            let m = need(&modem)?;
+            let m = modem.clone();
             tasks.submit(spec, move |t| {
                 t.progress("已下发重启，模组会掉线约 20 秒");
                 let r = m.reboot()?;
                 Ok(serde_json::to_value(r)?)
+            })
+        }
+        // ---- 拨号域：一次拨号要连发好几条 AT、还可能起主机侧拨号器 ----
+        // 同步 POST 会撞上 LuCI ucode 代理的 20 秒超时，所以页面走任务。
+        "dial.connect" => {
+            let m = modem.clone();
+            let st = state.clone();
+            let dial_req = crate::modem::model::DialRequest {
+                cid: request::i64_param(&params, "cid", 0) as i32,
+                apn: params.get("apn").cloned().unwrap_or_default(),
+                pdp_type: params.get("pdp_type").cloned().unwrap_or_default(),
+                reconnect: request::bool_param(&params, "reconnect", false),
+                force: request::bool_param(&params, "force", false),
+            };
+            let enabled = state.dial_enabled();
+            let ims = state.cfg.dial.activate_ims;
+            tasks.submit(spec, move |t| {
+                t.progress("正在拨号（QMI/MBIM 会起主机侧拨号器，约 10~30 秒）");
+                let out = m.dial(&dial_req, enabled, ims);
+                // 无论成败都把「卡在哪一步」的状态归档 + 广播，页面据此刷新
+                let st_now = m.dial_status();
+                let j = serde_json::to_value(&st_now)?;
+                cache.put("dial", m.id, j);
+                super::dial_connect::push_dial(&st, &st_now);
+                super::dial_connect::push_network(&st, &m);
+                out.and_then(|s| Ok(serde_json::to_value(s)?))
+            })
+        }
+        "dial.disconnect" => {
+            let m = modem.clone();
+            let st = state.clone();
+            let cid = request::i64_param(&params, "cid", 0) as i32;
+            tasks.submit(spec, move |t| {
+                t.progress("正在断开数据连接");
+                // 顺序要紧（与同步接口同口径）：先停拨号器，再让模组侧收尾，
+                // 否则模组侧先 `AT+CGACT=0`，拨号器下一轮发现自己重拨，两边会抢。
+                crate::runtime::dialer::supervisor().stop_modem(m.id);
+                let out = m.hangup(cid);
+                let st_now = m.dial_status();
+                let j = serde_json::to_value(&st_now)?;
+                cache.put("dial", m.id, j);
+                super::dial_connect::push_dial(&st, &st_now);
+                out.and_then(|s| Ok(serde_json::to_value(s)?))
+            })
+        }
+        // ---- 串口慢写：IMEI 改写（含备份快照 + 回读确认）与短信存储区切换 ----
+        "imei.set" => {
+            let m = modem.clone();
+            let st = state.clone();
+            let imei = params
+                .get("imei")
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            if imei.is_empty() {
+                return response::fail(req, -1, "imei required");
+            }
+            let backup = state.imei.get(modem.id);
+            tasks.submit(spec, move |t| {
+                t.progress("正在改写 IMEI（先备份原值，再写入并回读确认）");
+                let (_, warning, bak) = m.set_imei(&imei, backup)?;
+                // 改写成功才落备份：失败时台账保持原样（可能还是空）
+                st.imei.put(m.id, bak.clone());
+                let status = m.imei_status(Some(&bak), warning.as_deref());
+                Ok(serde_json::to_value(status)?)
+            })
+        }
+        "imei.restore" => {
+            let m = modem.clone();
+            let st = state.clone();
+            let backup = state.imei.get(modem.id);
+            tasks.submit(spec, move |t| {
+                t.progress("正在恢复出厂原始 IMEI（同样需重启模组后复查）");
+                let (_, warning, bak) = m.restore_imei(backup)?;
+                st.imei.put(m.id, bak.clone());
+                let status = m.imei_status(Some(&bak), warning.as_deref());
+                Ok(serde_json::to_value(status)?)
+            })
+        }
+        "sms.storage.set" => {
+            let m = modem.clone();
+            let st = state.clone();
+            let mem = params.get("mem").cloned().unwrap_or_default();
+            if mem.trim().is_empty() {
+                return response::fail(req, -1, "mem required（SM / ME / MT）");
+            }
+            tasks.submit(spec, move |t| {
+                t.progress(format!("正在切换到存储区 {mem}"));
+                let out = m.set_sms_memory(&mem)?;
+                // 写回配置：切完重启也能沿用（写失败只记日志，不影响本次结果 ——
+                // 与同步接口 `sms_storage_set` 完全同口径）
+                if let Err(e) = crate::config::patch::set_string(
+                    &st.config_path,
+                    "sms",
+                    "sms_memory",
+                    out.current.as_str(),
+                ) {
+                    log::warn!("写回 [sms] sms_memory 失败: {e}");
+                }
+                log::info!("模组 {} 短信存储区切到 {}", m.id, out.current);
+                Ok(serde_json::to_value(out)?)
             })
         }
         other => {
@@ -260,15 +383,12 @@ fn handle_post(mut req: Request, state: &AppState, query: &HashMap<String, Strin
     response::ok_msg(
         req,
         json!({ "task": task.view() }),
-        if task.is_active() { "已提交" } else { "任务已结束" },
+        if task.is_active() {
+            "已提交"
+        } else {
+            "任务已结束"
+        },
     )
-}
-
-/// 取模组（`needs_modem` 已保证存在，这里只是把 `Option` 拆开）。
-fn need(modem: &Option<Arc<Modem>>) -> Result<Arc<Modem>> {
-    modem
-        .clone()
-        .ok_or_else(|| msg("该任务需要 modem_id"))
 }
 
 /// 组装任务描述：标签给人看，去重键把参数也算进去。
@@ -276,13 +396,20 @@ fn build_spec(kind: &str, modem: Option<&Modem>, params: &HashMap<String, String
     let id = modem.map(|m| m.id);
     let label = match kind {
         "signal.refresh" => "刷新信号".to_string(),
+        "modem.refresh" => "刷新 SIM 与模组信息".to_string(),
         "network.refresh" => "刷新网络信息".to_string(),
         "cells.scan" => "扫描基站".to_string(),
         "lock.status" => "读取锁网状态".to_string(),
         "at" => format!("AT：{}", params.get("cmd").cloned().unwrap_or_default()),
         "ussd.send" => format!("USSD：{}", params.get("code").cloned().unwrap_or_default()),
-        "sms.send" => format!("发送短信给 {}", params.get("phone").cloned().unwrap_or_default()),
-        "usbnet.set" => format!("切换 USB 网卡模式 → {}", params.get("value").cloned().unwrap_or_default()),
+        "sms.send" => format!(
+            "发送短信给 {}",
+            params.get("phone").cloned().unwrap_or_default()
+        ),
+        "usbnet.set" => format!(
+            "切换 USB 网卡模式 → {}",
+            params.get("value").cloned().unwrap_or_default()
+        ),
         "lock.band" => format!(
             "锁频段：{} {}",
             params.get("tech").cloned().unwrap_or_default(),
@@ -290,11 +417,23 @@ fn build_spec(kind: &str, modem: Option<&Modem>, params: &HashMap<String, String
         ),
         "netscan" => "主动扫网".to_string(),
         "reboot" => "重启模组".to_string(),
+        "dial.connect" => "拨号".to_string(),
+        "dial.disconnect" => "断开数据连接".to_string(),
+        "imei.set" => format!(
+            "改写 IMEI → {}",
+            params.get("imei").cloned().unwrap_or_default()
+        ),
+        "imei.restore" => "恢复出厂原始 IMEI".to_string(),
+        "sms.storage.set" => format!(
+            "切换短信存储区 → {}",
+            params.get("mem").cloned().unwrap_or_default()
+        ),
         other => other.to_string(),
     };
     // 去重键：读类按种类即可；写类要把参数带上（AT 两条不同指令不能算同一个）
     let extra = match kind {
-        "at" | "lock.band" | "ussd.send" | "sms.send" | "usbnet.set" | "netscan" => {
+        "at" | "lock.band" | "ussd.send" | "sms.send" | "usbnet.set" | "netscan" | "imei.set"
+        | "imei.restore" | "sms.storage.set" | "dial.connect" | "dial.disconnect" => {
             let mut kv: Vec<String> = params
                 .iter()
                 .filter(|(k, _)| k.as_str() != "modem_id" && k.as_str() != "kind")
@@ -312,6 +451,7 @@ fn build_spec(kind: &str, modem: Option<&Modem>, params: &HashMap<String, String
 fn leak_kind(kind: &str) -> Result<&'static str> {
     Ok(match kind {
         "signal.refresh" => "signal.refresh",
+        "modem.refresh" => "modem.refresh",
         "network.refresh" => "network.refresh",
         "cells.scan" => "cells.scan",
         "lock.status" => "lock.status",
@@ -322,6 +462,11 @@ fn leak_kind(kind: &str) -> Result<&'static str> {
         "lock.band" => "lock.band",
         "netscan" => "netscan",
         "reboot" => "reboot",
+        "dial.connect" => "dial.connect",
+        "dial.disconnect" => "dial.disconnect",
+        "imei.set" => "imei.set",
+        "imei.restore" => "imei.restore",
+        "sms.storage.set" => "sms.storage.set",
         other => return Err(msg(format!("未知任务种类：{other}"))),
     })
 }

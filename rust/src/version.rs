@@ -34,8 +34,11 @@ pub fn current(luci_auth: bool) -> VersionInfo {
     }
 }
 
-/// 编译期 rustc 版本（不稳定 API 之外最省事的取法：用 `CARGO_PKG_*` 没有 rustc 版本，
-/// 这里用一个近似值；真正的 rustc 版本可从 `rustc --version` 获取，骨架阶段不做额外依赖）。
+/// 编译期 rustc 版本（由 `build.rs` 执行 `rustc --version` 注入）。
+///
+/// 早先这里写死返回 `"stable"`，于是 `/api/version` 的 `runtime` 恒为
+/// `rustc stable` —— 一个**看起来正常、实则无信息量**的假值，交叉编译链不一致时
+/// 完全派不上用场。现在拿不到就是 `unknown`，不再拿假值充数。
 fn rustc_version() -> &'static str {
-    "stable"
+    option_env!("MODEMD_RUSTC_VERSION").unwrap_or("unknown")
 }

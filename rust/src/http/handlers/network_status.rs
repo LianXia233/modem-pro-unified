@@ -21,7 +21,10 @@ pub fn handle(req: Request, state: &AppState, query: &HashMap<String, String>) -
         modem.id,
         &state.metrics.note_network(modem.id, &status),
     );
-    let value = serde_json::to_value(status)?;
+    let value = match response::to_value(status) {
+        Ok(j) => j,
+        Err(e) => return response::fail(req, -1, &e),
+    };
     // 进缓存：快照页免发 AT（network_status 是一次串口会话，代价不小）
     state.cache.put("network", modem.id, value.clone());
     response::ok(req, value)
