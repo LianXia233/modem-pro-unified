@@ -84,6 +84,27 @@ impl VendorSpec for Spec {
         // acqorder 口径：`^SYSCFGEX: "03",...` 的第 1 段决定制式集合
         ("AT^SYSCFGEX?", "huawei_acq")
     }
+
+    fn at_plan_commands(
+        &self,
+        ctx: &crate::modem::atplan::PlanCtx,
+    ) -> Vec<crate::modem::atplan::AtCmdSpec> {
+        use crate::modem::atplan::{replace, AtCmdSpec};
+        let mut v = crate::modem::atplan::base_specs(ctx);
+
+        replace(&mut v, AtCmdSpec::on(
+            "signal", "信号（^HCSQ）", "AT^HCSQ?", "model::signal::parse_hcsq", "rsrp/rsrq/sinr", "厂商指令集"));
+        replace(&mut v, AtCmdSpec::on(
+            "iccid", "ICCID", "AT^ICCID?", "model::siminfo::parse_iccid", "^ICCID: 数字", "厂商指令集"));
+        replace(&mut v, AtCmdSpec::on(
+            "imei_set", "IMEI 改写", "AT^PHYNUM=IMEI,\"<15 位>\"", "model::imei::write", "巴龙系", "厂商指令集"));
+        let mut lb = AtCmdSpec::on(
+            "lock_band", "锁频段", "AT^LTEFREQLOCK", "model::lock::parse_huawei_lock", "LTE / NR 频点锁", "厂商指令集");
+        lb.candidates = vec!["AT^LTEFREQLOCK".into(), "AT^NRFREQLOCK".into()];
+        replace(&mut v, lb);
+
+        v
+    }
 }
 
 fn of(group: &'static str, cmd: &'static str, desc: &'static str) -> AtPreset {

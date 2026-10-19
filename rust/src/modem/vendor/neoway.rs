@@ -66,6 +66,21 @@ impl VendorSpec for Spec {
     fn usbnet_write(&self, _value: u8) -> UsbnetWrite {
         UsbnetWrite::Deny("有方没有可写的 USB 网卡模式指令（只能查看）")
     }
+
+    fn at_plan_commands(
+        &self,
+        ctx: &crate::modem::atplan::PlanCtx,
+    ) -> Vec<crate::modem::atplan::AtCmdSpec> {
+        use crate::modem::atplan::{add_from_vendor, replace, AtCmdSpec};
+        let mut v = crate::modem::atplan::base_specs(ctx);
+
+        add_from_vendor(&mut v, ctx, "lock_band", "锁频段", "nwsetband", "model::lock::parse_nwsetband", "NWSETBAND 枚举");
+        add_from_vendor(&mut v, ctx, "signal", "信号（CESQ）", "cesq", "model::signal::parse_cesq", "rsrq/rsrp");
+        replace(&mut v, AtCmdSpec::off(
+            "imei_set", "IMEI 改写", "本厂商未提供可验证的 IMEI 写指令（只读）"));
+
+        v
+    }
 }
 
 fn of(group: &'static str, cmd: &'static str, desc: &'static str) -> AtPreset {

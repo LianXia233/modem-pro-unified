@@ -4,6 +4,22 @@
 
 ## [未发布]
 
+### 全量移植：逐型号 AT 指令面 + 厂商 × 平台变体表
+
+- **AT 指令面**（`rust/src/modem/atplan.rs`）：按上游 `modem_at_plan.go` 的字段契约
+  （`key/label/cmd/candidates/enable/parser/format/on/source/note`）输出 20+ 项能力：
+  身份、服务小区、邻区、信号、注册、运营商、CA、温度、电压、流量、APN、PDP 地址、
+  AMBR、ICCID、IMSI、时钟、短信读写、扫网、锁频段、组网模式、USB/PCIe 模式、IMEI、USSD、飞行模式。
+- **各厂商单独模块**：新增 `VendorSpec::at_plan_commands()`，默认给基础 3GPP；
+  14 家厂商在各自 `modem/vendor/<厂商>.rs` 里声明邻区/CA/ICCID/IMEI/锁频段/USB 等差异
+  （如移远 `QCAINFO` + `AT+EGMR`、广和通 MTK `AT+EGMREXT`、华为 `AT^PHYNUM`、
+  鼎桥 `AT^MONNC`、芯讯通 `AT+CNBP?`、Sierra `AT!USBCOMP?`…），加厂商只动一个文件。
+- **厂商 × 平台变体表**（`rust/src/modem/variant.rs`）：移植上游 22 条 `PlatformVariants`
+  与家族/平台档判定（含 lte 旧款、`EM12` 词边界、MT5700→鼎桥归口），输出
+  `platform_variant` / `platform_variant_note` / `lock|usb|mode|imei_dialect`。
+- `/api/modules?model=` / `?modem_id=` 全部改走 `atplan`，`commands` 只含有实现依据的条目，
+  未接入的进 `gaps`（带原因）。
+
 ### 对齐上游：支持清单从 7 个骨架型号扩到 91 个（QModem）
 
 `GET /api/modules` 之前是重构留下的骨架（7 条、裸数组），而前端「支持模块」页按

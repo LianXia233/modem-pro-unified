@@ -81,6 +81,21 @@ impl VendorSpec for Spec {
     fn usbnet_write(&self, _value: u8) -> UsbnetWrite {
         UsbnetWrite::Deny("高新兴的 USB 切换（AT+ZSWITCH）未逐档取证，只支持查看")
     }
+
+    fn at_plan_commands(
+        &self,
+        ctx: &crate::modem::atplan::PlanCtx,
+    ) -> Vec<crate::modem::atplan::AtCmdSpec> {
+        use crate::modem::atplan::{add_from_vendor, replace, AtCmdSpec};
+        let mut v = crate::modem::atplan::base_specs(ctx);
+
+        add_from_vendor(&mut v, ctx, "lock_band", "锁频段", "zband", "model::lock::parse_zband", "ZBAND 频段表");
+        add_from_vendor(&mut v, ctx, "lock_cell", "锁小区", "zlockcell", "model::lock::parse_zcell", "ZLOCKCELL");
+        replace(&mut v, AtCmdSpec::off(
+            "imei_set", "IMEI 改写", "本厂商未提供可验证的 IMEI 写指令（只读）"));
+
+        v
+    }
 }
 
 fn of(group: &'static str, cmd: &'static str, desc: &'static str) -> AtPreset {

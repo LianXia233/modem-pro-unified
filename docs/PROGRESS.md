@@ -2500,9 +2500,10 @@ gnu89 模式下上述两类都不再是错误，**一个开关同时解决两类
 
 | 能力 | Go 上游 | Rust 现状 | 影响 |
 | --- | --- | --- | --- |
-| 逐型号 AT 指令面 | `modem_at_plan.go`（35K，从真实实现反射出来） | 只给清单登记的 USB/PCIe 切换 AT；其余走 `/api/vendor/cmds` | 页面「AT 指令面」信息量较少，但不会说谎 |
-| 平台变体表 | `module/variant`（厂商 × 平台） | 厂商级 `VendorSpec`，平台差异散在 model | 个别平台（如 Fibocom MTK vs 高通）取值可能需补 |
+| 逐型号 AT 指令面 | `modem_at_plan.go`（35K） | **已移植**：`modem/atplan.rs` + 各厂商 `at_plan_commands()`（20+ 能力） | ✅ 字段契约一致；差异见下 |
+| 平台变体表 | `module/variant`（22 条） | **已移植**：`modem/variant.rs`（家族/平台档 + 22 条变体 + 方言名） | ✅ 判定与上游同序 |
 | 主机磁盘占用 | `hostdisk`（statfs） | 未实现 | 屏端少一个指标，不影响业务 |
+| 频段表 | `module/bands`（QModem 频段表） | 未移植 | `plan.bands` 暂缺，页面显示「未提供」 |
 
 ### 42.4 QModem 里没抄的部分（明确不适用/不做）
 

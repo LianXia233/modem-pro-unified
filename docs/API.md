@@ -141,13 +141,16 @@
 ```
 
 `plan` 关键字段：`model / vendor / vendor_name / platform / platform_name /
-in_catalog / live / usb_modes / pcie_modes / usb_text / pcie_text /
-cmd_impl / commands[] / gaps[] / gap_notes[]`。
+platform_variant / platform_variant_note / in_catalog / live /
+usb_modes / pcie_modes / usb_text / pcie_text / cmd_impl / cmd_impl_note /
+lock_dialect / usb_dialect / mode_dialect / imei_dialect /
+commands[] / gaps[] / gap_notes[]`。
 
-`commands` 里目前只放**清单登记的 USB/PCIe 模式切换指令**（`AT+QCFG="usbnet",0` 这类，
-来源 QModem 指令脚本），每条形如
-`{key,label,cmd,parser,format,on,source}`；没有切换指令的模式会进 `gaps` + `gap_notes`，
-**不编造**。型号不在清单里时 `in_catalog=false`、`commands=[]`，只回显识别到的厂商。
+`commands` 每条形如
+`{key,label,cmd,candidates?,enable_cmd?,parser,format,on,source,note?}`，
+来源分三类：3GPP 通用、厂商模块（`modem/vendor/<厂商>.rs`）、QModem 型号清单的
+USB/PCIe 切换指令（按型号精确）。没实现的模式/能力会进 `gaps` + `gap_notes`，**不编造**；
+型号不在清单里时 `in_catalog=false`，仍会给该厂商的 3GPP/厂商指令，但不给型号级切换指令。
 
 ### GET|POST /api/at
 直发 AT。参数 `modem_id`、`cmd`（POST 可用 form 或单层 JSON；form 值按百分号解码）。

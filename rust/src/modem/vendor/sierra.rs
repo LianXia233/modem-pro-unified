@@ -61,6 +61,21 @@ impl VendorSpec for Spec {
         // `!SELRAT: <n>`（00/06 = 自动、14 = LTE only）
         ("AT!SELRAT?", "selrat")
     }
+
+    fn at_plan_commands(
+        &self,
+        ctx: &crate::modem::atplan::PlanCtx,
+    ) -> Vec<crate::modem::atplan::AtCmdSpec> {
+        use crate::modem::atplan::{add_from_vendor, replace, AtCmdSpec};
+        let mut v = crate::modem::atplan::base_specs(ctx);
+
+        add_from_vendor(&mut v, ctx, "usbnet", "USB 网卡模式", "usbcomp", "model::usbnet", "AT!USBCOMP 组合");
+        add_from_vendor(&mut v, ctx, "iccid", "ICCID", "uims", "model::siminfo::parse_iccid", "AT!UIMS?");
+        replace(&mut v, AtCmdSpec::on(
+            "lock_band", "锁频段", "AT!BAND?", "model::lock::parse_sierra_band", "band 索引", "厂商指令集"));
+
+        v
+    }
 }
 
 fn of(group: &'static str, cmd: &'static str, desc: &'static str) -> AtPreset {

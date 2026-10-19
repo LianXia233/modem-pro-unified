@@ -186,6 +186,18 @@ pub trait VendorSpec: Sync {
     fn cell_scan_cmd(&self) -> Option<&'static str> {
         None
     }
+
+    /// 本厂商的 AT 指令面（`/api/modules?model=` 用）。
+    ///
+    /// 默认 = 基础 3GPP + 公共钩子（服务小区/网络信息/温度/流量/组网模式）。
+    /// 厂商模块覆盖它来声明自己的邻区/CA/ICCID/IMEI/锁频段等指令 ——
+    /// **每家一个文件**，新增厂商不动中央装配。
+    fn at_plan_commands(
+        &self,
+        ctx: &crate::modem::atplan::PlanCtx,
+    ) -> Vec<crate::modem::atplan::AtCmdSpec> {
+        crate::modem::atplan::base_specs(ctx)
+    }
 }
 
 impl Vendor {
@@ -218,6 +230,30 @@ impl Vendor {
             }
         }
         Vendor::Unknown
+    }
+
+    /// 支持清单里的厂商标识（`quectel` / `fibocom` / `huawei`…）→ 枚举。
+    ///
+    /// 清单里 `huawei` 同时含华为与鼎桥：MT5700/MT5710 归 `TDTech`（ATI 也这么认）。
+    pub fn from_key(key: &str) -> Option<Vendor> {
+        Some(match key.trim().to_ascii_lowercase().as_str() {
+            "quectel" => Vendor::Quectel,
+            "fibocom" => Vendor::Fibocom,
+            "simcom" => Vendor::Simcom,
+            "meig" => Vendor::Meig,
+            "huawei" => Vendor::Huawei,
+            "tdtech" => Vendor::TDTech,
+            "unisoc" => Vendor::Unisoc,
+            "foxconn" => Vendor::Foxconn,
+            "gosuncn" => Vendor::Gosuncn,
+            "neoway" => Vendor::Neoway,
+            "openluat" => Vendor::Openluat,
+            "sierra" => Vendor::Sierra,
+            "telit" => Vendor::Telit,
+            "thales" => Vendor::Thales,
+            "unknown" => Vendor::Unknown,
+            _ => return None,
+        })
     }
 
     pub fn as_str(&self) -> &'static str {

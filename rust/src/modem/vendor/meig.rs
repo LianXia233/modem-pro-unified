@@ -60,6 +60,22 @@ impl VendorSpec for Spec {
     fn mode_read(&self) -> (&'static str, &'static str) {
         ("AT+QNWPREFCFG=\"mode_pref\"", "qcf")
     }
+
+    fn at_plan_commands(
+        &self,
+        ctx: &crate::modem::atplan::PlanCtx,
+    ) -> Vec<crate::modem::atplan::AtCmdSpec> {
+        use crate::modem::atplan::{add_from_vendor, replace, AtCmdSpec};
+        let mut v = crate::modem::atplan::base_specs(ctx);
+
+        add_from_vendor(&mut v, ctx, "signal", "信号（CSQ/QCSQ）", "qcsq", "model::signal::parse_qcsq", "rsrp/rsrq/sinr");
+        replace(&mut v, AtCmdSpec::on(
+            "imei_set", "IMEI 改写", "AT+EGMR=1,7,\"<15 位>\"", "model::imei::write", "高通通用，需重启", "厂商手册"));
+        replace(&mut v, AtCmdSpec::on(
+            "lock_band", "锁频段", "AT+QNWPREFCFG=\"lte_band\"", "model::lock::parse_qnwpref", "LTE / NR5G 频段列表", "厂商指令集"));
+
+        v
+    }
 }
 
 fn of(group: &'static str, cmd: &'static str, desc: &'static str) -> AtPreset {
