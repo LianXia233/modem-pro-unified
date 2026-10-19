@@ -4,6 +4,16 @@
 
 ## [未发布]
 
+### CI 增加 mediatek/filogic（aarch64_cortex-a53）APK 通道
+
+实测：`apk --print-arch` 为 `aarch64_cortex-a53` 的固机装不上 armv8 打出的
+`aarch64_generic` 包（`error: uninstallable / arch: aarch64_generic`），而临时改
+`/etc/apk/arch` 会让已装的 cortex-a53 包全部变 uninstallable。
+
+所以把 `TARGET` 从 workflow env 下放到 job 级 matrix，新增 `apk-filogic` 通道。
+两档 APK 内容一致（同一份静态 musl 二进制、无内核模块），只是包架构标签不同；
+按设备 `apk --print-arch` 选：`aarch64_cortex-a53` → filogic，否则 → mainline。
+
 ### LuCI/后端异步化架构：任务系统 + 缓存快照
 
 慢操作从 HTTP 请求线程里整体挪走，「打开页面」不再等于「发一串 AT」：
