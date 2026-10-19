@@ -174,9 +174,11 @@ jobs:
           find "$PKG_DIR" -name target -type d -prune -exec rm -rf {} + 2>/dev/null
           echo "src-link modem_pro $FEED_DIR" >> feeds.conf.default
           echo "src-link ci_stub $GITHUB_WORKSPACE/.ci-stub" >> feeds.conf.default
-          ./scripts/feeds update packages luci
-          # 精确安装所需包（不 install -a，避免把 third_party/kmods 内核模块也拉进 feeds）。
           # 注意：Rust 走宿主工具链直编（见 build 顶部说明），已不再安装 feeds 的 lang/rust。
+          # feeds update 只处理命令行列出的 feed，src-link 也必须列出（否则不会生成
+          # feeds/<name>.index，后续 install 会报 "Ignoring feed 'modem_pro' - index missing"）。
+          ./scripts/feeds update packages luci modem_pro ci_stub
+          # 精确安装所需包（不 install -a，避免把 third_party/kmods 内核模块也拉进 feeds）
           ./scripts/feeds install -p luci luci-base
           ./scripts/feeds install -p ci_stub odhcp6c
           ./scripts/feeds install -p modem_pro modem-pro
