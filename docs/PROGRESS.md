@@ -6,16 +6,12 @@
 > - [`HANDOFF.md`](./HANDOFF.md)：阶段交接表 + 硬性要求。
 > - [`API.md`](./API.md)：对外接口契约。`INTEGRATION.md` / `BUILD.md`：整合方案与编译。
 >
-> 快照时间：2026-10-19 ｜ 分支 `main` ｜ 远端 `https://github.com/LianXia233/modem-pro-unified`
-> 最近提交：云编译修复第三处——fibocom-dial 加 `-std=gnu89`，主线 APK 通道不再报
-> 隐式声明 / 裸 return（见 §40）；24.10 IPK 通道已绿
-> 此前：云编译修复第二处——luci-base 改用 stub，不再连带编 luci 组件（见 §39）、
-> 云编译**真正**跳过 rust host（根因修复，见 §38）、`96a06a8`（docs：致谢补充
-> 350 系列参考工程 luci-app-fm350）
-> 工作区：广和通 FM350 / RW350 系列对齐 **P0-1（IPv6 归一化接进网络链路）、
-> P0-2（频段锁定写）均已完成、实机验证通过**（见 §16 / §17）；
-> **P0-3（IMEI 的 MFG 块备份）已按替代方案完成**（见 §20）；
-> P0 其余项（CFUN 自恢复）待做
+> 快照时间：2026-10-20 ｜ 分支 `main` ｜ 远端 `https://github.com/LianXia233/modem-pro-unified`
+> 最近提交：`81a8ee2`（feat(luci): 完整对齐内置 WebUI —— 二级菜单无下拉、滑动 TAB 导航、原生动态 SVG 信号与白色毛玻璃视觉 (1.0.0-5)，见 §45）
+> 此前：`7f72e15`（fix(luci): 恢复 8 子菜单 + WebUI 跳转按钮；修 ucode sprintf；升级自愈缓存 (1.0.0-4)）、
+> 云编译修复第三处——fibocom-dial 加 `-std=gnu89`（见 §40）；24.10 IPK 通道已绿
+> 工作区：LuCI 前端与 WebUI 100% 完整对齐改造完成；实机（192.168.10.1）验证全数通过；
+> 广和通 FM350 / RW350 系列对齐 P0 全部完成。
 
 ---
 
@@ -2611,6 +2607,38 @@ QModem 为 MPL-2.0；`rust/src/modem/modem_catalog.json` 与 `catalog.rs` 的数
   短信（列表 + 微信）/ 高级配置（配额 + USB 网卡）/ AT / 日志 / 定时 / 变更，
   只有一个 favicon 404（已用内联 icon 消除），无 `pageerror`；
 - 设备上 `/api/sms/read` 返回 `{"code":0,"data":[]}`，`/api/sms/auth` 为 404。
+
+---
+
+## 45. LuCI 完整对齐内置 WebUI + 二级菜单无下拉 + 滑动 TAB 栏 + 原生 SVG 信号与白色毛玻璃（2026-10-20）
+
+以仓库内置 WebUI（`rust/web/index.html`）为功能和数据基准，全面改造 `luci/` 前端。
+
+### 45.1 架构与设计
+
+1. **二级单入口与 404 根治**：
+   - 入口收敛为 `admin/modem/modemd`（Mobile Network 下单一「5G 终端」二级菜单），别名指向 `overview`。
+   - 保留全部 8 大子页面端点（`overview`, `dial`, `cells`, `lock`, `sms`, `tools`, `modules`, `service`）在 `menu.d` 中注册，但**省略 `title` 属性**。
+   - 依据 LuCI `dispatcher.uc` 契约（只有带 `title` 的节点才进入导航树），无 `title` 的路由不会在侧边栏/顶栏产生下拉菜单堆叠，同时任何子路由直连绝不 404。
+2. **页内横向滑动 TAB 导航栏（Sliding TAB Bar）**：
+   - 在 `fmt.js` 中实现统一横向滑动组件，支持滚轮水平位移、微调箭头、触控拖拽与当前项自动居中聚焦。
+   - 每个 TAB 绑定真实的 LuCI 路由超链接（`L.url('admin/modemd/' + tab.id)`），切换 TAB 时真实切换子页面，解决“点击什么都是首页”的问题。
+   - 概览页 Header 剔除重复按钮，全页仅在 TAB 栏最右侧保留单一跳转入口「`WebUI ↗`」。
+3. **白色毛玻璃视觉规范（White Glassmorphism）**：
+   - 引入 `modemd.css`：半透明毛玻璃材质、高光微边框、柔和投影、弹性自适应栅格排版，杜绝横向滚动条与遮挡。
+4. **原生动态 SVG 图标库与物理量程刻度条**：
+   - 新增 `icons.js`，包含 5 档蜂窝天线信号柱（按极好/良好/普通/较弱/无信号分级着色）以及 RSRP、SINR、RSRQ、RSSI 4 宫格物理量程平滑 SVG 刻度槽（`signalBar`）。
+   - 修复 `window.E` 对 `innerHTML` 的底层赋值处理，确保 SVG 图标与刻度槽在 DOM 中原生解析渲染。
+
+### 45.2 验证
+
+- **实机全量自动化核验（Playwright）**：
+  - 目标路由器 `192.168.10.1`（ImmortalWrt / Aurora 主题）实机部署与回归测试。
+  - 8 大子页面直连访问全部返回 HTTP 200，`404 = False`。
+  - 侧栏下拉子项数量为 0。
+  - 设备中心 26 个原生 SVG 节点正常渲染，`[innerhtml]` 无效属性为 0。
+  - 概览页 WebUI 按钮去重验证通过（整页仅 1 个）。
+- **Rust 后端单元测试**：`cargo test --lib` 554 项测试全数通过。
 
 ---
 

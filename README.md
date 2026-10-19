@@ -22,11 +22,19 @@ OpenWrt 上统一管理 **5G/LTE 模组**（移远 Quectel、广和通 Fibocom�
 # 安装后
 /etc/init.d/modemd status
 /etc/init.d/modemd restart
-# 调试台： http://<路由器地址>:9527/
-# LuCI 菜单： 5G终端
+# 原生独立 WebUI 调试台： http://<路由器地址>:9527/
+# LuCI 菜单： Mobile Network（移动网络） -> 5G 终端（二级单入口，支持页内横向左右滑动 TAB 栏）
 ```
 
 配置在 `/etc/modemd/config.toml`（conffile，升级不覆盖）；改完 `restart` 生效。
+
+### 特色亮点
+
+- **统一精致的白色毛玻璃视觉规范（White Glassmorphism）**：适度透明模糊卡片、高光轻薄边框、低饱和状态强调色与规整弹性自适应栅格。
+- **二级单入口 + 页内横向滑动 TAB**：收敛侧栏菜单树，杜绝下拉式菜单冗余；页内 TAB 栏支持滚轮水平滚动、左右微调与触控自适应。
+- **原生动态 SVG 信号系统**：5 档蜂窝天线信号计真实联动 3GPP 评级，RSRP/SINR/RSRQ/RSSI 4 宫格物理量程 SVG 进度刻度槽。
+- **与 WebUI 100% 完整对齐**：8 大核心业务页面与 10 项调试工具箱全功能覆盖，数据源、参数交互与刷新状态无缝同步。
+- **原生 Rust 守护进程**：内置 QMI / MBIM 拨号协议托管，无需外部厂商 C 二进制。
 
 ## 从源码构建
 
