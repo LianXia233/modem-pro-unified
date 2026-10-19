@@ -17,6 +17,7 @@
 //! 接口契约见 docs/API.md，迁移清单见 docs/PORTING.md。
 
 mod auth;
+pub(crate) mod cache;
 mod gateway;
 mod handlers;
 pub(crate) mod hostnic;
@@ -30,6 +31,7 @@ mod router;
 pub(crate) mod schedule;
 mod server;
 mod static_ui;
+pub(crate) mod tasks;
 mod ws;
 
 use std::sync::{Arc, Mutex};
@@ -73,6 +75,10 @@ pub struct AppState {
     pub(crate) netprov: crate::netprov::provision::ReportStore,
     /// 企业微信推送客户端（见 wechat/，`/api/wechat/*` 与 `+CMTI` 路径共用）
     pub(crate) wechat: crate::wechat::client::WeChatClient,
+    /// 只读状态缓存：页面首屏用「旧值 + 年龄」，不再每条都发 AT（见 http/cache.rs）
+    pub(crate) cache: Arc<cache::StateCache>,
+    /// 异步任务注册表：慢操作提交 → 轮询，不占 HTTP 线程与串口队列（见 http/tasks.rs）
+    pub(crate) tasks: Arc<tasks::Registry>,
 }
 
 impl AppState {
@@ -144,6 +150,8 @@ pub fn serve(
         net_wan_mode: Mutex::new(None),
         netprov: crate::netprov::provision::ReportStore::new(),
         wechat,
+        cache: Arc::new(cache::StateCache::new()),
+        tasks: Arc::new(tasks::Registry::new()),
     });
     log::info!("流量配额台账：{}", state.quota.path());
     log::info!("IMEI 备份台账：{}", state.imei.path());

@@ -150,9 +150,12 @@ define Package/modem-pro/install
 	# js/view/ 里，鉴权端点在 ucode/controller/ 里。
 	$(INSTALL_DIR) $(1)/usr/share/ucode/luci/controller
 	$(INSTALL_DATA) $(CURDIR)/luci/app/ucode/controller/modemd_auth.uc $(1)/usr/share/ucode/luci/controller/modemd_auth.uc
+	$(INSTALL_DATA) $(CURDIR)/luci/app/ucode/controller/modemd_api.uc $(1)/usr/share/ucode/luci/controller/modemd_api.uc
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/modemd
-	$(INSTALL_DATA) $(CURDIR)/luci/app/js/view/modemd/overview.js $(1)/www/luci-static/resources/view/modemd/overview.js
-	$(INSTALL_DATA) $(CURDIR)/luci/app/js/view/modemd/service.js $(1)/www/luci-static/resources/view/modemd/service.js
+	$(INSTALL_DATA) $(CURDIR)/luci/app/js/view/modemd/*.js $(1)/www/luci-static/resources/view/modemd/
+	# 共享 JS 模块（api/task/store/fmt）：异步化架构的页面侧
+	$(INSTALL_DIR) $(1)/www/luci-static/resources/modemd
+	$(INSTALL_DATA) $(CURDIR)/luci/app/htdocs/luci-static/resources/modemd/*.js $(1)/www/luci-static/resources/modemd/
 
 	# 菜单 + ACL
 	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d

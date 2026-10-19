@@ -19,6 +19,11 @@ use super::{auth, handlers, request, response, static_ui, AppState};
 #[cfg_attr(not(test), allow(dead_code))]
 pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/version"),
+    ("GET", "/api/snapshot"),
+    ("GET", "/api/tasks"),
+    ("POST", "/api/tasks"),
+    ("GET", "/api/tasks/get"),
+    ("POST", "/api/tasks/cancel"),
     ("POST", "/api/login"),
     ("POST", "/api/logout"),
     ("GET", "/api/session"),
@@ -136,6 +141,13 @@ pub fn handle(req: Request, state: Arc<AppState>) -> Result<()> {
     let m = method(&req);
     match (m, path.as_str()) {
         ("GET", "/api/version") => handlers::version::handle(req, &state),
+        // 异步化：快照（缓存优先，不发 AT）+ 任务（慢操作提交 → 轮询）
+        ("GET", "/api/snapshot") => handlers::snapshot::handle(req, &state, &query),
+        ("GET", "/api/tasks") | ("POST", "/api/tasks") => {
+            handlers::tasks::handle(req, &state, &query)
+        }
+        ("GET", "/api/tasks/get") => handlers::tasks::handle(req, &state, &query),
+        ("POST", "/api/tasks/cancel") => handlers::tasks::handle(req, &state, &query),
         ("GET", "/api/modems") => handlers::modems::handle(req, &state, &query),
         ("GET", "/api/modem/info") => handlers::modem_info::handle(req, &state, &query),
         ("GET", "/api/modem/status") => handlers::modem_status::handle(req, &state, &query),

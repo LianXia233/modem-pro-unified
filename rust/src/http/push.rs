@@ -22,6 +22,8 @@ pub fn push_signal(state: &AppState, modem: &Modem) {
             let entries = state.metrics.note_signal(modem.id, &sig);
             super::handlers::push_changes(state, modem.id, &entries);
             let data = serde_json::to_value(sig).unwrap_or(Value::Null);
+            // 顺手进缓存：/api/snapshot 就能立即读到，不用再发一次 AT
+            state.cache.put("signal", modem.id, data.clone());
             state.ws.broadcast("signal", Some(modem.id), data);
         }
         Err(e) => log::debug!("后台查信号失败（模组 {}）: {e}", modem.id),
@@ -33,6 +35,7 @@ pub fn push_network_state(state: &AppState, modem: &Modem, st: &NetworkStatus) {
     let entries = state.metrics.note_network(modem.id, st);
     super::handlers::push_changes(state, modem.id, &entries);
     let data = serde_json::to_value(st).unwrap_or(Value::Null);
+    state.cache.put("network", modem.id, data.clone());
     state.ws.broadcast("network", Some(modem.id), data);
 }
 
@@ -87,6 +90,7 @@ pub fn push_logs(state: &AppState, lines: &[String]) {
 /// 推基站扫描结果（「小区」卡片；主动扫网结束后调用，页面立即拿到新结果）。
 pub fn push_cells(state: &AppState, modem: &Modem, result: &CellScanResult) {
     let data = serde_json::to_value(result).unwrap_or(Value::Null);
+    state.cache.put("cells", modem.id, data.clone());
     state.ws.broadcast("cells", Some(modem.id), data);
 }
 
@@ -95,6 +99,7 @@ pub fn push_cells(state: &AppState, modem: &Modem, result: &CellScanResult) {
 /// 锁网是模组级状态，改一次所有在线页面都该看到，所以顺手广播。
 pub fn push_lock(state: &AppState, modem: &Modem, st: &LockStatus) {
     let data = serde_json::to_value(st).unwrap_or(Value::Null);
+    state.cache.put("lock", modem.id, data.clone());
     state.ws.broadcast("lock", Some(modem.id), data);
 }
 

@@ -26,6 +26,46 @@
 
 ## 接口
 
+### GET /api/snapshot?modem_id=N
+页面首屏快照：**一条 AT 都不发**，全部来自缓存（后台采样 / 同步接口 / 异步任务的最近一次结果）。
+
+```json
+{"code":0,"data":{
+  "ts":"2026-10-19T07:22:38Z","modem_id":0,
+  "modems":[{"id":0,"model":"FM350-GL","vendor":"fibocom",…}],
+  "blocks":{"signal":{…},"network":{…},"cells":{…},"lock":{…}},
+  "ages":{"signal":1933,"network":null,"cells":null,"lock":null,…},
+  "stale":{"signal":false,"network":true,…},
+  "dial":{"state":{"state":"idle","state_text":"未拨号",…}},
+  "tasks":[{"id":"t1","kind":"signal.refresh","state":"running",…}]
+},"msg":"ok"}
+```
+
+- `ages`：每块数据的年龄（毫秒）；`null` = 从没采过。`stale` 超过阈值（信号 30s / 网络 60s / 小区与锁网 30min）。
+- 页面契约：**先渲染旧值 + 年龄**，需要新值就提交任务（见下），任务完成后重拉快照。
+
+### GET /api/tasks、POST /api/tasks、GET /api/tasks/get、POST /api/tasks/cancel
+异步任务：慢操作（扫小区 / 扫网 / AT / USSD / 发短信 / 锁频段 / 切 USB 模式 / 重启模组 /
+刷新信号与网络）**提交后立即返回**，不占 HTTP 连接也不占串口队列。
+
+```text
+POST /api/tasks        {kind, modem_id, ...参数}  → {task:{id:"t1",state:"queued"}}
+GET  /api/tasks/get?id=t1                         → {task:{state:"done", result:{…}, elapsed_ms:…}}
+GET  /api/tasks?modem_id=0[&active=1]             → {tasks:[…], count}
+POST /api/tasks/cancel {id:"t1"}                  → {id, cancelled}
+```
+
+- `state ∈ queued|running|done|failed|cancelled`；`progress` 是给页面看的一句话。
+- **去重**：同 `kind + 模组 + 参数` 只允许一个在跑（扫网被点两次不会排两条）。
+- **取消是协作式**：AT 读取循环每 100ms 检查一次（`command_cancellable`），扫网能被打断；
+  不检查的闭包会跑完但结果标成 cancelled。
+- `result` 与同名同步接口的 `data` 同形，前端可复用渲染。
+- 任务种类：`signal.refresh` / `network.refresh` / `cells.scan` / `lock.status` / `at` /
+  `ussd.send` / `sms.send` / `usbnet.set` / `lock.band` / `netscan` / `reboot`。
+
+> 同步接口（`/api/cells`、`/api/netscan` 等）仍然保留：调试台与脚本用；
+> **页面应当全部走任务**，见 `docs/PORTING.md` 的异步化口径。
+
 ### GET /api/version
 免登录。返回版本与运行时信息。
 

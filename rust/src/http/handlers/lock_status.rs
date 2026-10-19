@@ -14,5 +14,8 @@ pub fn handle(req: Request, state: &AppState, query: &HashMap<String, String>) -
         return response::fail(req, -1, "modem not found");
     };
     let refresh = query.get("refresh").map(|v| v == "1").unwrap_or(false);
-    response::ok(req, serde_json::to_value(modem.lock_status(refresh))?)
+    let value = serde_json::to_value(modem.lock_status(refresh))?;
+    // 进缓存（refresh=1 是「真查了」；refresh=0 走模组内缓存，也一并归档）
+    state.cache.put("lock", modem.id, value.clone());
+    response::ok(req, value)
 }
