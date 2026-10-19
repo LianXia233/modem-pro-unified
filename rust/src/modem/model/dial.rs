@@ -39,6 +39,54 @@ pub const DIAL_CONNECTED: &str = "connected";
 /// 拨号失败。
 pub const DIAL_FAILED: &str = "failed";
 
+// ---------------- 链路阶段（`DialState::phase`）----------------
+//
+// 「拨号成功」有三种完全不同的含义，以前只有一个 `state`：
+//   ① 模组说 PDP 激活了（AT+CGACT=1 回 OK）；
+//   ② 模组给了本机地址（AT+CGPADDR 有值）；
+//   ③ 主机真的能经这块网卡发出去（网卡有地址 + 默认路由经它）。
+// ①② 都满足而 ③ 不满足时（实测 FM350：主机网卡挂 169.254、无默认路由），
+// 页面照样显示「已连接」，用户以为网络坏了。`phase` 把这三层拆开，
+// `state` 保持不变（API 契约不动），前端按 phase 显示细分说明。
+pub const PHASE_IDLE: &str = "idle";
+pub const PHASE_DIALING: &str = "dialing";
+/// 模组侧数据会话已建立（PDP 激活 / 数据呼叫建立），主机侧未验证。
+pub const PHASE_SESSION: &str = "session";
+/// 主机网卡还没起来（没找到网卡 / 网卡没拿到地址）。
+pub const PHASE_IFACE: &str = "iface_pending";
+/// 网卡有地址，但默认路由不经它（被别的口抢了 / 没配）。
+pub const PHASE_ROUTE: &str = "route_pending";
+/// 网卡有地址且默认路由经它 —— 这才是用户体感里的「已连接」。
+pub const PHASE_ONLINE: &str = "online";
+pub const PHASE_FAILED: &str = "failed";
+
+/// 连接态下的阶段判定（纯函数，便于单测）。
+///
+/// 三个布尔都要「事实」而不是「推断」：网卡在不在、有没有地址、默认路由走不走它。
+/// 任何一层不满足都如实标出来 —— 排障方向完全不同：
+/// `iface_pending` 去查 USB / 驱动 / hostnic，`route_pending` 去查 metric / netifd。
+fn phase_for_connected(has_iface: bool, has_addr: bool, has_route: bool) -> &'static str {
+    match (has_iface, has_addr, has_route) {
+        (true, true, true) => PHASE_ONLINE,
+        (true, true, false) => PHASE_ROUTE,
+        _ => PHASE_IFACE,
+    }
+}
+
+/// 阶段 → 人话（界面「链路阶段」一列）。
+pub fn dial_phase_text(phase: &str) -> String {
+    match phase {
+        PHASE_IDLE => "未初始化".into(),
+        PHASE_DIALING => "拨号执行中".into(),
+        PHASE_SESSION => "数据会话已建立（主机侧未验证）".into(),
+        PHASE_IFACE => "数据会话已建立，主机网卡未就绪".into(),
+        PHASE_ROUTE => "网卡有地址，但默认路由不经它".into(),
+        PHASE_ONLINE => "网络就绪（地址 + 默认路由）".into(),
+        PHASE_FAILED => "失败".into(),
+        other => other.to_string(),
+    }
+}
+
 /// 数据默认 cid（请求没带 cid 时用它）。
 pub const DEFAULT_DATA_CID: i32 = 1;
 
@@ -125,6 +173,15 @@ pub struct DialState {
     pub link_source: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<DialStep>,
+    /// 链路阶段（细分说明，见 PHASE_* 常量）。
+    ///
+    /// 与 `state` 的分工：`state` 回答「拨号任务进行到哪了」（对外契约，
+    /// 页面按它显示「已连接/未连接」）；`phase` 回答「网络真的通了吗」——
+    /// 需要看主机网卡有没有地址、默认路由走不走它。空 = 旧快照，无此概念。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub phase: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub phase_text: String,
 }
 
 impl DialState {
@@ -1709,6 +1766,28 @@ impl Modem {
                 st.type_name = "未能识别（设备未上报）".to_string();
             }
         }
+
+        // ⑦ 链路阶段：`state` 之外再给一层「网络真的通了吗」。
+        //
+        //    只在连接态算（其它态没有意义）；默认路由读 /proc/net/route，
+        //    不 fork —— dial_status 是所有出口的必经之路（HTTP/WS/snapshot），
+        //    每次都 fork 一次 `ip route` 不可接受。
+        st.phase = match st.state.as_str() {
+            s if s == DIAL_CONNECTED => {
+                let has_route = !st.host_iface.trim().is_empty()
+                    && crate::netprov::route::has_default_via(&st.host_iface);
+                phase_for_connected(
+                    !st.host_iface.trim().is_empty(),
+                    !st.host_ips.is_empty(),
+                    has_route,
+                )
+                .to_string()
+            }
+            s if s == DIAL_DIALING => PHASE_DIALING.to_string(),
+            s if s == DIAL_FAILED => PHASE_FAILED.to_string(),
+            _ => PHASE_IDLE.to_string(),
+        };
+        st.phase_text = dial_phase_text(&st.phase);
         st
     }
 
@@ -2151,6 +2230,40 @@ impl Modem {
             );
         }
 
+        // ④b 链路校验：只凭「PDP 激活 + 模组给了地址」就宣布成功是骗人 ——
+        //     主机网卡可能还没起来（FM350 实测：模组侧都好，eth2 挂 169.254、
+        //     无默认路由）。这里把「网卡 / 路由」两层也查一遍，写进 steps；
+        //     结论由 dial_status 的 phase 对外（state 契约不动）。
+        let st_now = self.dial_status();
+        let iface_up = !st_now.host_iface.trim().is_empty() && !st_now.host_ips.is_empty();
+        if iface_up {
+            let route_ok = crate::netprov::route::has_default_via(&st_now.host_iface);
+            self.dial_step(
+                "主机网卡就绪（有地址）",
+                true,
+                &format!("{} {}", st_now.host_iface, st_now.host_ips.join(" ")),
+            );
+            self.dial_step(
+                "默认路由经该网口",
+                route_ok,
+                if route_ok {
+                    ""
+                } else {
+                    "没有经它的默认路由：地址配了也出不去（查 netifd 配置 / metric）"
+                },
+            );
+        } else {
+            self.dial_step(
+                "主机网卡就绪（有地址）",
+                false,
+                &if st_now.host_iface.trim().is_empty() {
+                    "还没找到模组对应的数据网卡".to_string()
+                } else {
+                    format!("{} 还没拿到地址（DHCP 未回 / 静态未配）", st_now.host_iface)
+                },
+            );
+        }
+
         self.dial_update(|s| {
             s.state = DIAL_CONNECTED.to_string();
             s.state_text = dial_state_text(DIAL_CONNECTED);
@@ -2247,6 +2360,30 @@ impl Modem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------- 链路阶段 ----------
+
+    #[test]
+    fn phase_layers_follow_the_three_facts() {
+        // ①②③ 全满足 → online
+        assert_eq!(phase_for_connected(true, true, true), PHASE_ONLINE);
+        // 模组侧都好、主机网卡也有地址，但默认路由走别的口 → route_pending
+        assert_eq!(phase_for_connected(true, true, false), PHASE_ROUTE);
+        // 网卡不在 / 没地址 → iface_pending（路由根本无从谈起）
+        assert_eq!(phase_for_connected(true, false, false), PHASE_IFACE);
+        assert_eq!(phase_for_connected(false, false, false), PHASE_IFACE);
+        // 网卡不在但「有地址」在逻辑上不可能，这里只保证不 panic、给最保守值
+        assert_eq!(phase_for_connected(false, true, true), PHASE_IFACE);
+    }
+
+    #[test]
+    fn phase_text_is_human_readable() {
+        assert_eq!(dial_phase_text(PHASE_ONLINE), "网络就绪（地址 + 默认路由）");
+        assert_eq!(dial_phase_text(PHASE_IFACE), "数据会话已建立，主机网卡未就绪");
+        assert_eq!(dial_phase_text(PHASE_ROUTE), "网卡有地址，但默认路由不经它");
+        // 未认识的值原样返回，不 panic
+        assert_eq!(dial_phase_text("whatever"), "whatever");
+    }
 
     // ---------- 拨号前置体检 ----------
 

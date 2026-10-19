@@ -4,6 +4,46 @@
 
 ## [未发布]
 
+### 1.0.0-9：拨号链路阶段（phase）——「已连接」不再是一句空话
+
+对齐上游拨号实现后确认：方式判定、按类型分派、网口关联、幂等组网都已与
+Go 上游一致；真正缺的是**连接状态分层**。审计明细见
+[`docs/DIAL_AUDIT.md`](docs/DIAL_AUDIT.md)。
+
+#### 🟢 问题
+
+AT 拨号（ECM/NCM/RNDIS）收尾只凭 `AT+CGACT=1` 回 OK + `AT+CGPADDR` 有地址
+就置 `state=connected`。但「主机真的能出去」还差两层：
+
+3. 主机网卡存在且拿到地址（FM350 实测：模组侧全好，eth2 挂 169.254）；
+4. **默认路由经这块网卡**（有地址但路由被别的口抢走，照样打不开网页）。
+
+页面显示「已连接」，用户以为网络坏了 —— 排障方向完全错误。
+
+#### 🟢 修复：`phase` 阶段层（`state` 契约不变）
+
+| phase | 含义 | 判据 |
+| --- | --- | --- |
+| `iface_pending` | 会话已建立，主机网卡未就绪 | 网卡缺失或无地址 |
+| `route_pending` | 网卡有地址但默认路由不经它 | `has_default_via()==false` |
+| `online` | 地址 + 默认路由都有 | 三层全过 |
+
+- 路由事实读 `/proc/net/route` + `/proc/net/ipv6_route`（**不 fork**，
+  `netprov/route.rs`，小端网关还原 / 默认路由识别 / 子网排除 6 个单测）；
+- `dial_status()` 是 HTTP/WS/snapshot 唯一出口，phase 统一在此计算；
+- 拨号收尾把「主机网卡就绪」「默认路由经该网口」写进 `steps`，
+  失败那条直接给排障方向；
+- LuCI 拨号页加「链路阶段」行、WebUI 拨号卡加阶段徽标（同一份 JSON）。
+
+#### 验证
+
+- `cargo test`：**687 passed / 0 failed**（新增 8 个）；
+- 实机（netifd 拉起 eth2）：`phase=online`，LuCI 显示
+  「链路阶段 网络就绪（地址 + 默认路由）」；
+- `route_pending` / `iface_pending` 两条路径由单测覆盖（构造三布尔全组合）。
+
+---
+
 ### 1.0.0-8：多维度模组识别 + USB 端口规则 + 逐型号怪癖
 
 对齐两个上游（QModem `2ef9227`、Go 版 `397e014`）的模组知识，并把「认模组」

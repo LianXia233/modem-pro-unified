@@ -6277,9 +6277,14 @@ function renderDial() {
   renderPcieActions(u);
   // 自动组网（OpenWrt：模块上线自动拨号 + 自动建 WAN 接口与防火墙）最近一次结果
   const aw = d && d.auto_wan;
+  // 链路阶段（后端 phase）：「已连接」只说明模组侧激活了，主机网卡没地址、
+  // 默认路由被别的口抢走时照样上不了网 —— 与 LuCI 拨号页同一份 phase 字段。
+  const phasePill = s.phase === 'online' ? 'on'
+    : (s.phase === 'route_pending' || s.phase === 'iface_pending') ? 'off' : 'seg';
   $('#dialState').innerHTML =
     `<div class="row">
        <span class="pill ${pill}">${esc(s.state_text || '未拨号')}</span>
+       ${s.phase_text ? `<span class="pill ${phasePill}" title="链路阶段：模组会话 / 主机网卡 / 默认路由三层">阶段：${esc(s.phase_text)}</span>` : ''}
        <span class="muted">cid=${esc(dash(s.cid))}${s.apn ? ' · APN ' + esc(s.apn) : ''}${s.pdp_type ? ' · ' + esc(s.pdp_type) : ''}</span>
        ${s.elapsed_sec ? `<span class="muted">已连接 ${esc(fmtHeld(s.elapsed_sec))}</span>` : ''}
        ${s.type_name ? `<span class="muted">USB ${esc(s.type_name)}</span>` : ''}
@@ -6289,6 +6294,7 @@ function renderDial() {
        ${kv('本机 IPv4', s.ipv4 || '-')}
        ${kv('本机 IPv6', s.ipv6 || '-')}
        ${kv('主机侧网卡', s.host_iface || hostIface || '-')}
+       ${s.phase ? kv('链路阶段', s.phase_text || s.phase) : ''}
      </div>
      ${(s.host_ips && s.host_ips.length) ? `<div class="muted" style="margin-top:6px">网卡地址：${esc(s.host_ips.join(', '))}</div>` : ''}
      ${aw ? `<div class="muted" style="margin-top:8px${aw.error ? ';color:var(--err)' : ''}">

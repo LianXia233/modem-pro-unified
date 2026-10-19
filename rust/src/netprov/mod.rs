@@ -32,6 +32,7 @@
 //! **唯一的例外**：`host_dial` 关掉时 MBIM 退回 `proto=mbim` —— 那时没人拨号，
 //! 只能靠 netifd 的 `mbim.sh` / `umbim`。
 
+pub mod route;
 pub mod provision;
 pub mod uci;
 pub mod v6;

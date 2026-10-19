@@ -317,6 +317,13 @@ return view.extend({
 				]),
 				E('div', { 'class': 'mp-kv-grid' }, [
 					rowKv('连接状态', statusText),
+					/* 链路阶段（后端 phase）：「已连接」只说明模组侧激活了，
+					   主机网卡没地址、默认路由被别的口抢走时照样上不了网。
+					   这一行把三层（会话 / 网卡 / 路由）拆开给用户看，
+					   phase 缺省（旧快照）就不显示，避免多一行无信息的「-」。 */
+					rowKv('链路阶段', st.phase_text || '-',
+						st.phase === 'route_pending' ? '地址配了也出不去，查 netifd / metric'
+							: (st.phase === 'iface_pending' ? '等网卡起来或拿到地址' : '')),
 					rowKv('驱动/通信类型', st.type_name || st.kind || '-'),
 					rowKv('主机侧接口', st.host_iface || '-'),
 					rowKv('生效 APN', st.apn || '（沿用模组配置）'),

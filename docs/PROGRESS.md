@@ -3063,3 +3063,49 @@ QModem 的 `application/`（语音、短信转发、固件刷写、上行管理�
    （`2c7c` 一家独占、`1782` 三家共用）。多厂商 VID 只出候选。
 3. **清单里没有的型号不要伪造**。`model` 为 `None` 时前端显示「-」，
    能力全部回落到 3GPP 通用集 —— 这比猜一个名字然后按错误方言发私有指令安全。
+
+
+---
+
+## 49. 拨号链路阶段 phase（2026-10-20，1.0.0-9）
+
+> 审计明细见 [`DIAL_AUDIT.md`](./DIAL_AUDIT.md)。
+
+### 49.1 结论：拨号链路本身已与上游对齐，缺的是「连接状态分层」
+
+三方审计后确认：方式判定（`dial_types()` 同源表）、按类型分派（QMI/MBIM 走内置
+拨号器、ECM/NCM/RNDIS 走 AT+CGACT + netifd）、网口关联（USB 拓扑 + QMAP 优先）、
+幂等组网（`diff_plan` 零差异不 commit）都已与 Go 上游一致。
+
+真正的缺口：AT 路径收尾只凭 `CGACT` OK + `CGPADDR` 有地址就置 `connected`，
+不看主机网卡有没有地址、默认路由走不走它 —— 实测 FM350 的经典故障
+（模组侧全好、eth2 挂 169.254）在页面上就是「已连接」。
+
+### 49.2 做法：`phase` 阶段层，`state` 契约不动
+
+| phase | 判据 |
+| --- | --- |
+| `iface_pending` | 网卡缺失或无地址 |
+| `route_pending` | 有地址但 `has_default_via(iface)==false` |
+| `online` | 三层全过 |
+
+- 新增 `netprov/route.rs`：只读 `/proc/net/route` + `/proc/net/ipv6_route`，
+  **不 fork**（dial_status 是所有出口必经之路）；网关是小端 hex，`0153040A` → `10.42.0.1`（文档示例地址）；
+- `dial_status()` 统一算 phase；`dial()` 收尾把「网卡就绪 / 默认路由」写进 `steps`，
+  失败那条给排障方向（route_pending → 查 netifd/metric，iface_pending → 查 USB/驱动/hostnic）；
+- LuCI 拨号页「链路阶段」行 + WebUI 拨号卡阶段徽标，同一份 JSON。
+
+### 49.3 验证
+
+| 项 | 结果 |
+| --- | --- |
+| `cargo test` | ✅ 687 passed / 0 failed（新增 8：route 6 + phase 2） |
+| 实机 eth2（netifd 拉起） | ✅ `phase=online`，LuCI 显示「网络就绪（地址 + 默认路由）」 |
+| route_pending / iface_pending | ⚠️ 单测覆盖（三布尔全组合）；实机复现需临时改默认路由，未做 |
+| 实机遗留路由 | 记录：eth2 有 `proto boot` metric 50 的默认路由，非本程序产生（代码无 `ip route add`），不代清理 |
+
+### 49.4 待办
+
+1. 自动组网 15s 轮询改事件驱动（现有零写入幂等保护下收益小、竞态面大，缓做）；
+2. DNS 层诊断（有地址无路由已由 phase 覆盖，DNS 待实机复现）；
+3. `route_pending` 实机复现（临时降 metric 把默认路由挪走，需要维护窗口）。
