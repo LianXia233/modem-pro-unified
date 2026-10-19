@@ -2395,7 +2395,7 @@ Rust 独立模块实现。
 
 ### 上游与致谢
 
-本项目的方向、接口契约与真机调参经验来自以下两个上游工程，特此致谢：
+本项目的方向、接口契约与真机调参经验来自以下上游工程，特此致谢：
 
 - [ouyangzq/modem-pro](https://github.com/ouyangzq/modem-pro) — 模组侧守护进程 `modemd`：
   多模组管理、厂商指令方言、锁网/小区解析、短信与拨号托管。本仓库的 HTTP/WS 接口、JSON 字段、
@@ -2403,6 +2403,9 @@ Rust 独立模块实现。
 - [ouyangzq/luci-proto-modem-pro](https://github.com/ouyangzq/luci-proto-modem-pro) —
   `modem_pro` netifd 协议：一张接口同时承载 IPv4 + IPv6 的 `mp-client.sh` wrapper 与 LuCI 协议表单，
   并给出 `accept_ra=2`、QMI 数据面、前缀漂移等实机注意事项。
+- [LianXia233/luci-app-fm350](https://github.com/LianXia233/luci-app-fm350) — **350 系列模组**
+  （广和通 FM350 / RW350）的真机参考：模组识别与 AT 方言、锁频/锁小区写法、IMEI 的 MFG 块备份与
+  恢复等口径参考了该工程。
 
 本仓库在其基础上做「整合为单仓库 + 后端 Rust 重写」，目标是与上述契约逐字兼容。
 上游仓库未声明开源许可证，本仓库的 MIT 许可证仅覆盖本仓库自身的代码。

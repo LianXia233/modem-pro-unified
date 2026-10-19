@@ -30,14 +30,16 @@ OpenWrt 上统一管理 **5G/LTE 模组**（移远 Quectel、广和通 Fibocom�
 
 ## 从源码构建
 
-见 [docs/BUILD.md](docs/BUILD.md)。核心：把本仓库当作 OpenWrt 的 package feed，
-`feeds/packages`（提供 `lang/rust`）必须启用。
+见 [docs/BUILD.md](docs/BUILD.md)。核心：把本仓库当作 OpenWrt 的 package feed。
+Rust 后端有两条构建路径：默认走 `feeds/packages`（提供 `lang/rust`，需启用）；
+或用宿主 `rustup` 工具链直编（`MODEM_PRO_HOST_RUST=1`，跳过 rust 源码编译）。
 
 ```sh
 echo "src-link modem-pro /path/to/modem-pro-unified" >> feeds.conf.default
 ./scripts/feeds update -a && ./scripts/feeds install -a
 make menuconfig   # Network -> Modem Manager -> modem-pro
-make package/modem-pro/compile V=s
+make package/modem-pro/compile V=s                    # 默认：feeds 的 lang/rust
+make package/modem-pro/compile V=s MODEM_PRO_HOST_RUST=1   # 宿主 rustup 直编
 ```
 
 ## 文档
@@ -52,14 +54,15 @@ make package/modem-pro/compile V=s
 
 ## 致谢
 
-本项目的方向、接口契约与真机调参经验来自以下两个上游工程，特此致谢：
+本项目的方向、接口契约与真机调参经验来自以下上游工程，特此致谢：
 
 | 上游仓库 | 内容 |
 | --- | --- |
 | [ouyangzq/modem-pro](https://github.com/ouyangzq/modem-pro) | 模组侧守护进程 `modemd`：多模组管理、厂商指令方言、锁网/小区解析、短信与拨号托管等一整套真机打磨过的实现。本仓库的 HTTP/WS 接口、JSON 字段、AT 解析口径与配置项都以其为对齐基准。 |
 | [ouyangzq/luci-proto-modem-pro](https://github.com/ouyangzq/luci-proto-modem-pro) | `modem_pro` netifd 协议：**一张接口同时承载 IPv4 + IPv6** 的 `mp-client.sh` wrapper 与 LuCI 协议表单，并给出 `accept_ra=2`、QMI 数据面、前缀漂移等实机注意事项。 |
+| [LianXia233/luci-app-fm350](https://github.com/LianXia233/luci-app-fm350) | **350 系列模组**（广和通 FM350 / RW350）的真机参考：模组识别与 AT 方言、锁频/锁小区写法、IMEI 的 MFG 块备份与恢复等口径参考了该工程。 |
 
-本仓库是在这两个工程的基础上做「整合为单仓库 + 后端 Rust 重写」的工作，目标是与上述
+本仓库是在这些工程的基础上做「整合为单仓库 + 后端 Rust 重写」的工作，目标是与上述
 接口契约逐字兼容。上游仓库未声明开源许可证，本仓库的 [MIT 许可证](LICENSE) 仅覆盖本仓库自身的代码。
 
 ## 许可证
