@@ -45,6 +45,8 @@ pub const SVC_CTL: u8 = 0x00;
 pub const SVC_WDS: u8 = 0x01;
 /// WDS IPv6（与 WDS 分开一个 client，和 quectel-CM 同口径）。
 pub const SVC_WDS_IPV6: u8 = 0x11;
+/// WDA（Wireless Data Admin）：QMAP 的数据格式（聚合协议）由它设置。
+pub const SVC_WDA: u8 = 0x1A;
 
 /// CTL Sync（拿回 client id 之前必须先同步）。
 pub const CTL_SYNC: u16 = 0x0027;
@@ -277,6 +279,108 @@ pub fn wds_runtime(transaction: u16, service: u8, client: u8) -> Vec<u8> {
         WDS_GET_RUNTIME_SETTINGS,
         &tlv(0x10, &mask.to_le_bytes()),
     )
+}
+
+// ---------------------------------------------------------------- QMAP（WDA）
+
+/// WDA `Set Data Format`（QMAP 上下行聚合、链路层协议）。
+pub const WDA_SET_DATA_FORMAT: u16 = 0x0020;
+/// WDS `Bind Mux Data Port`（把数据呼叫绑到某个 QMAP mux）。
+pub const WDS_BIND_MUX_DATA_PORT: u16 = 0x00A2;
+
+/// 数据面端点类型，与 quectel-CM 的 `DATA_EP_TYPE_*` 同值。
+pub const EP_TYPE_HSUSB: u32 = 0x02;
+pub const EP_TYPE_PCIE: u32 = 0x03;
+
+/// QMAP 版本：quectel-CM 只认 `0x05`（`0x09` 原样透传，其余归 0x05）。
+pub const QMAP_VERSION: u32 = 0x05;
+/// 缺省聚合窗口（驱动 `rx_urb_size`），与 quectel-CM 的 16 KiB 缺省一致。
+pub const QMAP_RX_URB_SIZE: u32 = 16 * 1024;
+/// USB 上数据口的 interface 编号（quectel-CM 对 MDM9x07/SDX 系列写死 0x04）。
+pub const QMAP_IFACE_USB: u32 = 0x04;
+
+/// 一组 QMAP 参数（对应 quectel-CM 的 `QMAP_SETTING`）。
+///
+/// 只保留真正下发给设备的字段：聚合门限那几条（0x19/0x1B/0x1C）在
+/// quectel-CM 里由 `QUECTEL_UL_DATA_AGG` 控制，本项目编译时**未开**
+/// （`third_party/quectel-cm/Makefile` 没有该宏），所以这里同样不发。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QmapSettings {
+    /// `DATA_EP_TYPE_HSUSB` / `DATA_EP_TYPE_PCIE`。
+    pub ep_type: u32,
+    /// 数据口 interface 号。
+    pub iface_id: u32,
+    /// QMAP mux id（`0x81` = PDN 1，`0x8X` = PDN X）。
+    pub mux_id: u8,
+    /// 聚合协议版本。
+    pub qmap_version: u32,
+    /// 聚合窗口（必须与驱动的 `rx_urb_size` 一致）。
+    pub rx_urb_size: u32,
+}
+
+impl QmapSettings {
+    /// USB（qmi_wwan / qmi_wwan_q / qmi_wwan_f）上的 QMAP。
+    pub fn usb(mux_id: u8, rx_urb_size: u32) -> Self {
+        Self {
+            ep_type: EP_TYPE_HSUSB,
+            iface_id: QMAP_IFACE_USB,
+            mux_id,
+            qmap_version: QMAP_VERSION,
+            rx_urb_size: if rx_urb_size == 0 {
+                QMAP_RX_URB_SIZE
+            } else {
+                rx_urb_size
+            },
+        }
+    }
+
+    /// PCIe（MHI / rmnet）上的 QMAP。
+    pub fn pcie(mux_id: u8, rx_urb_size: u32) -> Self {
+        Self {
+            ep_type: EP_TYPE_PCIE,
+            ..Self::usb(mux_id, rx_urb_size)
+        }
+    }
+}
+
+/// WDA `Set Data Format`（TLV 顺序与 quectel-CM 的 `WdaSetDataFormat()` 一致）。
+///
+/// | TLV | 含义 |
+/// | --- | --- |
+/// | `0x10` | QOS 头：0 = no-QOS |
+/// | `0x11` | 链路层协议：2 = IP |
+/// | `0x12` / `0x13` | 上行 / 下行聚合协议 = QMAP 版本 |
+/// | `0x15` | 下行最大报文数 = `rx_urb_size / 512` |
+/// | `0x16` | 下行最大聚合尺寸 = `rx_urb_size` |
+/// | `0x17` | 端点：ep_type + iface_id |
+pub fn wda_set_data_format(transaction: u16, client: u8, s: &QmapSettings) -> Vec<u8> {
+    let mut p = Vec::new();
+    p.extend(tlv(0x10, &[0x00]));
+    p.extend(tlv(0x11, &2u32.to_le_bytes()));
+    p.extend(tlv(0x12, &s.qmap_version.to_le_bytes()));
+    p.extend(tlv(0x13, &s.qmap_version.to_le_bytes()));
+    p.extend(tlv(0x15, &(s.rx_urb_size / 512).to_le_bytes()));
+    p.extend(tlv(0x16, &s.rx_urb_size.to_le_bytes()));
+    let mut ep = Vec::with_capacity(8);
+    ep.extend(s.ep_type.to_le_bytes());
+    ep.extend(s.iface_id.to_le_bytes());
+    p.extend(tlv(0x17, &ep));
+    encode(SVC_WDA, client, transaction, WDA_SET_DATA_FORMAT, &p)
+}
+
+/// WDS `Bind Mux Data Port`：把某个 WDS client 绑到 QMAP 的 mux 上。
+///
+/// TLV：`0x10` 端点（ep_type + iface_id）、`0x11` mux id、`0x13` client type
+/// （1 = tethered，与 quectel-CM 同值）。
+pub fn wds_bind_mux(transaction: u16, service: u8, client: u8, s: &QmapSettings) -> Vec<u8> {
+    let mut p = Vec::new();
+    let mut ep = Vec::with_capacity(8);
+    ep.extend(s.ep_type.to_le_bytes());
+    ep.extend(s.iface_id.to_le_bytes());
+    p.extend(tlv(0x10, &ep));
+    p.extend(tlv(0x11, &[s.mux_id]));
+    p.extend(tlv(0x13, &1u32.to_le_bytes()));
+    encode(service, client, transaction, WDS_BIND_MUX_DATA_PORT, &p)
 }
 
 // ---------------------------------------------------------------- 应答解析
@@ -512,5 +616,68 @@ mod tests {
         p.extend(tlv(0x25, &v));
         let s = parse_runtime(&p);
         assert_eq!(s.ipv6, Some((Ipv6Addr::from(addr), 64)));
+    }
+
+    #[test]
+    fn set_data_format_matches_quectel_layout() {
+        let s = QmapSettings::usb(0x81, 16 * 1024);
+        let mut buf = wda_set_data_format(0x10, 4, &s);
+        let m = take(&mut buf).expect("完整帧");
+        assert_eq!(m.service, SVC_WDA);
+        assert_eq!(m.client, 4);
+        assert_eq!(m.message, WDA_SET_DATA_FORMAT);
+        // 链路层协议写死 IP(2)
+        assert_eq!(find_tlv(&m.payload, 0x11, false), Some(&2u32.to_le_bytes()[..]));
+        // 上下行聚合协议都是 QMAP 0x05
+        assert_eq!(find_tlv(&m.payload, 0x12, false), Some(&5u32.to_le_bytes()[..]));
+        assert_eq!(find_tlv(&m.payload, 0x13, false), Some(&5u32.to_le_bytes()[..]));
+        // 最大报文数 = 窗口 / 512；最大尺寸 = 窗口
+        assert_eq!(find_tlv(&m.payload, 0x15, false), Some(&32u32.to_le_bytes()[..]));
+        assert_eq!(
+            find_tlv(&m.payload, 0x16, false),
+            Some(&(16 * 1024u32).to_le_bytes()[..])
+        );
+        // 端点 TLV：ep_type=HSUSB(2) + iface_id=4
+        let ep = find_tlv(&m.payload, 0x17, false).expect("端点 TLV");
+        assert_eq!(ep.len(), 8);
+        assert_eq!(u32::from_le_bytes([ep[0], ep[1], ep[2], ep[3]]), EP_TYPE_HSUSB);
+        assert_eq!(u32::from_le_bytes([ep[4], ep[5], ep[6], ep[7]]), 4);
+        // QOS 头 = 0
+        assert_eq!(find_tlv(&m.payload, 0x10, false), Some(&[0u8][..]));
+    }
+
+    #[test]
+    fn set_data_format_uses_pcie_endpoint() {
+        let s = QmapSettings::pcie(0x81, 32 * 1024);
+        let mut buf = wda_set_data_format(1, 2, &s);
+        let m = take(&mut buf).expect("完整帧");
+        let ep = find_tlv(&m.payload, 0x17, false).expect("端点 TLV");
+        assert_eq!(u32::from_le_bytes([ep[0], ep[1], ep[2], ep[3]]), EP_TYPE_PCIE);
+        assert_eq!(
+            find_tlv(&m.payload, 0x16, false),
+            Some(&(32 * 1024u32).to_le_bytes()[..])
+        );
+    }
+
+    #[test]
+    fn bind_mux_carries_mux_id_and_client_type() {
+        let s = QmapSettings::usb(0x83, 16 * 1024);
+        let mut buf = wds_bind_mux(7, SVC_WDS_IPV6, 5, &s);
+        let m = take(&mut buf).expect("完整帧");
+        assert_eq!(m.service, SVC_WDS_IPV6);
+        assert_eq!(m.client, 5);
+        assert_eq!(m.message, WDS_BIND_MUX_DATA_PORT);
+        assert_eq!(find_tlv(&m.payload, 0x11, false), Some(&[0x83u8][..]));
+        assert_eq!(find_tlv(&m.payload, 0x13, false), Some(&1u32.to_le_bytes()[..]));
+        let ep = find_tlv(&m.payload, 0x10, false).expect("端点 TLV");
+        assert_eq!(ep.len(), 8);
+    }
+
+    #[test]
+    fn qmap_defaults_are_documented_values() {
+        // 窗口 0 表示「用缺省」——不能真的下发 0（驱动会按 0 算聚合门限）
+        let s = QmapSettings::usb(0x81, 0);
+        assert_eq!(s.rx_urb_size, QMAP_RX_URB_SIZE);
+        assert_eq!(s.qmap_version, QMAP_VERSION);
     }
 }

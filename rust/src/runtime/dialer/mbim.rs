@@ -1,7 +1,7 @@
 //! MBIM 线协议（MBIM 1.0 / USB CDC-MBIM）。
 //!
 //! 与 [`super::qmi`] 并列：这是**纯编解码**，不做 IO。
-//! 常量与流程逐条对齐 `third_party/{quectel-cm,meig-cm}/mbim-cm.c`：
+//! 常量与流程逐条对齐上游 `{quectel-cm,meig-cm}/mbim-cm.c`（原 `third_party/`，已移除）：
 //!
 //! - 帧头 12 字节：`type / length / transaction_id`（均小端）；
 //! - `COMMAND_MSG` 追加 8 字节分片头 + 16 字节 service UUID + `CID / type / length`；

@@ -22,10 +22,6 @@ impl VendorSpec for Spec {
         any_line(lines, &["SIMCOM", "SIM7900"])
     }
 
-    fn dialer_bin(&self) -> &'static str {
-        "simcom-cm"
-    }
-
     fn serving_cell_cmd(&self) -> &'static str {
         "AT+CPSI?"
     }

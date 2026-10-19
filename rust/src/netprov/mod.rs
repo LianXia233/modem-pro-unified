@@ -27,8 +27,7 @@
 //!
 //! 三种模式（`modem_pro` / `dhcp` / `both`）下 **qmi / ecm / ncm / rndis / mbim /
 //! 认不出的类型一律 modem_pro**，不再只认 QMI，MBIM 也不再例外 —— 它的会话建立
-//! 改由 modemd 托管的 quectel-CM 做（只有它实现了 MBIM），接口跟其它类型一样
-//! 是一张 `modem<id>`。
+//! 由 modemd 内置的 MBIM 拨号做，接口跟其它类型一样是一张 `modem<id>`。
 //!
 //! **唯一的例外**：`host_dial` 关掉时 MBIM 退回 `proto=mbim` —— 那时没人拨号，
 //! 只能靠 netifd 的 `mbim.sh` / `umbim`。
@@ -610,7 +609,7 @@ mod tests {
     fn mbim_falls_back_only_when_host_dial_off() {
         assert_eq!(main_proto("mbim", WanMode::ModemPro, false), PROTO_MBIM);
         assert_eq!(main_proto("mbim", WanMode::Both, false), PROTO_MBIM);
-        // host_dial 开着就不能退：会话由 modemd 托管的 quectel-CM 建
+        // host_dial 开着就不能退：会话由 modemd 内置的 MBIM 拨号建
         assert_eq!(main_proto("mbim", WanMode::ModemPro, true), PROTO_MODEM_PRO);
         assert_eq!(main_proto("mbim", WanMode::Both, true), PROTO_MODEM_PRO);
     }
@@ -657,7 +656,7 @@ mod tests {
 
     #[test]
     fn plan_mbim_with_host_dial_uses_modem_pro() {
-        // 会话由 modemd 托管的 quectel-CM 建 ⇒ 接口跟其它类型一样
+        // 会话由 modemd 内置的 MBIM 拨号建 ⇒ 接口跟其它类型一样
         let p = plan_wan(
             0,
             "mbim",

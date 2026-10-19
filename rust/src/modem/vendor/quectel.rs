@@ -1,6 +1,6 @@
 //! 移远 Quectel。
 //!
-//! 识别关键字 `QUECTEL`；QMI 初始化走 `quectel-CM`。
+//! 识别关键字 `QUECTEL`；数据面首选 QMI（与 quectel-CM 的主线一致）。
 //! QENG / QNWCFG / QNWLOCK 这一族都是移远私有的（其它厂商不一定认）。
 
 use crate::modem::at::AtPreset;

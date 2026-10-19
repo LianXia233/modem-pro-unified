@@ -1,6 +1,6 @@
 //! 美格智能 MeiG。
 //!
-//! 识别关键字 `MEIG` / `SRM8*` / `SLM7*`。QMI 拨号器是 `meig-cm`。
+//! 识别关键字 `MEIG` / `SRM8*` / `SLM7*`。数据面首选 MBIM（与 `meig-cm` 同序）。
 
 use crate::modem::at::AtPreset;
 
@@ -19,10 +19,6 @@ impl VendorSpec for Spec {
 
     fn detect(&self, lines: &[String]) -> bool {
         any_line(lines, &["MEIG", "SRM8", "SLM7"])
-    }
-
-    fn dialer_bin(&self) -> &'static str {
-        "meig-cm"
     }
 
     fn at_presets(&self) -> Vec<AtPreset> {

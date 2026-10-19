@@ -72,19 +72,16 @@ echo "src-git modem-pro https://github.com/LianXia233/modem-pro-unified.git" >> 
 
 ---
 
-## 2. 选择包与拨号器
+## 2. 选择包
 
 ```sh
 make menuconfig
 # Network -> Modem Manager -> <*> modem-pro
-#   ├─ [ ] 用宿主 rustup 工具链直编 modemd（跳过 feeds 的 rust/host 源码编译）
-#   ├─ <*> 打包移远 Quectel 拨号器 (quectel-CM)
-#   ├─ <*> 打包广和通 Fibocom 拨号器 (fibocom-dial)
-#   ├─ <*> 打包美格 Meig 拨号器 (meig-cm)
-#   └─ <*> 打包芯讯通 SIMCom 拨号器 (simcom-cm)
+#   └─ [ ] 用宿主 rustup 工具链直编 modemd（跳过 feeds 的 rust/host 源码编译）
 ```
 
-默认四家全开；按实际模组裁剪可省固件空间。
+QMI / MBIM 拨号已内置在 `modemd` 里（`host_dial_bin = "native"`），
+**不再有厂商拨号器子选项**，也不需要额外的 C 源码目录。
 
 ---
 

@@ -32,7 +32,7 @@ impl Default for NetConfig {
             auto_dial: true,
             wan_mode: "modem_pro".to_string(),
             host_dial: true,
-            host_dial_bin: String::new(),
+            host_dial_bin: "native".to_string(),
             host_dial_pdn: 0,
             wan_ipv6: true,
             wan_ipv6_mode: "dhcpv6".to_string(),
@@ -61,5 +61,10 @@ impl NetConfig {
         self.wan_ipv6_mode = crate::netprov::v6::V6Mode::parse(&self.wan_ipv6_mode)
             .as_str()
             .to_string();
+        // 拨号后端只剩内置一种：空值（旧配置的默认）统一落成 "native"，
+        // 这样 `/api/config` 与日志里看到的就是实际生效值。
+        if self.host_dial_bin.trim().is_empty() {
+            self.host_dial_bin = "native".to_string();
+        }
     }
 }

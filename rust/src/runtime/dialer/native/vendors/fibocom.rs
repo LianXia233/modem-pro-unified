@@ -1,14 +1,15 @@
-//! 广和通 Fibocom：仅 QMI。
+//! 广和通 Fibocom：QMI 首选，MBIM 作为标准协议兜底。
 //!
-//! 依据 `third_party/fibocom-dial`：源码里**没有** `mbim-cm.c`（只有
-//! `QMIThread.c` / `QmiWwanCM.c` / `GobiNetCM.c`），所以 MBIM 不在接管范围 ——
-//! 声明成支持 MBIM 的话，`host_dial_bin = "native"` 会在 MBIM 模组上直接失败。
+//! 依据 `third_party/fibocom-dial`：那份厂商实现里**没有** `mbim-cm.c`
+//! （只有 `QMIThread.c` / `QmiWwanCM.c` / `GobiNetCM.c`），所以它的首选是 QMI。
+//! 但 MBIM 是标准协议，[`super::super::mbim_link`] 自己实现 Basic Connect，
+//! 不再受厂商二进制能力限制 —— 这里的 `links` 只表示**优先级**。
 //!
 //! 差异点：
 //! - **multi-pdn**（`-m/-n/-N`）：多通道时每条通道各自一个 PDN，本实现只做
 //!   `[net] host_dial_pdn` 指定的那一条（单通道足够覆盖家用场景）；
-//! - **PCIe 模式**（`query_pcie_mode.c`）：PCIe 挂载的模组走 MHI，不发 QMI
-//!   控制命令；这种情况 `find_wdm()` 找不到控制口，会明确报错而不是瞎猜；
+//! - **PCIe 模式**（`query_pcie_mode.c`）：PCIe 挂载的模组走 MHI；控制口由
+//!   [`super::find_control`] 从 `/dev/mhi_QMI*` 反查，端点类型自动切成 PCIe；
 //! - FM350 / RW350 是 RNDIS/ECM，本来就不走这里（由 `netprov` 配 static 地址）。
 
 use super::{Caps, DataLink};
@@ -18,5 +19,5 @@ pub const CAPS: Caps = Caps {
     mbim_session: 0,
     disable_autoconnect: true,
     needs_raw_ip: true,
-    note: "仅 QMI（fibocom-dial 无 mbim-cm.c）；PCIe/MHI 模式不走这里",
+    note: "QMI 首选（厂商实现无 mbim-cm.c）；MBIM 走标准协议；PCIe/MHI 用 mhi_QMI 控制口",
 };

@@ -167,8 +167,8 @@ pub fn dial_types() -> Vec<DialType> {
             name: "QMI/NDIS".into(),
             kind: "qmi".into(),
             protocol: "rmnet（wwan0）".into(),
-            host_driver: "qmi_wwan + 厂商 QMI 拨号器（移远 quectel-CM / 广和通 fibocom-dial / 美格 meig-cm / 芯讯通 simcom-cm）/ uqmi；Windows 装高通或移远驱动".into(),
-            host_setup: "主机侧拨号：厂商拨号器（quectel-CM / fibocom-dial / meig-cm / simcom-cm，modemd 按厂商自动挑） -s <APN>，或 uqmi -d /dev/cdc-wdm0 --start-network <APN>；Windows 由 WWAN 服务自动建立。".into(),
+            host_driver: "qmi_wwan（或 qmi_wwan_q/f）+ modemd 内置 QMI 拨号；手工排障等价于 uqmi -d /dev/cdc-wdm0 --start-network；Windows 装高通或移远驱动".into(),
+            host_setup: "主机侧拨号：modemd 自动发 QMI `WDS Start`（APN 来自「拨号上网」；QMAP 模组先发 WDA Set Data Format 并 Bind Mux），地址由 netifd 的 modem_pro（udhcpc）取；手工排障可用 uqmi -d /dev/cdc-wdm0 --start-network <APN>；Windows 由 WWAN 服务自动建立。".into(),
             at_dial: true,
             note: "高通原生协议，模组自己不发 DHCP；AT 侧激活 PDP 只代表模组这一端就绪。".into(),
         },
@@ -187,8 +187,8 @@ pub fn dial_types() -> Vec<DialType> {
             name: "MBIM".into(),
             kind: "mbim".into(),
             protocol: "cdc_mbim（wwan0 + /dev/cdc-wdm0）".into(),
-            host_driver: "cdc_mbim + quectel-CM 的 mbim-cm（Windows 自带 MBIM 类驱动）".into(),
-            host_setup: "主机侧拨号：modemd 拉起 quectel-CM 的 MBIM 路径（`-s <APN>` **必填**）—— 它自己认 MBIM 设备、建会话，再把链路地址配到网卡上。等价的手工命令：`umbim -d /dev/cdc-wdm0 connect`（netifd 的 mbim.sh 用的就是它）。".into(),
+            host_driver: "cdc_mbim + modemd 内置 MBIM Basic Connect（Windows 自带 MBIM 类驱动）".into(),
+            host_setup: "主机侧拨号：modemd 自己发 MBIM `OPEN → CONNECT → IP_CONFIGURATION`（**APN 必填**）。等价的手工命令：`umbim -d /dev/cdc-wdm0 connect`（netifd 的 mbim.sh 用的就是它）。".into(),
             at_dial: false,
             note: "MBIM 是微软标准，一套会话里既有拨号也有 IP 配置指令；模组的 DHCP 服务器通常也在链路上，所以 udhcpc 能拿到同一份地址。⚠️ 模组只有**一个**数据承载：模组侧先激活过 PDP 的话，MBIM_CID_CONNECT 会被拒（Status=2），得先把它收掉。".into(),
         },
@@ -1812,9 +1812,8 @@ impl Modem {
                 "交办给主机侧拨号器（托管中）",
                 true,
                 &format!(
-                    "{} 类型：数据呼叫由 modemd 托管的 {} 建立；APN {}；下一轮组网循环（15s）内拉起",
+                    "{} 类型：数据呼叫由 modemd 内置拨号器建立；APN {}；下一轮组网循环（15s）内拉起",
                     dial_kind_label(&info.kind),
-                    crate::runtime::dialer::dialer_bin_name(self.vendor(), &info.kind),
                     if apn.is_empty() {
                         "沿用模组配置".to_string()
                     } else {

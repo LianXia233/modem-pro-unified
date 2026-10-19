@@ -1,7 +1,7 @@
 //! 鼎桥 TD Tech（MT5700 系列）。
 //!
 //! 识别关键字 `MT5700`。网络/信号/温度/流量全在 `^` 私有命令里
-//! （移远那套全回 ERROR），所以拨号器也回落 quectel-CM。
+//! （移远那套全回 ERROR），数据面按通用 QMI 处理。
 
 use crate::modem::at::AtPreset;
 

@@ -9,8 +9,7 @@
 
 ```
 modem-pro-unified/
-├── Makefile                 # 唯一顶层 Makefile（OpenWrt package feed）
-├── Config.in                # 厂商拨号器选装开关
+├── Makefile                 # 唯一顶层 Makefile（OpenWrt package feed；包内 config 只剩 MODEM_PRO_HOST_RUST）
 ├── VERSION                  # 版本号唯一来源，形如 1.0.0-1
 ├── LICENSE  README.md  CHANGELOG.md
 ├── .gitignore  .gitattributes   # 强制 LF
@@ -30,12 +29,8 @@ modem-pro-unified/
 │       ├── http/            # server / router / request / response / auth / static_ui / handlers
 │       └── runtime/         # pid / signals / dialer / scheduler
 │
-├── third_party/             # 厂商源码（原样）
-│   ├── quectel-cm/  fibocom-dial/  meig-cm/  simcom-cm/
-│   └── kmods/               # 各家内核模块源码（QMI_WWAN / MHI / Gobinet / ndisc …）
-│
 ├── files/                   # 运行时要落盘的文件
-│   ├── lib/netifd/proto/{modem_pro.sh,quectel.sh}
+│   ├── lib/netifd/proto/modem_pro.sh
 │   ├── usr/lib/modem-pro/mp-client.sh
 │   └── etc/modemd/config.toml
 │
@@ -71,12 +66,11 @@ modem-pro-unified/
     `aarch64-unknown-linux-musl` target 交叉编译（链接交给工具链自带 `rust-lld`），
     产出静态 musl 二进制。**不**依赖 `feeds/packages/lang/rust`，跳过 OpenWrt 从源码
     编译 rustc + LLVM（冷启动 1~2 小时）。CI 走这条，见 `.github/workflows/build.yml`。
-- **C 拨号器**：不使用各家自带 Makefile 的 `-Werror`，用 `TARGET_CC` 按显式源文件清单编译
-  （清单与各家 Makefile 一致），输出到 `/usr/lib/modemd/`。用 `Config.in` 的
-  `MODEM_PRO_{QUECTEL,FIBOCOM,MEIG,SIMCOM}` 裁剪。
+- **拨号**：QMI / MBIM 全部在 `modemd` 内实现（`rust/src/runtime/dialer/`），
+  不再编译或安装任何厂商 C 二进制；包内 config 只剩 `MODEM_PRO_HOST_RUST` 一个开关。
 - **版本注入**：`Build/Compile` 里以 `MODEMD_VERSION="$(PKG_VERSION)-$(PKG_RELEASE)"` 传给 cargo，
   代码用 `option_env!` 读取（直接 `cargo build` 时为 `dev`）。
-- **安装**：`Package/modem-pro/install` 把守护进程、拨号器、netifd 脚本、默认配置、
+- **安装**：`Package/modem-pro/install` 把守护进程、netifd 脚本、默认配置、
   init 脚本、LuCI 文件装到目标路径；`config.toml` 声明为 conffile。
 - **脚本**：`postinst/prerm/postrm` 由 `$(file <packaging/control/...)` 注入，避免内联大段 shell。
 
@@ -98,10 +92,11 @@ modem-pro-unified/
    iframe → http://:9527/  │  · HTTP :9527      │   │  ├ udhcpc  (v4)    │
                            │  · config.toml     │   │  └ odhcp6c (v6)    │
                            │  · /dev/ttyUSB*    │   └───┬───────────────┘
-                           └───┬───────────┬────┘       │
-                               │ AT        │ 拨号器      │ proto_set_keep
-                               ▼           ▼ 进程       ▼
-                          5G 模组(AT口)   /usr/lib/modemd/<vendor>-*  → wwan0
+                           │  · 内置 QMI/MBIM   │       │
+                           └───┬───────────┬────┘       │ proto_set_keep
+                               │ AT        │ 控制口      ▼
+                               ▼           ▼ (/dev/cdc-wdm*, GobiQMI*, mhi_QMI*)
+                          5G 模组(AT口)   数据呼叫 → wwan0
 ```
 
 - **配置**：`/etc/modemd/config.toml` 是唯一运行配置（conffile）。LuCI 的「服务控制」页
@@ -111,11 +106,11 @@ modem-pro-unified/
 - **netifd**：`interface proto=modem_pro` 由 `modem_pro.sh` 处理；它只起一个
   `mp-client.sh`，由后者同时拉 `udhcpc`(IPv4) 与 `odhcp6c`(IPv6)，两侧上报脚本都调
   `proto_set_keep 1`，实现「一个接口同时承载 v4+v6 且互不清空」。
-- **拨号器**：数据面（QMI/MBIM 建 PDN、拉起 wwan0）由厂商拨号器负责，两者按
-  `AT+GMI` 识别的厂商选择，**不可互相顶替**。**MBIM 一律用 `quectel-CM`**（只有它
-  实现了 MBIM 那套，且认 MBIM 靠标准 USB CDC 描述符、与厂商无关）。拨号器由
-  modemd 托管：组网循环（15s 一轮）拉起、看着、退出自动重试，模组拔了/手动断开/
-  拨号总开关关掉时按进程树收起（连它拉起的 `udhcpc`），见 `rust/src/runtime/dialer/`。
+- **拨号**：数据面（QMI `WDS Start` / MBIM `CONNECT`、QMAP 绑 mux、拉起 wwan0）
+  由 `modemd` **内置实现**，不再调厂商二进制。控制口按 sysfs 反查
+  （`cdc-wdm` / `GobiQMI` / `mhi_QMI`），QMAP 模组先发 WDA `Set Data Format`
+  再绑 mux。组网循环（15s 一轮）负责探活、掉线重拨、失败退避 5 秒；模组拔了 /
+  手动断开 / 拨号总开关关掉时拆会话。实现见 `rust/src/runtime/dialer/`。
 - **前端**：LuCI 页面（JS 世代 `.js` 视图）内嵌 modemd 自带调试台；
   协议 JS 让 `proto=modem_pro` 出现在接口配置表单里。
 
@@ -127,7 +122,7 @@ modem-pro-unified/
 | --- | --- |
 | 仓库/包名 | `modem-pro`（单一包） |
 | 二进制 | `/usr/bin/modemd` |
-| 拨号器 | `/usr/lib/modemd/{quectel-CM,fibocom-dial,meig-cm,simcom-cm}` |
+| 拨号后端 | `modemd` 内置（QMI / MBIM，无外部二进制） |
 | 协议名 | `modem_pro`（netifd 注册名；**不能用连字符**——shell 函数名非法） |
 | 配置 | `/etc/modemd/config.toml` |
 | 版本 | 仓库根 `VERSION` 单一来源；打包注入 `MODEMD_VERSION` |

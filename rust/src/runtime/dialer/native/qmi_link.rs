@@ -1,6 +1,6 @@
 //! QMI 数据链路：`/dev/cdc-wdmN` 上的请求-应答串行化 + WDS 数据呼叫。
 //!
-//! 这是四家拨号器**共用**的底层（quectel-cm / fibocom-dial / simcom-cm 的
+//! 这是四家拨号器**共用**的底层（上游 quectel-cm / fibocom-dial / simcom-cm 的
 //! `QMIThread.c` 是同一份代码的不同分支；meig-cm 的 QMI 走代理但协议一致）。
 //! 差异只在「用哪条指令、要不要先关自动连接」这类策略，放在 `native/vendors/`。
 
@@ -168,6 +168,51 @@ impl QmiLink {
         Ok(())
     }
 
+    /// 下发 QMAP 数据格式（WDA `Set Data Format`）。
+    ///
+    /// 这一条决定 `wwan0_1` 上跑的是 QMAP 聚合还是裸 IP：不发的话驱动不会
+    /// `add_mux`，QMAP 模组的数据口永远是 NO-CARRIER（现象见配置注释里
+    /// 「FM160-CN + qmi_wwan_f 不传 `-n` 就 add_mux 不起来」那一段）。
+    pub fn set_data_format(
+        &mut self,
+        client: u8,
+        settings: &qmi::QmapSettings,
+    ) -> Result<(), String> {
+        let tid = self.next_tid();
+        let frame = qmi::wda_set_data_format(tid, client, settings);
+        let deadline = Instant::now() + CTL_TIMEOUT;
+        self.write_frame(&frame, deadline)?;
+        let payload = self.read_response(
+            qmi::SVC_WDA,
+            qmi::WDA_SET_DATA_FORMAT,
+            tid,
+            deadline,
+        )?;
+        qmi::result(&payload)
+            .map_err(|(r, e)| format!("Set Data Format 失败 result={r} error={e}"))?;
+        Ok(())
+    }
+
+    /// 把 WDS client 绑到 QMAP 的 mux 上（`Bind Mux Data Port`）。
+    ///
+    /// 必须**每个 WDS client 各绑一次**（v4 走 service 1、v6 走 0x11），
+    /// 与 quectel-CM 在 `requestSetEthMode()` 里的做法一致。
+    pub fn bind_mux(
+        &mut self,
+        service: u8,
+        client: u8,
+        settings: &qmi::QmapSettings,
+    ) -> Result<(), String> {
+        let tid = self.next_tid();
+        let frame = qmi::wds_bind_mux(tid, service, client, settings);
+        let deadline = Instant::now() + CTL_TIMEOUT;
+        self.write_frame(&frame, deadline)?;
+        let payload = self.read_response(service, qmi::WDS_BIND_MUX_DATA_PORT, tid, deadline)?;
+        qmi::result(&payload)
+            .map_err(|(r, e)| format!("Bind Mux Data Port 失败 result={r} error={e}"))?;
+        Ok(())
+    }
+
     /// 建立一个数据呼叫，返回 handle。
     ///
     /// `pdn` 作为 profile index 下发；`auth` 由厂商策略给出（目前都是 none）。
@@ -232,11 +277,18 @@ pub struct QmiSession {
     handle4: u32,
     client6: Option<u8>,
     handle6: Option<u32>,
+    /// QMAP 的 WDA client（非 QMAP 模组为 `None`），退出时要还回去。
+    wda_client: Option<u8>,
+    /// 这一轮用的 QMAP 参数（给状态接口看）。
+    qmap: Option<qmi::QmapSettings>,
     pub settings: RuntimeSettings,
 }
 
 impl QmiSession {
     /// 建立呼叫：v4 必须成功；v6 失败只记 note（很多网络本来就不给 v6）。
+    ///
+    /// `qmap` 非空时按 quectel-CM `requestSetEthMode()` 的顺序先做
+    /// `WDA Set Data Format`，再把 v4/v6 两个 WDS client 绑到同一个 mux 上。
     ///
     /// 返回 `(会话, 备注)`；备注是给页面看的一句话（非致命情况）。
     pub fn start(
@@ -246,6 +298,7 @@ impl QmiSession {
         ipv6: bool,
         pdn: i64,
         disable_autoconnect: bool,
+        qmap: Option<qmi::QmapSettings>,
     ) -> Result<(Self, String), String> {
         if !super::ensure_raw_ip(iface) {
             return Err(format!("{iface} 的 qmi/raw_ip 设置失败"));
@@ -253,6 +306,52 @@ impl QmiSession {
         let mut link = QmiLink::open(wdm)?;
         link.sync()?;
         let client4 = link.client_id(qmi::SVC_WDS)?;
+
+        let mut note = String::new();
+        // v6 的 client 提前申请：QMAP 要在 Start 之前把两个 client 都绑到 mux 上
+        let mut client6 = None;
+        if ipv6 {
+            match link.client_id(qmi::SVC_WDS_IPV6) {
+                Ok(c) => client6 = Some(c),
+                Err(e) => note = format!("IPv6 client id 申请失败：{e}"),
+            }
+        }
+
+        // QMAP：数据格式 + 绑 mux（缺了这两步，驱动不会 add_mux，数据口永远 NO-CARRIER）
+        let mut wda_client = None;
+        if let Some(q) = qmap {
+            let wda = match link.client_id(qmi::SVC_WDA) {
+                Ok(w) => w,
+                Err(e) => {
+                    let _ = link.release_client_id(qmi::SVC_WDS, client4);
+                    if let Some(c6) = client6 {
+                        let _ = link.release_client_id(qmi::SVC_WDS_IPV6, c6);
+                    }
+                    return Err(format!("QMAP 需要 WDA client，申请失败：{e}"));
+                }
+            };
+            let setup = link
+                .set_data_format(wda, &q)
+                .and_then(|_| link.bind_mux(qmi::SVC_WDS, client4, &q));
+            if let Err(e) = setup {
+                let _ = link.release_client_id(qmi::SVC_WDA, wda);
+                let _ = link.release_client_id(qmi::SVC_WDS, client4);
+                if let Some(c6) = client6 {
+                    let _ = link.release_client_id(qmi::SVC_WDS_IPV6, c6);
+                }
+                return Err(format!("QMAP 初始化失败：{e}"));
+            }
+            if let Some(c6) = client6 {
+                if let Err(e) = link.bind_mux(qmi::SVC_WDS_IPV6, c6, &q) {
+                    // v6 绑不上就只走 v4，别让整条呼叫失败
+                    note = format!("IPv6 绑 mux 失败：{e}");
+                    let _ = link.release_client_id(qmi::SVC_WDS_IPV6, c6);
+                    client6 = None;
+                }
+            }
+            wda_client = Some(wda);
+        }
+
         // 先关自动连接再 Start：顺序与 quectel-cm 的 QmiWwanInit() 一致
         if disable_autoconnect {
             if let Err(e) = link.set_autoconnect(client4, false) {
@@ -265,25 +364,24 @@ impl QmiSession {
             Err(e) => {
                 // 起不来就把 client id 还回去，别占着槽位
                 let _ = link.release_client_id(qmi::SVC_WDS, client4);
+                if let Some(w) = wda_client {
+                    let _ = link.release_client_id(qmi::SVC_WDA, w);
+                }
+                if let Some(c6) = client6 {
+                    let _ = link.release_client_id(qmi::SVC_WDS_IPV6, c6);
+                }
                 return Err(e);
             }
         };
-        let mut note = String::new();
-        let mut client6 = None;
         let mut handle6 = None;
-        if ipv6 {
-            match link.client_id(qmi::SVC_WDS_IPV6) {
-                Ok(c6) => match link.start(qmi::SVC_WDS_IPV6, c6, apn, qmi::IP_FAMILY_V6, pdn) {
-                    Ok(h) => {
-                        client6 = Some(c6);
-                        handle6 = Some(h);
-                    }
-                    Err(e) => {
-                        let _ = link.release_client_id(qmi::SVC_WDS_IPV6, c6);
-                        note = format!("IPv6 数据呼叫没起来：{e}");
-                    }
-                },
-                Err(e) => note = format!("IPv6 client id 申请失败：{e}"),
+        if let Some(c6) = client6 {
+            match link.start(qmi::SVC_WDS_IPV6, c6, apn, qmi::IP_FAMILY_V6, pdn) {
+                Ok(h) => handle6 = Some(h),
+                Err(e) => {
+                    let _ = link.release_client_id(qmi::SVC_WDS_IPV6, c6);
+                    client6 = None;
+                    note = format!("IPv6 数据呼叫没起来：{e}");
+                }
             }
         }
         let settings = link.runtime(qmi::SVC_WDS, client4).unwrap_or_default();
@@ -294,6 +392,8 @@ impl QmiSession {
                 handle4,
                 client6,
                 handle6,
+                wda_client,
+                qmap,
                 settings,
             },
             note,
@@ -324,6 +424,12 @@ impl QmiSession {
                 log::debug!("原生 QMI：释放 v4 client 失败: {e}");
             }
         }
+        // WDA client 最后还：数据格式是设备级状态，不需要「撤销」
+        if let Some(w) = self.wda_client.take() {
+            if let Err(e) = self.link.release_client_id(qmi::SVC_WDA, w) {
+                log::debug!("原生 QMI：释放 WDA client 失败: {e}");
+            }
+        }
     }
 
     /// 状态字段（给 `/api/dial` 的 `host_dialer`）。
@@ -336,6 +442,12 @@ impl QmiSession {
             "gateway": self.settings.gateway.map(|ip| ip.to_string()),
             "dns": self.settings.dns.iter().map(|ip| ip.to_string()).collect::<Vec<_>>(),
             "modem_ipv6": self.settings.ipv6.map(|(ip, p)| format!("{ip}/{p}")),
+            "qmap": self.qmap.map(|q| serde_json::json!({
+                "mux_id": q.mux_id,
+                "qmap_version": q.qmap_version,
+                "ep_type": q.ep_type,
+                "rx_urb_size": q.rx_urb_size,
+            })),
         })
     }
 }

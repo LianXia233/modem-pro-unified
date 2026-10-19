@@ -8,8 +8,8 @@
 //!
 //! ★ 「不分协议」：模式 1/3 下**不再只认 QMI** —— qmi / ecm / ncm / rndis / mbim
 //! 以及认不出的类型一律用 modem_pro。MBIM 也**不再例外**（2026-10-13 起）：
-//! 它的会话建立改由 modemd 托管的 quectel-CM 做（只有它实现了 MBIM），接口跟其它
-//! 类型一样是一张 `modem<id>`；只有 `host_dial` 关掉时才退回 `proto=mbim`
+//! 它的会话建立由 modemd 内置的 MBIM 拨号做，接口跟其它类型一样是一张
+//! `modem<id>`；只有 `host_dial` 关掉时才退回 `proto=mbim`
 //! （见 `netprov::main_proto`）。
 //!
 //! ⚠️ 本文件只放**纯策略**：真正的建接口 / 改接口在 `netprov/`（纯策略 + UCI 薄 IO

@@ -18,7 +18,7 @@ cd "$ROOT" || exit 2
 FILES=$(find . -type f \
   \( -name '*.rs' -o -name '*.md' -o -name '*.toml' -o -name '*.sh' \
      -o -name '*.html' -o -name '*.js' -o -name '*.json' -o -name '*.uc' \) \
-  -not -path './.git/*' -not -path './rust/target/*' -not -path './third_party/*' \
+  -not -path './.git/*' -not -path './rust/target/*' \
   -not -path './scripts/*' 2>/dev/null)
 
 fail=0

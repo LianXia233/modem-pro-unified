@@ -29,7 +29,7 @@
 //! 1. **未取证就不发**：`VendorSpec` 的默认实现一律是「没有这个能力」，
 //!    厂商模块只写**实测过**的指令（见各文件注释与 `PROGRESS.md`）。
 //! 2. **识别顺序先中先得**：同一行里同时出现两家关键字时按 [`DETECT_ORDER`]。
-//! 3. **MBIM 一律 quectel-CM**：识别靠标准 USB CDC 描述符，与厂商无关
+//! 3. **MBIM 与厂商无关**：Basic Connect 是标准协议，内置实现统一处理
 //!    （见 `runtime/dialer`）。
 
 use serde::Serialize;
@@ -131,11 +131,6 @@ pub trait VendorSpec: Sync {
     /// 这一家的 `ATI`（或回落指令）应答里有没有它的关键字。
     fn detect(&self, lines: &[String]) -> bool;
 
-    /// 主机侧拨号器可执行文件名（`/usr/lib/modemd/` 下）。默认 quectel-CM。
-    fn dialer_bin(&self) -> &'static str {
-        "quectel-CM"
-    }
-
     /// 服务小区/信号查询的首选指令（老接口，保留给调用方）。
     fn serving_cell_cmd(&self) -> &'static str {
         "AT+QENG=\"servingcell\""
@@ -223,11 +218,6 @@ impl Vendor {
             }
         }
         Vendor::Unknown
-    }
-
-    /// 主机侧拨号器可执行文件名。
-    pub fn dialer_bin(&self) -> &'static str {
-        self.spec().dialer_bin()
     }
 
     pub fn as_str(&self) -> &'static str {

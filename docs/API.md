@@ -242,17 +242,17 @@ POST /api/at     {"modem_id":0,"cmd":"AT+CGSN"}
 
 - `state`：`idle`/`dialing`/`connected`/`failed` + `state_text`；`steps` 按顺序记下
   「写入 APN → 激活 PDP → 激活 IMS → 读取本机地址 → 主机侧网卡候选」每一步的成败
-  （QMI/MBIM 只有一步「交办给主机侧拨号器（托管中）」）。
+  （QMI/MBIM 只有一步「交办给内置拨号器（托管中）」）。
 - `usb`：三条路识别（① 固件 `AT+QCFG="usbnet"`；② USB 描述符类码；③ 主机侧网卡驱动），
   `source` 标明走了哪条；`confident=false` 时 `note` 说明为什么不确定。
 - `auto_wan`：自动组网最近一次结果（后台 netprov 循环 15 秒一轮，见 `rust/src/netprov/`）。
-- `host_dialer`：主机侧拨号器后端。
-  - `backend=external`：`bin` / `args` / `cmd`（厂商二进制）；
-  - `backend=native-qmi`：handle / MTU / 模组侧地址 / 启动时刻（Rust 原生 QMI）；
-  - `backend=native-mbim`：session / MTU / 模组侧地址 / `nw_error`（Rust 原生 MBIM）；
+- `host_dialer`：内置拨号后端（`modemd` 自己建数据呼叫，无外部二进制）。
+  - `backend=native-qmi`：`handle4/handle6`、`mtu`、`modem_ipv4`、`gateway`、`dns`、
+    `modem_ipv6`、`qmap`（`mux_id` / `qmap_version` / `ep_type` / `rx_urb_size`）；
+  - `backend=native-mbim`：session / MTU / 模组侧地址 / `nw_error`；
   - `vendor` 是厂商短名（`quectel` / `fibocom` / `meig` / `simcom` / …）；
-  - 两者都由 `[net] host_dial_bin = "native"` 开启；没在跑就是 `null`。
-  - 原生后端**只做数据呼叫**，地址仍由 netifd 的 `modem_pro` 取。
+  - `control` / `control_kind` 是控制口路径与驱动类型（`cdc-wdm` / `gobinet` / `mhi`）；
+  - 没在跑就是 `null`。后端**只做数据呼叫**，地址仍由 netifd 的 `modem_pro` 取。
 - `wan_ipv6_mode`：生效的模组侧 IPv6 取址方式（`dhcpv6` / `ra` / `static` / `off`，来自
   `[net] wan_ipv6_mode`；`wan_ipv6=false` 时恒为 `off`）。`wan_ipv6_modes` 是四档的元信息。
   从未跑过 / 被跳过时是 `null` 或 `skipped` 非空；`applied` 是逐条人话记录（页面可显示
@@ -264,27 +264,27 @@ POST /api/at     {"modem_id":0,"cmd":"AT+CGSN"}
 
 - **ECM/RNDIS/NCM 等** → 写 APN（留空沿用模组配置）→ 激活 PDP → 激活 IMS →
   读本机地址（`AT+CGPADDR`）→ 找主机侧网卡；
-- **QMI/MBIM** → **不发 `AT+CGACT=1`**（会把拨号器唯一的数据承载占掉，实测
+- **QMI/MBIM** → **不发 `AT+CGACT=1`**（会把内置拨号唯一的数据承载占掉，实测
   `QMUXError 0xe` / `wwan0 link_state 0`），只把 APN 落到拨号状态里，由下一轮
-  组网循环（≤15 秒）拉起 modemd 托管的厂商拨号器（`quectel-CM` / `fibocom-dial` /
-  `meig-cm` / `simcom-cm`，见 `runtime/dialer/`）。
+  组网循环（≤15 秒）让 `modemd` 建立数据呼叫（QMI `WDS Start` / MBIM `CONNECT`，
+  QMAP 模组还会先发 `WDA Set Data Format` + `Bind Mux`，见 `runtime/dialer/`）。
 
-  `msg` = `ok, 已交办主机侧拨号器 cid=N`（不是「已连上」：进程起来到拿到地址
+  `msg` = `ok, 已交办内置拨号器 cid=N`（不是「已连上」：会话建起来到拿到地址
   还要几秒，页面随后由 `dial` 推送刷新）。MBIM 且**没有任何 APN 可用**时仍报错
-  —— 拨号器没有 `-s` 会直接退出，不如当场说清楚。
+  —— 空 APN 的 `CONNECT` 会被设备拒绝，不如当场说清楚。
 
 成功 `msg` = `ok, 已拨号 cid=N`；**失败也把 `DialState` 放进 `data`**（页面显示卡在哪一步），
 错误原因在 `msg`。
 
 ### POST /api/dial/disconnect
 断开数据连接（`{modem_id, cid?}`；`cid` ≤ 0 时用当前拨号 cid，再兜底默认 cid）。
-ECM/RNDIS/NCM 等 → `AT+CGACT=0,<cid>` + 回读确认；QMI/MBIM → 先按进程树停掉
-modemd 托管的拨号器（连它拉起的 udhcpc 一起）再重置状态。
+ECM/RNDIS/NCM 等 → `AT+CGACT=0,<cid>` + 回读确认；QMI/MBIM → 先拆掉 `modemd`
+内置的 QMI/MBIM 会话（发 `Stop` / 去激活并释放 client id）再重置状态。
 成功后 `manual_stop=true`（自动组网不再替用户拨回来）。`msg` = `ok, 已断开 cid=N`。
 
 ### POST /api/dial/enable
 拨号总开关（`{on}`，**必须显式给值**）：写回 `[net] dial_enabled` 并即时生效。
-关掉后所有拨号方式（含手动拨号）一律拒绝，且下一轮组网循环会收起 QMI/MBIM 的拨号器。
+关掉后所有拨号方式（含手动拨号）一律拒绝，且下一轮组网循环会拆掉 QMI/MBIM 会话。
 
 ### POST /api/dial/mode
 WAN 模式（`{mode}` = `modem_pro` / `dhcp` / `both`，含别名）：写回 `[net] wan_mode`，
@@ -292,7 +292,7 @@ WAN 模式（`{mode}` = `modem_pro` / `dhcp` / `both`，含别名）：写回 `[
 
 ### POST /api/dial/ipv6
 IPv6 开关（`{on}`，**必须显式给值**）：写回 `[net] wan_ipv6` 并即时生效，
-四种拨号方式都按它来（QMI 不给拨号器加 `-6`、ECM/NCM/RNDIS 不建 `modem<id>_6` 等）。
+四种拨号方式都按它来（QMI/MBIM 不建 v6 呼叫、ECM/NCM/RNDIS 不建 `modem<id>_6` 等）。
 
 **取址方式**由 `[net] wan_ipv6_mode` 决定（`dhcpv6` 默认 / `ra` / `static` / `off`，
 见 `PROGRESS.md` §30；350 系列对齐 `luci-app-fm350`）：`dhcpv6` 交给 odhcp6c 并
@@ -600,7 +600,7 @@ IMEI 管理状态（含备份信息）。`supported=false` 表示本机厂商没
 ```
 
 - `required`：只有 **350 系列（FM350 / RW350）**为 true（判据认 ATI 原文里的型号串）。别的机型
-  主机侧地址由模组 DHCP 或主机拨号器给，加了只会让人以为"每次都要手工配"。
+  主机侧地址由模组 DHCP 或内置拨号给，加了只会让人以为"每次都要手工配"。
 - `plan`：建议值按模组上报的本机地址推（同网段取 `.2`、网关指向模组），**仅供参考**，
   真正的网段只有模组那份配置知道。
 - `persist`：仅 OpenWrt 给（`uci` 写 `/etc/config/network`），全部 `manual=true`

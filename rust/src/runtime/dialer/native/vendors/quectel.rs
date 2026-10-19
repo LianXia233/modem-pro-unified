@@ -1,6 +1,6 @@
 //! 移远 Quectel：QMI + MBIM 双栈。
 //!
-//! 依据 `third_party/quectel-cm`：同时带 `QMIThread.c` 与 `mbim-cm.c`，
+//! 依据上游 quectel-CM 1.6.8（原 `third_party/quectel-cm`）：同时带 `QMIThread.c` 与 `mbim-cm.c`，
 //! `-p quectel-mbim-proxy` 走 MBIM、默认走 QMI。所以两条都能接管，
 //! 但**默认仍选 QMI**（`QMIThread.c` 是主线，`mbim-cm.c` 是补充路径）。
 //!

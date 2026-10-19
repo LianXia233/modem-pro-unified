@@ -17,6 +17,3 @@ VERSION text eol=lf
 *.gif binary
 *.ico binary
 *.gz  binary
-
-# 厂商源码原样保存，不做行尾转换
-third_party/** -text

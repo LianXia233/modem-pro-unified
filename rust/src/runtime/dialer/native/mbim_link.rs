@@ -1,7 +1,7 @@
 //! MBIM 数据链路：`/dev/cdc-wdmN` 上的 OPEN / COMMAND / CLOSE + Basic Connect。
 //!
 //! 与 [`super::qmi_link`] 平级，覆盖「模组只给 MBIM 接口」的场景
-//! （quectel-cm / meig-cm 的 `mbim-cm.c` 是同一套流程）。
+//! （上游 quectel-cm / meig-cm 的 `mbim-cm.c` 是同一套流程）。
 //!
 //! 流程（MBIM 1.0）：
 //! 1. `MBIM_OPEN_MSG` → `OPEN_DONE`（status 0）；

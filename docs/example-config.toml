@@ -18,8 +18,8 @@ cmd_timeout = "3s"
 [net]
 wan_mode = "modem_pro"
 host_dial = true
-# 主机侧拨号器："" = 厂商二进制（/usr/lib/modemd/），"native" = 内置 Rust QMI 拨号器
-host_dial_bin = ""
+# 主机侧拨号后端：只剩内置实现（"native" / 空值同义），无外部二进制
+host_dial_bin = "native"
 auto_dial = true
 # 模组侧 IPv6 取址方式：dhcpv6（默认，odhcp6c 收 RA + /64 委派给 LAN）/ ra（内核 RA+SLAAC，
 # 本程序开 accept_ra=2 并主动发 RS）/ static（照模组上报地址写 /128）/ off（不托管）。

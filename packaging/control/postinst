@@ -3,12 +3,16 @@
 [ -n "$IPKG_INSTROOT" ] && exit 0
 
 chmod +x /usr/bin/modemd 2>/dev/null
-for d in quectel-CM fibocom-dial meig-cm simcom-cm; do
-	[ -f "/usr/lib/modemd/$d" ] && chmod +x "/usr/lib/modemd/$d" 2>/dev/null
-done
-for s in /lib/netifd/proto/modem_pro.sh /lib/netifd/proto/quectel.sh /usr/lib/modem-pro/mp-client.sh; do
+for s in /lib/netifd/proto/modem_pro.sh /usr/lib/modem-pro/mp-client.sh; do
 	[ -f "$s" ] && chmod +x "$s" 2>/dev/null
 done
+
+# 升级清理：2026-10-19 起 QMI/MBIM 拨号已内化进 modemd，旧包留下的厂商二进制
+# 与 quectel.sh 协议脚本不再使用（不清掉会白占几百 KB，且误导排障）。
+rm -f /usr/lib/modemd/quectel-CM /usr/lib/modemd/fibocom-dial \
+      /usr/lib/modemd/meig-cm /usr/lib/modemd/simcom-cm 2>/dev/null
+rmdir /usr/lib/modemd 2>/dev/null
+rm -f /lib/netifd/proto/quectel.sh 2>/dev/null
 
 # 注册并拉起服务
 /etc/init.d/modemd enable 2>/dev/null
@@ -23,14 +27,12 @@ rm -rf /tmp/luci-modulecache 2>/dev/null
 _port=$(sed -n 's/.*listen[[:space:]]*=[[:space:]]*"[^"]*:\([0-9][0-9]*\)".*/\1/p' /etc/modemd/config.toml 2>/dev/null | head -1)
 case "$_port" in ''|*[!0-9]*) _port=9527 ;; esac
 
-echo "modem-pro 已安装（modemd + 拨号器 + LuCI）："
+echo "modem-pro 已安装（modemd + 内置 QMI/MBIM 拨号 + LuCI）："
 echo "  服务：  /etc/init.d/modemd status | start | stop | restart"
 echo "  配置：  /etc/modemd/config.toml（改完 restart 生效）"
 echo "  页面：  http://<路由器地址>:$_port/   或 LuCI 菜单「5G终端」"
 echo "  日志：  logread -e modemd   （或 /var/log/modemd.log）"
 echo ""
-echo "模组接口 prot=modem_pro 承载 IPv4(DHCP)+IPv6(SLAAC/DHCPv6)，拨号器按厂商选择："
-echo "  Quectel → /usr/lib/modemd/quectel-CM    Fibocom → /usr/lib/modemd/fibocom-dial"
-echo "  Meig    → /usr/lib/modemd/meig-cm       SIMCom  → /usr/lib/modemd/simcom-cm"
-echo "  四家 QMI 初始化序列不同，不能互相顶替。"
+echo "模组接口 proto=modem_pro 承载 IPv4(DHCP)+IPv6(SLAAC/DHCPv6)；"
+echo "QMI/MBIM 数据呼叫由 modemd 内置建立（QMAP 模组自动发 WDA 并绑 mux），无需外部拨号器。"
 exit 0

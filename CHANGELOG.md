@@ -4,6 +4,34 @@
 
 ## [未发布]
 
+### 重大变更：删除 `third_party/`，QMI/MBIM 拨号全部内化
+
+四家厂商的 C 拨号器（quectel-CM / fibocom-dial / meig-cm / simcom-cm）与 8 个厂商内核模块
+整目录移除，仓库从 8.0M 降到 2.5M；`modemd` 现在自己完成 QMI / MBIM 数据呼叫，
+`[net] host_dial_bin` 默认 `"native"`，不再安装任何 `/usr/lib/modemd/*` 二进制。
+
+- **补齐 QMAP**：`runtime/dialer/qmi.rs` 新增 `WDA Set Data Format`（TLV 0x10/0x11/0x12/0x13/
+  0x15/0x16/0x17）与 `WDS Bind Mux Data Port`（TLV 0x10/0x11/0x13），逐条对齐 quectel-CM
+  的 `WdaSetDataFormat()` / `WdsSetQMUXBindMuxDataPort()`（`QUECTEL_UL_DATA_AGG` 未开，
+  故不发 0x19/0x1B/0x1C）。mux id：单承载 `0x81`，多承载 `PDN + 0x80`；端点类型 USB=2 / PCIe=3；
+  聚合窗口读 `qmap_size`，缺省 16 KiB。
+- **控制口扩到三种驱动**：`find_control()` 依次反查 `/dev/cdc-wdmN`、`/dev/GobiQMIx`、
+  `/dev/mhi_QMIx`，都按 sysfs 对齐设备，对不上就报错而不是猜 `cdc-wdm0`。
+  GobiNet 跳过 WDA（驱动自己设数据格式，与 `GobiNetCM.c` 同口径）。
+- **MBIM 不再受厂商限制**：`vendors::supports()` 对 MBIM 恒真（Basic Connect 是标准协议），
+  Fibocom / SIMCom 的 MBIM 模组不会再因为「厂商 C 源码里没有 `mbim-cm.c`」被拒。
+- **删除死代码**：`runtime/dialer/proc.rs`（321 行外部进程托管）、`DialerPlan` / `plan_dialer` /
+  `DialerSupervisor::status`、`VendorSpec::dialer_bin()` 及 4 处实现、`files/lib/netifd/proto/quectel.sh`
+  （quectel-CM 的 netifd 包装）、`Makefile` 的 `cc_dialer` / 四个 `MODEM_PRO_*` 菜单 / 安装规则、
+  CI 的 `third_party` 拷贝与四个 `CONFIG_MODEM_PRO_*`、`.gitattributes` 与脱敏脚本的
+  `third_party` 例外。
+- **配置兼容**：旧值 `host_dial_bin = "quectel-CM"` 等不会报错，只告警一次并按内置实现跑；
+  `proto=quectel` 的接口不再可用，改用 `proto=modem_pro`。
+- **验证**：`cargo test` **570 全绿**（新增 WDA 帧 / QMAP 计划 / 控制口策略 9 条）、
+  `cargo clippy --all-targets` 与 `cargo build` 零告警。
+- ⚠️ **真机未验证**：测试机 FM350/RW350 是 ECM，没有控制口。QMI（含 QMAP）、MBIM、
+  PCIe/MHI 三种数据面仍需实机跑通（验证矩阵见 `docs/PROGRESS.md` §41.4）。
+
 ### 清理：移除误入库的 `downloads/fluxdown`
 
 `downloads/fluxdown/FluxDown-0.5.7-linux-x64/`（一个与项目无关的 FluxDown 桌面应用二进制

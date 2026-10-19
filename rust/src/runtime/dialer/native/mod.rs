@@ -1,4 +1,4 @@
-//! 原生拨号器（不依赖 `quectel-CM` 等外部二进制）。
+//! 内置拨号器（不依赖任何外部二进制）。
 //!
 //! ## 结构
 //!
@@ -34,10 +34,19 @@
 //! - 状态能直接回给 `/api/dial`（handle / 地址 / MTU / 最后错误），排障不用猜；
 //! - 参数（APN / family / profile）与配置强绑定，不会被拨号器自己的默认值覆盖。
 //!
-//! ## 开启方式
+//! ## 接入方式
 //!
-//! `[net] host_dial_bin = "native"`（`rust` / `builtin` 同义）。默认仍用外部二进制；
-//! 原生路径需要 `cdc-wdm` 控制口，RNDIS/ECM 模组（FM350 / RW350）不适用。
+//! 原生拨号是**唯一**路径（`[net] host_dial_bin = "native"`，空值/`rust`/`builtin`
+//! 同义）。控制口支持三种驱动布局：
+//!
+//! | 驱动 | 控制口 | 说明 |
+//! | --- | --- | --- |
+//! | `qmi_wwan*` / `cdc_mbim` | `/dev/cdc-wdmN` | USB 主力路径 |
+//! | GobiNet | `/dev/GobiQMIx` | 与 cdc-wdm 同一套 QMUX 帧 |
+//! | `pcie_mhi` | `/dev/mhi_QMIx` | PCIe / MHI，帧格式相同，端点类型不同 |
+//!
+//! RNDIS/ECM 模组（FM350 / RW350）不走这里：它们没有 QMI 控制口，
+//! 数据面由模组侧 AT 拨号完成。
 
 pub mod qmi_link;
 pub mod vendors;
@@ -45,19 +54,83 @@ pub mod vendors;
 #[cfg(unix)]
 pub mod mbim_link;
 
+use std::path::{Path, PathBuf};
+
 use crate::modem::vendor::Vendor;
 use crate::runtime::dialer::PlanError;
 
+use super::qmi;
 use vendors::{Caps, DataLink};
 
-/// 从数据网卡反查 QMI/MBIM 控制设备。
+/// 控制口的驱动类型（决定端点类型，以及要不要跳过 WDA）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlKind {
+    /// `qmi_wwan` / `qmi_wwan_q` / `qmi_wwan_f` / `cdc_mbim`：`/dev/cdc-wdmN`。
+    CdcWdm,
+    /// GobiNet：`/dev/GobiQMIx`。驱动自己处理 QMAP 数据格式。
+    GobiNet,
+    /// `pcie_mhi`：`/dev/mhi_QMIx`（PCIe 模组）。
+    Mhi,
+}
+
+impl ControlKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ControlKind::CdcWdm => "cdc-wdm",
+            ControlKind::GobiNet => "gobinet",
+            ControlKind::Mhi => "mhi",
+        }
+    }
+
+    /// 要不要下发 WDA `Set Data Format`。
+    ///
+    /// GobiNet 是例外：quectel-CM 在 `qmidev_is_gobinet()` 分支里**明确跳过**
+    /// （「when QMAP enabled, set data format in GobiNet driver」）。
+    pub fn handles_data_format(self) -> bool {
+        self != ControlKind::GobiNet
+    }
+
+    /// PCIe/MHI 的 QMAP 端点类型是 `DATA_EP_TYPE_PCIE`。
+    pub fn is_pcie(self) -> bool {
+        self == ControlKind::Mhi
+    }
+}
+
+/// 一个控制口（路径 + 驱动类型）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlDev {
+    pub path: String,
+    pub kind: ControlKind,
+}
+
+/// 从数据网卡反查控制口。
 ///
+/// 顺序：`cdc-wdm` → GobiNet → MHI。**不猜** `/dev/cdc-wdm0`：多模组时会把
+/// 呼叫建到别人身上，所以每一路都要求 sysfs 能对上，对不上就返回 `None`。
+pub fn find_control(iface: &str) -> Option<ControlDev> {
+    if let Some(path) = find_cdc_wdm(iface) {
+        return Some(ControlDev {
+            path,
+            kind: ControlKind::CdcWdm,
+        });
+    }
+    if let Some(path) = find_gobinet(iface) {
+        return Some(ControlDev {
+            path,
+            kind: ControlKind::GobiNet,
+        });
+    }
+    find_mhi(iface).map(|path| ControlDev {
+        path,
+        kind: ControlKind::Mhi,
+    })
+}
+
 /// `qmi_wwan` 的布局是 `<usb interface>/usbmisc/cdc-wdmN`；不同内核/驱动层级
-/// 差一层，所以逐级向上找。找不到就返回 `None` —— **不猜** `/dev/cdc-wdm0`
-/// （多模组时会把呼叫建到别人身上）。
-pub fn find_wdm(iface: &str) -> Option<String> {
+/// 差一层，所以逐级向上找。
+fn find_cdc_wdm(iface: &str) -> Option<String> {
     let base = parent_iface(iface);
-    let mut dir = std::path::PathBuf::from(format!("/sys/class/net/{base}/device"));
+    let mut dir = PathBuf::from(format!("/sys/class/net/{base}/device"));
     for _ in 0..4 {
         for sub in [dir.join("usbmisc"), dir.join("../usbmisc")] {
             if let Ok(rd) = std::fs::read_dir(&sub) {
@@ -75,6 +148,73 @@ pub fn find_wdm(iface: &str) -> Option<String> {
         if !dir.pop() {
             break;
         }
+    }
+    None
+}
+
+fn sysfs_device(iface: &str) -> Option<PathBuf> {
+    std::fs::canonicalize(format!("/sys/class/net/{iface}/device")).ok()
+}
+
+/// USB 接口路径归一：`.../1-1.2/1-1.2:1.0` 与 `.../1-1.2` 视为同一设备。
+fn usb_dev_dir(p: &Path) -> PathBuf {
+    match p.file_name().and_then(|n| n.to_str()) {
+        Some(n) if n.contains(':') => p.parent().map(Path::to_path_buf).unwrap_or_else(|| p.to_path_buf()),
+        _ => p.to_path_buf(),
+    }
+}
+
+/// GobiNet：字符设备以 `/sys/class/GobiQMI/<name>/device` 反指 USB 接口。
+fn find_gobinet(iface: &str) -> Option<String> {
+    let dev = usb_dev_dir(&sysfs_device(iface)?);
+    let mut hits = Vec::new();
+    for entry in std::fs::read_dir("/dev").ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("GobiQMI") {
+            continue;
+        }
+        let link = PathBuf::from(format!("/sys/class/GobiQMI/{name}/device"));
+        if let Ok(target) = std::fs::canonicalize(link) {
+            if usb_dev_dir(&target) == dev {
+                hits.push(format!("/dev/{name}"));
+            }
+        }
+    }
+    hits.sort();
+    if hits.len() == 1 {
+        return hits.pop();
+    }
+    None
+}
+
+/// MHI：`/dev/mhi_QMIx` 与 PCIe 设备对应；`/sys/class/mhi/mhiN/device` 是同一
+/// 个 PCI 设备（数据网卡也叫 `mhi_wwan*`）。层级因驱动版本有差异，所以双向比。
+fn find_mhi(iface: &str) -> Option<String> {
+    let dev = sysfs_device(iface)?;
+    let mut all = Vec::new();
+    let mut hits = Vec::new();
+    for entry in std::fs::read_dir("/dev").ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(idx) = name.strip_prefix("mhi_QMI") else {
+            continue;
+        };
+        let path = format!("/dev/{name}");
+        all.push(path.clone());
+        let link = PathBuf::from(format!("/sys/class/mhi/mhi{idx}/device"));
+        if let Ok(target) = std::fs::canonicalize(link) {
+            if target == dev || target.starts_with(&dev) || dev.starts_with(&target) {
+                hits.push(path);
+            }
+        }
+    }
+    hits.sort();
+    if hits.len() == 1 {
+        return hits.pop();
+    }
+    all.sort();
+    // 只有一个 MHI 控制口、网卡名又是 mhi_* ⇒ 就是它（否则等于「有口不用」）
+    if all.len() == 1 && iface.starts_with("mhi") {
+        return all.pop();
     }
     None
 }
@@ -125,14 +265,16 @@ pub struct NativePlan {
     pub vendor: Vendor,
     /// 数据面（QMI / MBIM）。
     pub link: DataLink,
-    /// `/dev/cdc-wdmN`。
-    pub wdm: String,
+    /// 控制口（`/dev/cdc-wdmN` / `/dev/GobiQMIx` / `/dev/mhi_QMIx`）。
+    pub control: ControlDev,
     /// 数据网卡（raw_ip sysfs 在它上面；QMAP 时取父口）。
     pub iface: String,
     pub apn: String,
     pub ipv6: bool,
     /// profile index（`[net] host_dial_pdn`，0 = 不指定）。
     pub pdn: i64,
+    /// QMAP 参数（非 QMAP 模组为 `None`）。
+    pub qmap: Option<qmi::QmapSettings>,
     /// MBIM session id（QMI 忽略）。
     pub session: u32,
 }
@@ -141,17 +283,21 @@ impl NativePlan {
     /// 一行可读描述（日志 / 状态接口用）。
     pub fn describe(&self) -> String {
         format!(
-            "native {} {} ({}, apn={}, v6={}, pdn={})",
+            "native {} {} [{} {}] (apn={}, v6={}, pdn={}, qmap={})",
             self.vendor.as_str(),
             self.link.as_str(),
-            self.wdm,
+            self.control.kind.as_str(),
+            self.control.path,
             if self.apn.is_empty() {
                 "默认"
             } else {
                 &self.apn
             },
             self.ipv6,
-            self.pdn
+            self.pdn,
+            self.qmap
+                .map(|q| format!("0x{:02x}", q.mux_id))
+                .unwrap_or_else(|| "-".to_string())
         )
     }
 
@@ -169,7 +315,77 @@ fn parse_link(kind: &str) -> Option<DataLink> {
     }
 }
 
-/// 算一个原生拨号计划（纯函数；`wdm` 反查是唯一 IO）。
+/// 从数据网卡名反推 PDN（`wwan0_1` → 1）；`rmnet_data0` 这类不算。
+fn pdn_from_iface(iface: &str) -> Option<i64> {
+    let tail = iface.rsplit('_').next()?;
+    let n: i64 = tail.parse().ok()?;
+    (n > 0).then_some(n)
+}
+
+/// 解析 PDN / mux 序号。
+///
+/// `> 0` 强制；`-1` 只按网卡名反推；`0`（默认）先反推，QMAP 单承载驱动按 1。
+fn resolve_pdn(device: &str, cfg: i64, qmap_mode: i64) -> i64 {
+    match cfg {
+        n if n > 0 => n,
+        -1 => pdn_from_iface(device).unwrap_or(0),
+        _ => pdn_from_iface(device).or((qmap_mode == 1).then_some(1)).unwrap_or(0),
+    }
+}
+
+/// 聚合窗口：驱动 `qmap_size`（父口上没有就看数据口），读不到交给缺省。
+fn qmap_size(parent: &str, device: &str) -> u32 {
+    for dev in [parent, device] {
+        if let Ok(s) = std::fs::read_to_string(format!("/sys/class/net/{dev}/qmap_size")) {
+            if let Ok(v) = s.trim().parse::<u32>() {
+                return v;
+            }
+        }
+    }
+    // 部分驱动把参数挂在模块参数上（qmi_wwan_q / qmi_wwan_f）
+    for p in [
+        format!("/sys/class/net/{parent}/device/driver/module/parameters/qmap_size"),
+        "/sys/module/qmi_wwan_q/parameters/qmap_size".to_string(),
+    ] {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if let Ok(v) = s.trim().parse::<u32>() {
+                return v;
+            }
+        }
+    }
+    0
+}
+
+/// 算 QMAP 参数（纯函数）。
+///
+/// - `qmap_mode <= 0`：不是 QMAP，返回 `None`；
+/// - `qmap_mode == 1`：单承载，唯一 mux 是 `0x81`（与 quectel-CM 一致）；
+/// - `qmap_mode > 1`：mux = PDN + `0x80`（`wwan0_1` → `0x81`）；
+/// - GobiNet：驱动自己设数据格式，不需要 WDA（返回 `None`）。
+pub fn qmap_settings(
+    kind: ControlKind,
+    qmap_mode: i64,
+    pdn: i64,
+    rx_urb_size: u32,
+) -> Option<qmi::QmapSettings> {
+    if qmap_mode <= 0 || !kind.handles_data_format() {
+        return None;
+    }
+    let mux = if qmap_mode == 1 {
+        0x81
+    } else {
+        // mux id 是 1 字节：PDN 上限 0x7F，别让配置里的离谱值绕回 0x80
+        (pdn.clamp(1, 0x7F) + 0x80) as u8
+    };
+    Some(if kind.is_pcie() {
+        qmi::QmapSettings::pcie(mux, rx_urb_size)
+    } else {
+        qmi::QmapSettings::usb(mux, rx_urb_size)
+    })
+}
+
+/// 算一个原生拨号计划（唯一 IO：反查控制口 + 读 qmap sysfs）。
+#[allow(clippy::too_many_arguments)] // 计划本来就是「模组 + 类型 + APN + 网卡 + 地址族 + PDN」
 pub fn plan_native(
     modem_id: u32,
     vendor: Vendor,
@@ -185,7 +401,7 @@ pub fn plan_native(
         )));
     };
     let caps = vendors::select(vendor);
-    if !caps.links.contains(&link) {
+    if !vendors::supports(vendor, link) {
         return Err(PlanError::Unsupported(format!(
             "{} 的原生后端不支持 {}（只支持 {}）：{}",
             vendor.label(),
@@ -198,24 +414,39 @@ pub fn plan_native(
             caps.note
         )));
     }
+    // MBIM 必须有 APN（协议要求，空 APN 的 CONNECT 会被设备拒）
+    if link == DataLink::Mbim && apn.trim().is_empty() {
+        return Err(PlanError::MbimNeedsApn);
+    }
     if device.trim().is_empty() {
         return Err(PlanError::NoDevice);
     }
-    let wdm = find_wdm(device).ok_or_else(|| {
+    let parent = parent_iface(device);
+    let control = find_control(device).ok_or_else(|| {
         PlanError::NoWdm(format!(
-            "没在 /sys/class/net/{}/device 下找到 cdc-wdm 控制口",
-            parent_iface(device)
+            "/sys/class/net/{parent}/device 下没有 cdc-wdm / GobiQMI / mhi_QMI 控制口"
         ))
     })?;
+    if link == DataLink::Mbim && control.kind != ControlKind::CdcWdm {
+        return Err(PlanError::Unsupported(format!(
+            "MBIM 需要 cdc-wdm 控制口，{} 上只有 {}",
+            parent,
+            control.kind.as_str()
+        )));
+    }
+    let qmap_mode = crate::netprov::provision::qmap_mode(&parent);
+    let pdn = resolve_pdn(device, pdn, qmap_mode);
+    let qmap = qmap_settings(control.kind, qmap_mode, pdn, qmap_size(&parent, device));
     Ok(NativePlan {
         modem_id,
         vendor,
         link,
-        wdm,
-        iface: parent_iface(device),
+        control,
+        iface: parent,
         apn: apn.trim().to_string(),
         ipv6,
-        pdn: if pdn > 0 { pdn } else { 0 },
+        pdn,
+        qmap,
         session: caps.mbim_session,
     })
 }
@@ -246,12 +477,13 @@ impl Session {
                     return Err(format!("{} 的 qmi/raw_ip 设置失败", plan.iface));
                 }
                 let (s, note) = qmi_link::QmiSession::start(
-                    &plan.wdm,
+                    &plan.control.path,
                     &plan.iface,
                     &plan.apn,
                     plan.ipv6,
                     plan.pdn,
                     caps.disable_autoconnect,
+                    plan.qmap,
                 )
                 .map_err(|e| format!("{}：{e}", plan.describe()))?;
                 (Inner::Qmi(s), note)
@@ -260,7 +492,7 @@ impl Session {
                 #[cfg(unix)]
                 {
                     let (s, note) = mbim_link::MbimSession::start(
-                        &plan.wdm,
+                        &plan.control.path,
                         &plan.apn,
                         plan.ipv6,
                         plan.session,
@@ -333,7 +565,8 @@ impl Session {
             "backend": format!("native-{}", self.plan.link.as_str()),
             "vendor": self.plan.vendor.as_str(),
             "plan": self.plan.describe(),
-            "wdm": self.plan.wdm,
+            "control": self.plan.control.path,
+            "control_kind": self.plan.control.kind.as_str(),
             "device": self.plan.iface,
             "started_at": self.started_at,
             "note": self.note,
@@ -355,18 +588,7 @@ impl Drop for Session {
 
 #[cfg(test)]
 mod tests {
-    use super::super::is_native_bin_name as is_native_bin;
     use super::*;
-
-    #[test]
-    fn native_bin_aliases_are_recognised() {
-        for v in ["native", "NATIVE", "rust", "builtin", " Native "] {
-            assert!(is_native_bin(v), "{v:?} 应识别为原生");
-        }
-        for v in ["", "quectel-CM", "/usr/bin/native", "natives"] {
-            assert!(!is_native_bin(v), "{v:?} 不是原生开关");
-        }
-    }
 
     #[test]
     fn native_plan_rejects_unsupported_link_kind() {
@@ -377,38 +599,51 @@ mod tests {
     }
 
     #[test]
-    fn vendor_without_mbim_is_reported_clearly() {
-        // fibocom-dial 没有 mbim-cm.c ⇒ 明确拒绝，而不是运行时才失败
-        let e = plan_native(0, Vendor::Fibocom, "mbim", "ctnet", "wwan0", false, 0).unwrap_err();
-        let text = e.to_string();
+    fn vendor_mbim_is_not_gated_by_external_dialer_sources() {
+        // 外部时代「MBIM 一律 quectel-CM」；原生后端自己实现 MBIM，
+        // Fibocom 的 MBIM 模组不能再因为「fibocom-dial 没 mbim-cm.c」被拒
+        for v in [Vendor::Fibocom, Vendor::Simcom, Vendor::TDTech, Vendor::Unknown] {
+            assert!(
+                vendors::supports(v, DataLink::Mbim),
+                "{v:?} 应该能走原生 MBIM"
+            );
+        }
+        // 仍然要拒绝 ECM 这种不归主机侧管的类型
+        let e = plan_native(0, Vendor::Fibocom, "ecm", "ctnet", "wwan0", false, 0).unwrap_err();
         assert!(matches!(e, PlanError::Unsupported(_)));
-        assert!(
-            text.contains("不支持 mbim"),
-            "错误文本要说清不支持什么: {text}"
-        );
-        // meiG 反过来：MBIM 首选但 QMI 也认
-        assert!(vendors::supports(Vendor::Meig, DataLink::Mbim));
-        assert!(vendors::supports(Vendor::Meig, DataLink::Qmi));
     }
 
     #[test]
-    fn pdn_is_only_positive() {
-        // 通过 plan 的归一化验证（不碰 sysfs 的部分）
+    fn mbim_without_apn_is_rejected_before_io() {
+        // MBIM 的 CONNECT 必须带 APN；空 APN 先拦，别等设备回失败
+        let e = plan_native(0, Vendor::Quectel, "mbim", "", "wwan0", false, 0).unwrap_err();
+        assert!(matches!(e, PlanError::MbimNeedsApn));
+    }
+
+    #[test]
+    fn describe_carries_control_and_qmap() {
         let p = NativePlan {
             modem_id: 1,
             vendor: Vendor::Quectel,
             link: DataLink::Qmi,
-            wdm: "/dev/cdc-wdm0".into(),
+            control: ControlDev {
+                path: "/dev/cdc-wdm0".into(),
+                kind: ControlKind::CdcWdm,
+            },
             iface: "wwan0".into(),
             apn: "ctnet".into(),
             ipv6: true,
-            pdn: 0,
+            pdn: 1,
+            qmap: Some(qmi::QmapSettings::usb(0x81, 16 * 1024)),
             session: 0,
         };
-        assert!(p.describe().contains("ctnet"));
-        assert!(p.describe().contains("v6=true"));
-        assert!(p.describe().contains("quectel"));
-        assert!(p.describe().contains("qmi"));
+        let s = p.describe();
+        assert!(s.contains("ctnet"), "{s}");
+        assert!(s.contains("v6=true"), "{s}");
+        assert!(s.contains("quectel"), "{s}");
+        assert!(s.contains("qmi"), "{s}");
+        assert!(s.contains("cdc-wdm"), "{s}");
+        assert!(s.contains("qmap=0x81"), "{s}");
     }
 
     #[test]
@@ -419,8 +654,48 @@ mod tests {
     }
 
     #[test]
-    fn find_wdm_returns_none_for_missing_iface() {
+    fn find_control_returns_none_for_missing_iface() {
         // 不存在的网卡不能瞎猜 /dev/cdc-wdm0（多模组会建到别人身上）
-        assert_eq!(find_wdm("definitely-not-an-iface"), None);
+        assert_eq!(find_control("definitely-not-an-iface"), None);
+    }
+
+    // ---------- QMAP 计划 ----------
+
+    #[test]
+    fn qmap_is_planned_only_for_qmap_drivers() {
+        // 非 QMAP：不下发 WDA
+        assert_eq!(qmap_settings(ControlKind::CdcWdm, 0, 1, 16384), None);
+        // GobiNet：驱动自己设数据格式
+        assert_eq!(qmap_settings(ControlKind::GobiNet, 4, 1, 16384), None);
+        // 单承载：唯一 mux 0x81
+        let s = qmap_settings(ControlKind::CdcWdm, 1, 0, 16384).expect("qmap");
+        assert_eq!(s.mux_id, 0x81);
+        assert_eq!(s.ep_type, qmi::EP_TYPE_HSUSB);
+        // 多承载：PDN + 0x80
+        let s = qmap_settings(ControlKind::CdcWdm, 4, 3, 16384).expect("qmap");
+        assert_eq!(s.mux_id, 0x83);
+        // PCIe/MHI：端点类型不同
+        let s = qmap_settings(ControlKind::Mhi, 1, 0, 16384).expect("qmap");
+        assert_eq!(s.ep_type, qmi::EP_TYPE_PCIE);
+        // PDN 是 1 字节上限，离谱配置不能绕回 0x80
+        let s = qmap_settings(ControlKind::CdcWdm, 4, 500, 16384).expect("qmap");
+        assert_eq!(s.mux_id, 0xFF);
+    }
+
+    #[test]
+    fn pdn_resolution_prefers_explicit_then_iface_then_qmap() {
+        assert_eq!(resolve_pdn("wwan0_2", 3, 4), 3, "显式配置优先");
+        assert_eq!(resolve_pdn("wwan0_2", 0, 4), 2, "其次按网卡名反推");
+        assert_eq!(resolve_pdn("wwan0", 0, 1), 1, "单承载 QMAP 兜底 1");
+        assert_eq!(resolve_pdn("wwan0", -1, 1), 0, "-1 表示只按网卡名");
+        assert_eq!(resolve_pdn("wwan0", 0, 0), 0, "非 QMAP 不猜");
+    }
+
+    #[test]
+    fn control_kind_matches_driver_expectations() {
+        assert!(ControlKind::CdcWdm.handles_data_format());
+        assert!(!ControlKind::GobiNet.handles_data_format());
+        assert!(ControlKind::Mhi.is_pcie());
+        assert_eq!(ControlKind::GobiNet.as_str(), "gobinet");
     }
 }

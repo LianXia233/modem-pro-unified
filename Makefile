@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
 # 统一包：modem-pro
-#   · Rust 守护进程 modemd（rust/）
-#   · 厂商主机侧拨号器（third_party/，按包内 config 子选项 MODEM_PRO_* 裁剪）
+#   · Rust 守护进程 modemd（rust/，内置 QMI/MBIM 拨号，不再依赖厂商 C 二进制）
 #   · netifd 协议脚本（files/lib/netifd/proto/）
 #   · LuCI 前端（luci/）
 #   · 默认配置与 init 脚本（files/、packaging/）
@@ -61,12 +60,6 @@ ifeq ($(HAVE_RUST),1)
   PKG_BUILD_DEPENDS:=rust/host
 endif
 
-# 厂商拨号器源文件清单（与各家自带 Makefile 保持一致，但不使用其 -Werror）。
-QUECTEL_SRC:=QmiWwanCM.c GobiNetCM.c main.c QCQMUX.c QMIThread.c util.c qmap_bridge_mode.c mbim-cm.c device.c atc.c atchannel.c at_tok.c udhcpc.c
-FIBOCOM_SRC:=QmiWwanCM.c GobiNetCM.c main.c MPQMUX.c QMIThread.c util.c qmap_bridge_mode.c query_pcie_mode.c udhcpc_netlink.c libmnl/ifutils.c libmnl/attr.c libmnl/callback.c libmnl/nlmsg.c libmnl/socket.c
-MEIG_SRC:=QmiWwanCM.c GobiNetCM.c main.c MPQMUX.c QMIThread.c util.c udhcpc.c qmap_bridge_mode.c mbim-cm.c device.c
-SIMCOM_SRC:=QmiWwanCM.c GobiNetCM.c main.c MPQMUX.c QMIThread.c util.c udhcpc.c
-
 include $(INCLUDE_DIR)/package.mk
 
 ifeq ($(HAVE_RUST),1)
@@ -99,52 +92,20 @@ else
   endef
 endif
 
-TP:=$(PKG_BUILD_DIR)/third_party
-DL_OUT:=$(PKG_BUILD_DIR)/dialers
-
-# $(1)=源目录 $(2)=源文件清单 $(3)=输出 $(4)=链接库 $(5)=额外 CFLAGS
-define cc_dialer
-	$(TARGET_CC) $(TARGET_CPPFLAGS) $(TARGET_CFLAGS) $(5) $(addprefix $(1)/,$(2)) -o $(3) $(4)
-endef
-
 define Package/modem-pro
   SECTION:=net
   CATEGORY:=Network
   SUBMENU:=Modem Manager
-  TITLE:=Unified 5G modem manager (modemd + dialers + LuCI)
+  TITLE:=Unified 5G modem manager (modemd + LuCI)
   URL:=https://github.com/LianXia233/modem-pro-unified
   DEPENDS:=+luci-base +odhcp6c
 endef
 
-# 四家拨号器的 QMI 初始化序列互不兼容，必须按模组厂商选装（装错会拨不上）。
-# 默认全开，方便一次装齐；可以把用不到的品牌关掉以省固件空间。
-# 子选项内联在此（OpenWrt 包内 config 机制，生成 CONFIG_MODEM_PRO_* 符号，
-# 被 Build/Compile 的 $(if $(CONFIG_MODEM_PRO_*),...) 引用决定各家拨号器是否编译）。
 define Package/modem-pro/config
 	config MODEM_PRO_HOST_RUST
 		bool "用宿主 rustup 工具链直编 modemd（跳过 feeds 的 rust/host 源码编译）"
 		depends on PACKAGE_modem-pro
 		default n
-
-	config MODEM_PRO_QUECTEL
-		bool "打包移远 Quectel 拨号器 (quectel-CM)"
-		depends on PACKAGE_modem-pro
-		default y
-
-	config MODEM_PRO_FIBOCOM
-		bool "打包广和通 Fibocom 拨号器 (fibocom-dial)"
-		depends on PACKAGE_modem-pro
-		default y
-
-	config MODEM_PRO_MEIG
-		bool "打包美格 Meig 拨号器 (meig-cm)"
-		depends on PACKAGE_modem-pro
-		default y
-
-	config MODEM_PRO_SIMCOM
-		bool "打包芯讯通 SIMCom 拨号器 (simcom-cm)"
-		depends on PACKAGE_modem-pro
-		default y
 endef
 
 define Package/modem-pro/conffiles
@@ -154,23 +115,12 @@ endef
 define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
 	$(CP) $(CURDIR)/rust $(PKG_BUILD_DIR)/rust
-	$(CP) $(CURDIR)/third_party $(PKG_BUILD_DIR)/third_party
 endef
 
 define Build/Compile
-	# Rust 守护进程：注入统一版本号（单一来源 VERSION）
+	# Rust 守护进程：注入统一版本号（单一来源 VERSION）。
+	# QMI / MBIM 拨号（含 QMAP 绑 mux）都在 modemd 内完成，不再编译厂商 C 拨号器。
 	$(call MODEMD/Compile)
-	# 厂商拨号器
-	# 广和通 fibocom-dial 是老代码（先调用后定义、非 void 函数里裸 return）：
-	# gcc-14（主线 snapshots）把 implicit-function-declaration / return-mismatch 默认当错误，
-	# 需 -std=gnu89 才编得过（gnu89 下这两类都不再是错误）。该开关**只能单给 fibocom**：
-	# quectel 用了 C99 的 for 内声明，加 gnu89 反而报错；meig/simcom 在 gcc-14 语义下无需。
-	# 详见 third_party/fibocom-dial/SOURCE.md。
-	$(INSTALL_DIR) $(DL_OUT)
-	$(if $(CONFIG_MODEM_PRO_QUECTEL),$(call cc_dialer,$(TP)/quectel-cm,$(QUECTEL_SRC),$(DL_OUT)/quectel-CM,-lpthread -ldl -lrt,))
-	$(if $(CONFIG_MODEM_PRO_FIBOCOM),$(call cc_dialer,$(TP)/fibocom-dial/src,$(FIBOCOM_SRC),$(DL_OUT)/fibocom-dial,-lpthread -ldl,-DGHT_FEATURE_PCIE_AUTO -std=gnu89))
-	$(if $(CONFIG_MODEM_PRO_MEIG),$(call cc_dialer,$(TP)/meig-cm/src,$(MEIG_SRC),$(DL_OUT)/meig-cm,-lpthread -ldl,))
-	$(if $(CONFIG_MODEM_PRO_SIMCOM),$(call cc_dialer,$(TP)/simcom-cm/src,$(SIMCOM_SRC),$(DL_OUT)/simcom-cm,-lpthread,))
 endef
 
 define Package/modem-pro/install
@@ -178,17 +128,9 @@ define Package/modem-pro/install
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/bin/modemd $(1)/usr/bin/modemd
 
-	# 厂商拨号器（按开关裁剪）
-	$(INSTALL_DIR) $(1)/usr/lib/modemd
-	$(if $(CONFIG_MODEM_PRO_QUECTEL),$(INSTALL_BIN) $(DL_OUT)/quectel-CM $(1)/usr/lib/modemd/quectel-CM)
-	$(if $(CONFIG_MODEM_PRO_FIBOCOM),$(INSTALL_BIN) $(DL_OUT)/fibocom-dial $(1)/usr/lib/modemd/fibocom-dial)
-	$(if $(CONFIG_MODEM_PRO_MEIG),$(INSTALL_BIN) $(DL_OUT)/meig-cm $(1)/usr/lib/modemd/meig-cm)
-	$(if $(CONFIG_MODEM_PRO_SIMCOM),$(INSTALL_BIN) $(DL_OUT)/simcom-cm $(1)/usr/lib/modemd/simcom-cm)
-
 	# netifd 协议
 	$(INSTALL_DIR) $(1)/lib/netifd/proto
 	$(INSTALL_BIN) $(CURDIR)/files/lib/netifd/proto/modem_pro.sh $(1)/lib/netifd/proto/modem_pro.sh
-	$(INSTALL_BIN) $(CURDIR)/files/lib/netifd/proto/quectel.sh $(1)/lib/netifd/proto/quectel.sh
 	$(INSTALL_DIR) $(1)/usr/lib/modem-pro
 	$(INSTALL_BIN) $(CURDIR)/files/usr/lib/modem-pro/mp-client.sh $(1)/usr/lib/modem-pro/mp-client.sh
 

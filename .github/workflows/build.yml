@@ -191,10 +191,6 @@ jobs:
           cat >> .config <<'EOF'
           CONFIG_PACKAGE_modem-pro=y
           CONFIG_MODEM_PRO_HOST_RUST=y
-          CONFIG_MODEM_PRO_QUECTEL=y
-          CONFIG_MODEM_PRO_FIBOCOM=y
-          CONFIG_MODEM_PRO_MEIG=y
-          CONFIG_MODEM_PRO_SIMCOM=y
           EOF
           grep -E "^CONFIG_PACKAGE_modem-pro=|^CONFIG_MODEM_PRO_HOST_RUST=" .config
 
@@ -228,7 +224,7 @@ jobs:
           PKG_DIR="$FEED_DIR/modem-pro"
           rm -rf "$GITHUB_WORKSPACE/.ci-feed"
           mkdir -p "$PKG_DIR"
-          for item in Makefile rust third_party luci files packaging VERSION; do
+          for item in Makefile rust luci files packaging VERSION; do
             [ -e "$GITHUB_WORKSPACE/$item" ] && cp -r "$GITHUB_WORKSPACE/$item" "$PKG_DIR/$item"
           done
           # 清掉可能混入的 Rust/内核模块构建产物 target/（体积爆炸 + 平台残留会污染 feed 索引）

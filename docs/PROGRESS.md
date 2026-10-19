@@ -43,9 +43,9 @@
 | 3 | 写操作域接口 | ✅ 完成 | ~100%（流量配额、短信、参数与开关、IMEI 写、重启/校时、锁网写、AT 直发域、拨号域、定时器、USB/PCIe 绑定、atport 绑定均已完成） |
 | 4 | WebSocket 全量推送 | ✅ 完成 | 100%（握手 + snapshot + 各面板推送函数齐备；写操作成功后顺手广播；短信推送过密码闸门） |
 | 5 | 后台循环（采样 / 配额 / 定时 / 热插拔 / 组网 / 微信 / 历史） | ✅ 完成 | 100%（push / traffic / quota / change / hotplug / sim / logs / **urc** / **netprov** 九类循环已接线；SIM 热插拔巡检含换卡清短信缓存，且 `+GTSIM` / 注册态 URC 可把巡检加速到下一拍；**自动组网 netprov 已完成**（§23）、**企业微信推送已完成**（§24）；`+CUSD` 应答直接推页面、`+CMTI` 触发一次短信重读（§21 / §22）） |
-| 6 | 拨号器托管（hostdial + udhcpc） | ✅ 完成 | 100%（外部：按厂商启停拨号器、按进程树收起连 udhcpc、退出自动重试；`/api/dial/connect` 对 QMI/MBIM 从「拒绝」改为「交办」。原生：Rust QMI 拨号器（`host_dial_bin=native`，见 §31.2）。**验证缺口**：外部四家的命令行没在真机跑过（§25）；原生 QMI 的线协议有单测、数据呼叫缺 QMI 真机） |
+| 6 | 内置拨号（QMI / MBIM / QMAP） | ✅ 完成（代码）/ ⚠️ 真机待验证 | 100% 代码面：控制口反查（cdc-wdm / GobiQMI / mhi_QMI）、QMI WDS、MBIM Basic Connect、QMAP `WDA Set Data Format` + `Bind Mux`、掉线重拨与 5s 退避；`/api/dial/connect` 对 QMI/MBIM 从「拒绝」改为「交办」。**验证缺口**：线协议有 golden-bytes 单测，数据呼叫缺 QMI/MBIM/PCIe 真机（测试机 FM350 为 ECM，无控制口） |
 
-量化的工程指标（可作为「没跑偏」的自检）：`cargo build` **零告警**、`cargo test` **575 项全绿**、
+量化的工程指标（可作为「没跑偏」的自检）：`cargo build` **零告警**、`cargo test` **570 项全绿**、
 已迁移接口在实机上返回 **HTTP 200** 的统一信封。
 
 ---
@@ -63,11 +63,11 @@
 ## 4. 仓库结构
 
 ```
-Makefile              顶层单包构建（接入 feeds/packages/lang/rust/rust-package.mk）
-Config.in             MODEM_PRO_{QUECTEL,FIBOCOM,MEIG,SIMCOM} 拨号器裁剪开关
+Makefile              顶层单包构建（接入 feeds/packages/lang/rust/rust-package.mk；
+                      包内 config 只剩 MODEM_PRO_HOST_RUST）
 VERSION               版本单一来源（1.0.0-1）；打包注入 MODEMD_VERSION（未注入为 "dev"）
 LICENSE               MIT
-.gitattributes        强制 LF；third_party/** -text
+.gitattributes        强制 LF
 .gitignore            /rust/target/、*.ipk、构建产物、/legacy-go/
 rust/                 Rust 后端 modemd
   Cargo.toml          依赖：serde/serde_json/toml/tiny_http/serialport/log(必须 std+alloc)/ctrlc/sha1/base64
@@ -95,9 +95,8 @@ rust/                 Rust 后端 modemd
 luci/                 LuCI 前端：ucode/JS 世代（JS 视图/ucode 控制器/菜单/ACL/协议 JS）
 files/                安装到设备的文件
   etc/modemd/config.toml          默认配置（conffile，UTF-8）
-  lib/netifd/proto/{modem_pro.sh,quectel.sh}
+  lib/netifd/proto/modem_pro.sh
   usr/lib/modem-pro/mp-client.sh
-third_party/          四家拨号器 C 源码（不改动、可裁剪）
 packaging/            init.d/modemd、control/{postinst,prerm,postrm}
 docs/                 API / BUILD / INTEGRATION / PORTING / HANDOFF / PROGRESS(本文件) / example-config
 legacy-go/            （本地参考副本，**不在版本控制内**，不构建不推送）
@@ -2095,7 +2094,7 @@ sh scripts/check-desensitize.sh   # 退出码 0 = 干净
 ```
 
 - 扫 `*.rs / *.md / *.toml / *.sh / *.html / *.js / *.json / *.uc`；
-- 跳过 `.git`、`rust/target`、`third_party`（上游原样代码）、`scripts`（自带规则）；
+- 跳过 `.git`、`rust/target`、`scripts`（自带规则）；
 - 拦五类：历史实机网段、运营商 IPv6 前缀、非文档段公网 IPv4、凭据/穿透域名、真实手机号；
 - 公网 IPv4 逐段判 `<=255`（避开 `999.1.1.1` 这类脏值误报），并排除点分 16 段的 IPv6 形态。
 
@@ -2409,6 +2408,63 @@ gnu89 模式下上述两类都不再是错误，**一个开关同时解决两类
    24.10 通道不回归。
 
 **文档**：`third_party/fibocom-dial/SOURCE.md` 的「要加的开关」表按上述实测修正。
+
+---
+
+## 41. 彻底移除 third_party：拨号全内化（2026-10-19）
+
+上一轮（§35）把 QMI/MBIM 两条线协议内化，但**默认路径仍调外部二进制**，仓库里还留着
+4.9M 的 `third_party/`（四家拨号器 + 8 个内核模块）。本轮把它删干净，并把缺失的能力补齐。
+
+### 41.1 删了什么
+
+| 对象 | 体积 | 处置 |
+| --- | --- | --- |
+| `third_party/kmods/`（8 个厂商驱动 + ndisc6） | 2.4M / 133 文件 | 直接删除：Makefile 从未引用，README 自述「不随包发布」 |
+| `third_party/{quectel-cm,fibocom-dial,meig-cm,simcom-cm}` | 2.5M / 143 文件 | 删除；对应能力在 Rust 内实现（见 §41.2） |
+| `files/lib/netifd/proto/quectel.sh` | — | 删除：它是 quectel-CM 的 netifd 包装，二进制没了就是死代码 |
+| `rust/src/runtime/dialer/proc.rs` | 321 行 | 删除：只服务于外部进程托管 |
+| `vendor::dialer_bin()`（trait + 4 处实现 + 调用点） | — | 删除：不再有「按厂商标选二进制」 |
+
+### 41.2 补了什么
+
+| 能力 | 位置 | 依据 |
+| --- | --- | --- |
+| QMAP `WDA Set Data Format`（TLV 0x10/0x11/0x12/0x13/0x15/0x16/0x17） | `dialer/qmi.rs::wda_set_data_format` | quectel-CM `QMIThread.c::WdaSetDataFormat()`（未开 `QUECTEL_UL_DATA_AGG`，故不发 0x19/0x1B/0x1C） |
+| `WDS Bind Mux Data Port`（TLV 0x10/0x11/0x13） | `dialer/qmi.rs::wds_bind_mux` | 同上 `WdsSetQMUXBindMuxDataPort()`；v4/v6 各绑一次 |
+| mux id 规则：单承载 `0x81`，多承载 `PDN + 0x80` | `native/mod.rs::qmap_settings` | `qmap_bridge_mode.c` 的 `muxid = pdp + 0x80` |
+| 端点类型：USB `DATA_EP_TYPE_HSUSB(2)` / PCIe `(3)` | `qmi::QmapSettings::{usb,pcie}` | `QMIThread.c` 的 `qmap_settings` 赋值 |
+| 聚合窗口：`qmap_size` sysfs，缺省 16 KiB | `native/mod.rs::qmap_size` | `qmap_bridge_mode.c` 的 `qmap_size` 回退 |
+| 控制口发现：`cdc-wdm` / `GobiQMI` / `mhi_QMI` | `native/mod.rs::find_control` | 三种驱动各自的 sysfs 布局 |
+| GobiNet 跳过 WDA | `ControlKind::handles_data_format` | `GobiNetCM.c`：「set data format in GobiNet Driver」 |
+| MBIM 对所有厂商可用（不再依赖 `mbim-cm.c`） | `vendors::supports` | MBIM Basic Connect 是标准协议 |
+| 默认 `host_dial_bin = "native"`；旧值忽略并告警一次 | `config/net.rs`、`dialer/mod.rs::warn_legacy_bin_once` | — |
+
+### 41.3 为什么敢默认切
+
+- 线协议有 golden-bytes 与真实布局断言（QMI 13 字节头、WDA TLV 顺序、MBIM 48 字节命令头）；
+- `cargo test` **570 项全绿**、`cargo clippy --all-targets` 零告警、`cargo build` 零告警；
+- 切换后**接口形态不变**：地址/DNS/默认路由仍由 netifd 的 `proto=modem_pro` 取，
+  内置后端只做「数据呼叫生命周期」，与外部拨号器的职责边界一致。
+
+### 41.4 仍然缺的（唯一风险）
+
+**真机验证**。测试机 FM350 / RW350 是 RNDIS/ECM，没有控制口，所以：
+
+- QMAP 的 `Set Data Format` + `Bind Mux` 只有单测，没在 qmi_wwan_q/f 上跑过；
+- MHI/GobiNet 的控制口反查没有对应硬件；
+- MBIM 的 `CONNECT` / `IP_CONFIGURATION` 只有布局单测。
+
+需要的验证矩阵：**QMI 非 QMAP（如 EC20）→ QMI QMAP（RM500Q/FM160）→ MBIM（FM150）→ PCIe MHI**。
+每张卡看四件事：`wwan0` / `wwan0_1` 是否 up、`udhcpc` 能否拿到地址、`ping -I` 是否通、
+拔插后能否自动重拨。
+
+### 41.5 迁移提示
+
+- 升级后 `/usr/lib/modemd/` 会消失；旧配置里的 `host_dial_bin = "quectel-CM"` 等值
+  不会报错，只会告警一次并按内置实现跑；
+- `proto=quectel` 的旧接口不再可用（`quectel.sh` 已删），请改用 `proto=modem_pro`；
+- 内核驱动（`qmi_wwan_q/f`、`GobiNet`、`pcie_mhi`）本来就不随包发布，仍由固件提供。
 
 ---
 

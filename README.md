@@ -1,7 +1,8 @@
 # modem-pro
 
 OpenWrt 上统一管理 **5G/LTE 模组**（移远 Quectel、广和通 Fibocom、美格 Meig、芯讯通 SIMCom）
-的单一软件包：一个 Rust 守护进程 `modemd` + 四家主机侧拨号器 + netifd 协议 + LuCI 前端。
+的单一软件包：一个 Rust 守护进程 `modemd`（**内置 QMI / MBIM 拨号**，含 QMAP 绑 mux）
++ netifd 协议 + LuCI 前端。
 
 > 本仓库由原先分离的两个工程合并而成：LuCI 前端插件与模组后端。现在是一个仓库、一个包、一份版本号。
 
@@ -9,8 +10,7 @@ OpenWrt 上统一管理 **5G/LTE 模组**（移远 Quectel、广和通 Fibocom�
 
 | 目录 | 内容 |
 | --- | --- |
-| `rust/` | `modemd` 守护进程（Rust，按功能域细分模块）+ 内置调试台页面 |
-| `third_party/` | 四家厂商主机侧拨号器源码与内核模块源码 |
+| `rust/` | `modemd` 守护进程（Rust，按功能域细分模块）+ 内置调试台页面；`runtime/dialer/` 是 QMI/MBIM 拨号实现 |
 | `files/` | netifd 协议脚本、默认 `config.toml`、mp-client wrapper |
 | `luci/` | LuCI 前端：协议 JS、控制器、i18n、视图、菜单、ACL |
 | `packaging/` | init 脚本与安装/卸载脚本 |

@@ -1,6 +1,6 @@
 //! 美格智能 MeiG：MBIM 优先，QMI 备选。
 //!
-//! 依据 `third_party/meig-cm`：带 `mbim-cm.c` 且默认流程走 MBIM；
+//! 依据上游 meig-cm（原 `third_party/meig-cm`）：带 `mbim-cm.c` 且默认流程走 MBIM；
 //! QMI 通过 `meig-qmi-proxy.c` 转发（协议仍是标准 QMI，但多一层代理）。
 //! 所以首选 MBIM，QMI 作为兼容路径。
 //!

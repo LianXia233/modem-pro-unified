@@ -40,7 +40,7 @@
    `+CMTI` 触发一次短信重读（见 `PROGRESS.md` §21 / §22）。
    USB 热插拔推送、~~组网（netprov）~~（已完成，见 §23）、~~企业微信~~（已完成，见 §24）待补。
    （~~主机网卡 `/api/host/nic*`~~ 已完成，见 `PROGRESS.md` §28。）
-6. **拨号器托管**：`hostdial`（按厂商启动/回收拨号器进程，含 udhcpc）—— ✅ 已完成，见 `PROGRESS.md` §25。
+6. **内置拨号**：`hostdial`（QMI/MBIM 数据呼叫、QMAP 绑 mux、掉线重拨）—— ✅ 已完成，见 `PROGRESS.md` §25 / §41。
 
 ---
 
@@ -97,8 +97,8 @@
 | [x] | POST | `/api/dial/enable`（`{on}`） | 拨号总开关：写回 `[net] dial_enabled` 并即时生效（缺 `on` 报错） |
 | [x] | POST | `/api/dial/mode`（`{mode}`） | WAN 模式（modem_pro / dhcp / both）：写回 `[net] wan_mode` + Label + 全量列表 |
 | [x] | POST | `/api/dial/ipv6`（`{on}`） | IPv6 开关：写回 `[net] wan_ipv6` 并即时生效（缺 `on` 报错） |
-| [x] | POST | `/api/dial/connect`（`{modem_id,cid,apn,pdp_type,reconnect,force}`） | AT 拨号（ECM/RNDIS/NCM 等）：写 APN → 激活 PDP → 激活 IMS → 读本机地址；QMI/MBIM **不发** `AT+CGACT`（会占掉拨号器的唯一数据承载），改为把 APN 落到状态、由组网循环拉起 modemd 托管的厂商拨号器（`runtime/dialer/`，见 `PROGRESS.md` §25）；失败也回 `DialState` |
-| [x] | POST | `/api/dial/disconnect`（`{modem_id,cid}`） | `AT+CGACT=0,<cid>` + 回读确认；QMI/MBIM 先按进程树停掉托管中的拨号器（连 udhcpc）再重置状态 |
+| [x] | POST | `/api/dial/connect`（`{modem_id,cid,apn,pdp_type,reconnect,force}`） | AT 拨号（ECM/RNDIS/NCM 等）：写 APN → 激活 PDP → 激活 IMS → 读本机地址；QMI/MBIM **不发** `AT+CGACT`（会占掉拨号器的唯一数据承载），改为把 APN 落到状态、由组网循环让 `modemd` 内置拨号建会话（`runtime/dialer/`，见 `PROGRESS.md` §25 / §41）；失败也回 `DialState` |
+| [x] | POST | `/api/dial/disconnect`（`{modem_id,cid}`） | `AT+CGACT=0,<cid>` + 回读确认；QMI/MBIM 先拆掉内置会话（Stop / 去激活并释放 client id）再重置状态 |
 | [x] | GET | `/api/usbnet`（`?refresh=1`） |
 | [x] | POST | `/api/usbnet/set`（`{value}`，仅移远/美格可写；广和通 RNDIS 不允许执行） |
 | [x] | GET | `/api/host/nic`（前端面板已下线、接口保留：FM350 这类机型要靠它手工配主机网卡） |
@@ -207,7 +207,7 @@ SIM 热插拔事件（`sim`，并清短信缓存后补推空 `sms` + `smscount`�
 ## 关键约束（真机经验，迁移时必须保留）
 
 - netifd 协议名固定 `modem_pro`（连字符会导致 shell 函数名非法）。
-- 四家拨号器 **不可互相顶替**（QMI 初始化序列不同）。
+- QMAP 模组必须发 WDA `Set Data Format` 并 `Bind Mux`（否则数据口永远 NO-CARRIER）。
 - `AT+CMGL` 会把未读标已读 ⇒ `/api/sms/read` 有副作用，前端口径依赖此行为。
 - `/api/sms/storage` 同路径 GET（读用量）/ POST（切存储区）。
 - 波动记录 / 采样历史只在**进程内环形缓冲**（波动 500 条、每模组 1800 段），不落盘；

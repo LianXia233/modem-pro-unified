@@ -22,10 +22,6 @@ impl VendorSpec for Spec {
         any_line(lines, &["FIBOCOM", "FM650", "RW350"])
     }
 
-    fn dialer_bin(&self) -> &'static str {
-        "fibocom-dial"
-    }
-
     fn net_info_cmd(&self) -> &'static str {
         "AT+QNWINFO"
     }

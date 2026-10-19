@@ -3,12 +3,12 @@
 //! 外部二进制（`third_party/{quectel-cm,fibocom-dial,meig-cm,simcom-cm}`）的
 //! 数据面协议基本同源（QMI 的 `QMIThread.c`、MBIM 的 `mbim-cm.c`），真正的差异只有：
 //!
-//! | 厂商 | 数据面 | 差异点 |
+//! | 厂商 | 首选数据面 | 差异点 |
 //! | --- | --- | --- |
-//! | Quectel | QMI + MBIM | 有 `mbim-cm.c`；支持 QMAP / GobiNet；`-d` 走 QMI 取地址 |
-//! | Fibocom | 仅 QMI | 无 `mbim-cm.c`；multi-pdn（`-m/-n/-N`）；PCIe 模式另判 |
-//! | MeiG | MBIM 优先 | `meig-cm` 主打 MBIM，QMI 走 `meig-qmi-proxy` |
-//! | SIMCom | 仅 QMI | 无 MBIM；参数最简（`-s / -p / -f`） |
+//! | Quectel | QMI | 支持 QMAP / GobiNet；MBIM 也认 |
+//! | Fibocom | QMI | multi-pdn（`-m/-n/-N`）；PCIe 模式另判 |
+//! | MeiG | MBIM | `meig-cm` 主打 MBIM，QMI 走 `meig-qmi-proxy` |
+//! | SIMCom | QMI | 参数最简（`-s / -p / -f`） |
 //!
 //! 所以「四家模块」不该复制四份 QMI/MBIM 实现，而是各自声明
 //! **支持哪些链路、优先级、以及少数开关**；协议实现在
@@ -18,7 +18,12 @@
 //! - 协议修一次，四家同时受益；
 //! - 谁支持什么一眼可查（`links()`），不会出现「给 SIMCom 发 MBIM 命令」这种错。
 //!
-//! 原生后端**只碰 `cdc-wdm`**，不发 AT：AT 通道归 `modem/at` 与各厂商
+//! ⚠️ **MBIM 现在是协议标准，不再看厂商**：过去 MBIM 一律交给 quectel-CM
+//! （因为只有它实现了 `mbim-cm.c`）；改成原生后端后，[`super::mbim_link`]
+//! 对任何厂商都用同一套 MBIM Basic Connect，所以 [`supports`] 对 MBIM 恒定
+//! 为真。`Caps.links` 里剩下的差异只表示**首选**链路。
+//!
+//! 原生后端**只碰控制口**，不发 AT：AT 通道归 `modem/at` 与各厂商
 //! `VendorSpec` 管（两条通道抢同一个串口的代价比省几条 AT 大得多）。
 
 pub mod fibocom;
@@ -83,8 +88,14 @@ pub const UNKNOWN: Caps = Caps {
 };
 
 /// 这家厂商在这个链路类型上能不能拨。
+///
+/// MBIM 是 3GPP/行业标准（Basic Connect），原生实现与厂商无关 ⇒ 恒定可用。
+/// QMI 才看厂商策略：未识别厂商按保守的「只 QMI」处理。
 pub fn supports(vendor: Vendor, link: DataLink) -> bool {
-    select(vendor).links.contains(&link)
+    match link {
+        DataLink::Mbim => true,
+        DataLink::Qmi => select(vendor).links.contains(&link),
+    }
 }
 
 #[cfg(test)]
@@ -110,16 +121,21 @@ mod tests {
 
     #[test]
     fn vendor_differences_match_reference_sources() {
-        // quectel-cm 有 mbim-cm.c ⇒ 支持 MBIM
+        // quectel-cm 有 mbim-cm.c ⇒ QMI 主线、MBIM 备选
         assert!(supports(Vendor::Quectel, DataLink::Mbim));
         // meig-cm 有 mbim-cm.c 且主打 MBIM ⇒ 首选 MBIM
         assert_eq!(select(Vendor::Meig).links[0], DataLink::Mbim);
         assert!(supports(Vendor::Meig, DataLink::Qmi), "QMI 走 proxy 仍可用");
-        // fibocom-dial / simcom-cm 只有 QMI（没有 mbim-cm.c）
-        assert!(!supports(Vendor::Fibocom, DataLink::Mbim));
-        assert!(!supports(Vendor::Simcom, DataLink::Mbim));
+        // fibocom-dial / simcom-cm 只有 QMI 实现 ⇒ QMI 是首选；
+        // 但 MBIM 是协议标准，原生后端对任何厂商都实现，不能因此拒绝
         assert_eq!(select(Vendor::Fibocom).links[0], DataLink::Qmi);
         assert_eq!(select(Vendor::Simcom).links[0], DataLink::Qmi);
+        for v in [Vendor::Fibocom, Vendor::Simcom, Vendor::TDTech, Vendor::Unknown] {
+            assert!(
+                supports(v, DataLink::Mbim),
+                "{v:?} 的 MBIM 不该被厂商策略挡住（原生实现与厂商无关）"
+            );
+        }
     }
 
     #[test]

@@ -20,7 +20,7 @@
 
 1. 路由、方法、JSON 契约与原后端**逐字对齐**，前端 `rust/web/index.html` / `mini.html` **不改也能跑**；
 2. 依赖关系、包名、版本号统一（单一来源 `VERSION`）；
-3. OpenWrt SDK / feeds 下可编译、可安装、四家拨号器可裁剪。
+3. OpenWrt SDK / feeds 下可编译、可安装；拨号全部由 `modemd` 内置实现，无外部二进制。
 
 > 迁移参照副本仅作**本地参考**，已从版本控制移除、不参与构建，也不推送到远端
 > （见第 6 节「交接注意事项」）。
@@ -40,7 +40,7 @@
 | 3 | 写操作域 | ✅ 完成 | 已完成：流量配额、短信、参数与开关（`params/apn|pdp|netselect`、`mode/set`、`usbnet/set`、`airplane/set`、`roam/set`）、`imei(set/restore)`、`modem(reset/clock)`、`lock(band/cell/mode/unlock)`、`at`(发/port/presets)、`changes/clear`、`dial`(connect/disconnect/enable/mode/ipv6 + GET)、`schedule`(GET + set/delete/toggle/run)、usb/pcie/atport 绑定 |
 | 4 | WebSocket 推送 | ✅ 完成 | 握手 + `snapshot` + 各面板 `push_*` 全部接线；写操作成功后顺手广播（cells / lock / sms+smscount / quota / traffic / ussd）；短信推送过密码闸门（带令牌才收 `sms`，`smscount` 不过闸门） |
 | 5 | 后台循环 | ✅ 完成 | push / traffic / quota / change / hotplug / sim / logs / **urc** / **netprov** 九类循环已接线（SIM 巡检 2s 一拍、到点或 URC 置脏才发 AT；换卡清短信缓存并补推空 `sms`+`smscount`；**urc 循环**消费 `at/urc.rs` 暂存的主动上报，折算成「SIM / 网络 / 短信置脏」并把巡检加速到下一拍，`+CUSD` 直接推页面、`+CMTI` 触发一次短信重读，见 `PROGRESS.md` §21 / §22；**netprov 自动组网**见 §23、**企业微信推送**见 §24） |
-| 6 | 拨号器托管 | ✅ 已完成 | `hostdial`：按厂商启停拨号器进程（含 udhcpc），QMI/MBIM 的数据呼叫由它接管；`/api/dial/connect` 对这两类已从「拒绝」改为「委托」（见 `PROGRESS.md` §25）。**实机未验证**：四家拨号器的命令行参数没在真机跑过（源码在 `third_party/`，参数集中在 `runtime/dialer/mod.rs::plan_dialer`） |
+| 6 | 内置拨号 | ✅ 已完成（代码）/ ⚠️ 真机待验证 | `hostdial`：QMI/MBIM 数据呼叫由 `modemd` 内置实现（含 QMAP 绑 mux）；`/api/dial/connect` 对这两类从「拒绝」改为「委托」（见 `PROGRESS.md` §25）。**QMI/MBIM 真机均未验证**：测试机为 FM350（ECM，无控制口） |
 
 ### 2.1 只读域明细
 
@@ -83,14 +83,12 @@
 
 ```
 Makefile            顶层单包构建（含 rust-package.mk 接入、Cargo.lock 锁定；
-                    拨号器裁剪开关 MODEM_PRO_{QUECTEL,FIBOCOM,MEIG,SIMCOM} 内联在
-                    Package/modem-pro/config 块，生成 CONFIG_MODEM_PRO_* 符号）
+                    包内 config 只剩 MODEM_PRO_HOST_RUST）
 VERSION             版本单一来源；打包注入 MODEMD_VERSION
 rust/               Rust 后端（modemd）：http / modem / config / logging / ubus / runtime
   └ web/            静态调试台（index.html / mini.html，编译期嵌入）
 luci/               LuCI 前端：ucode/JS 世代（JS 视图 / ucode 控制器 / menu.d / ACL / 协议 JS）
 files/              安装到设备的文件：netifd 协议、mp-client 等
-third_party/        四家拨号器 C 源码（不裁剪不改动）
 packaging/          init.d / control 脚本
 docs/               INTEGRATION / BUILD / API / PORTING / PROGRESS / HANDOFF（本文件）
 ```
@@ -108,15 +106,16 @@ docs/               INTEGRATION / BUILD / API / PORTING / PROGRESS / HANDOFF（�
    WS 侧同款闸门，另有短信令牌 `sms_token`；`/display/ws` 免密固定 key `h29k-tft-9f3c1a7b`。
 3. **同端口 WebSocket**：前端硬编码 `location.host + /ws`，而 `tiny_http` 不支持协议升级 ⇒
    必须保留自建 TCP 网关（`http/gateway.rs`）+ 升级处理（`http/ws.rs`）。
-4. **命名**：包名 `modem-pro`；二进制 `/usr/bin/modemd`；拨号器
-   `/usr/lib/modemd/{quectel-CM,fibocom-dial,meig-cm,simcom-cm}`；netifd 协议名
-   **`modem_pro`**（连字符在 shell 函数名非法）。
+4. **命名**：包名 `modem-pro`；二进制 `/usr/bin/modemd`（QMI/MBIM 内置拨号，
+   不再有 `/usr/lib/modemd/` 下的厂商二进制）；netifd 协议名 **`modem_pro`**
+   （连字符在 shell 函数名非法）。
 5. **配置**：`/etc/modemd/config.toml`（conffile）。
 6. **构建**：`feeds/packages/lang/rust/rust-package.mk`；`RUST_PKG_LOCKED` 默认 1 ⇒ **必须提交
    `rust/Cargo.lock`**；`log` 依赖须带 `features=["std","alloc"]`。
 7. **行尾**：`.sh/.lua/.htm/.uc/.js/.json/.toml/.mk/.rs` 一律 **LF**（CRLF 会导致 BusyBox/procd 启动失败）；
-   `.gitattributes` 已强制，`third_party/**` 保留原样。
-8. **真机口径**：四家拨号器不可互相顶替；`AT+CMGL` 有「标已读」副作用；
+   `.gitattributes` 已强制。
+8. **真机口径**：QMAP 模组必须发 WDA `Set Data Format` 并 `Bind Mux`（否则数据口永远
+   NO-CARRIER）；`AT+CMGL` 有「标已读」副作用；
    `/api/sms/storage` 同路径 GET 读 / POST 切；一个 AT 口 = 一个模组；
    AT 解析按量纲定位（`+CESQ` 换算、`+QENG` NR/LTE 下标、Fibocom SSB 扩展等）不得回退。
 9. **短信密码闸门**：`require_luci_login` 开启 / `sms_password_required=false` / `sms_password`
@@ -197,9 +196,11 @@ cargo test           # 当前 575 项全通过
    ~~厂商模块拆分（`modem/vendor/<厂商>.rs` + `VendorSpec` 统一接口）~~
    **已完成**（见 §31.1，调用方只问 `vendor.spec()`）；
    ~~Rust 原生 QMI 拨号器（`[net] host_dial_bin = "native"`）~~
-   **已完成**（见 §31.2；线协议有单测，**QMI 真机未验证**，默认仍用厂商二进制）；
+   **已完成**（见 §31.2；线协议有单测，**QMI 真机未验证**）；
    ~~四家拨号器 Rust 重构（QMI + MBIM 双协议 + `native/vendors/` 四模块）~~
    **已完成**（见 §35；MBIM 线协议有真实布局单测，**MBIM 真机未验证**）；
+   ~~彻底去 C 依赖（删除 `third_party/`、默认 `host_dial_bin=native`、补 QMAP/MHI/GobiNet）~~
+   **已完成**（见 §41；**真机验证仍是唯一缺口**）；
    ~~厂商方言 6 家 → 14 家~~ **已完成**（见 §36；8 家新增，未取证的项明确留空）；
    ~~仓库脱敏 + 守门脚本~~ **已完成**（见 §34 与 `docs/PRIVACY.md`）；
    ~~NTP 时间同步（自带 SNTP + 时区 + 三段退避 + `/api/ntp*` + 概览页卡片）~~
@@ -215,9 +216,8 @@ cargo test           # 当前 575 项全通过
    芯讯通 `AT+CSYSSEL` 频段写的分隔符与解锁写法（当前拒绝盲写）、
    **鼎桥 `AT^SYSCFGEX` 与展锐 `AT+SP5GRAN` 组网模式的写路径**（代码已实现、未经真机）、
    拨号域在 ECM/RNDIS/NCM 真机上的完整链路（虚拟串口已验证，尚缺实机）、
-   **拨号器托管在真机上的拉起与回收**（源码在 `third_party/`，命令行参数未在真机核对，
-   集中在 `runtime/dialer/mod.rs::plan_dialer`；进程树回收的 `/proc` 解析已在 Windows 上
-   用本进程验证过，未在设备上验证）、
+   **内置 QMI/MBIM 拨号在真机上的数据面**（QMAP / 非 QMAP / MBIM / PCIe-MHI 四种形态，
+   控制口反查与 WDA 绑 mux 无实机；线协议只有 golden-bytes 单测）、
    ~~定时任务在真机上的到点执行~~ **已验证**（2026-10-19，FM350-GL：本地 00:57 的任务
    在下一拍下发并记录 `last.ok=true`，槽位去重生效）；`AT+QNWLOCK="save_ctrl"` 写 NV 仍缺实机、
    USB 热插拔补驱动与 PCIe 复位/绑驱动在真机上的表现（sysfs 逻辑已实现，尚缺实机）。

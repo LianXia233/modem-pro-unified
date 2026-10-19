@@ -77,9 +77,8 @@ hotswap_reset = false
 #      ★ 默认模式下 **qmi / ecm / ncm / rndis / mbim / 未知类型 一律用 modem_pro**
 #        （旧版只有一个 case "qmi"，其它类型都落在 dhcp 上、再被配上 modem<N>_6 ——
 #         用户看到的就是"只有 qmi 会切成一张，其它都是两个接口"）。
-#      ★ MBIM 也不再例外（用户 2026-10-13）：它的会话建立改由 modemd 托管的 quectel-CM 做
-#        （只有它实现了 MBIM；fibocom-dial / simcom-cm 源码里压根没有，meig-cm 有文件没接上），
-#        接口就跟其它类型一样是一张 modem<N>。
+#      ★ MBIM 也不再例外（用户 2026-10-13）：它的会话建立由 modemd 内置的 MBIM 拨号
+#        （Basic Connect）完成，接口就跟其它类型一样是一张 modem<N>。
 #      ⚠️ 只有把下面的 host_dial 关掉时，MBIM 才会退回 proto=mbim
 #        （那时没人拨号，只能靠 netifd 的 mbim.sh / umbim）。
 # 不做这些，新插上的模组拿不到地址、上不了网（每次都要去 LuCI 手工建接口）。
@@ -93,7 +92,7 @@ auto_wan = true
 #                           QMI 的数据呼叫仍由主机侧拨号器做（见下面的 host_dial）。
 #   "both"                —— 两种都要：modem<N>(modem_pro) + modem<N>_6(dhcpv6)。
 # ★ 三种模式下 **qmi / ecm / ncm / rndis / mbim / 未知类型 一律 modem_pro**（不再只认 QMI，
-#   也不再有 MBIM 例外 —— MBIM 的会话建立改由 modemd 托管的 quectel-CM 做，见下面 host_dial）。
+#   也不再有 MBIM 例外 —— MBIM 的会话建立由 modemd 内置拨号器做，见下面 host_dial）。
 # 认不出的值（含不写这一项）一律按 modem_pro 处理，配置写错不会让网络换形态。
 # 切换后由组网循环（≤15 秒一轮）就地生效：改主接口的 proto、按需补/删 modem<N>_6，
 # 并同步 /etc/firewall.user 里那段 v6 规则（模式 modem_pro 下整段收掉，
@@ -111,52 +110,34 @@ wan_mode = "modem_pro"
 #    同理，「可写参数」页写 APN 后**不自动激活 PDP**（只写配置）、手动「激活 PDP」会被拒——
 #    承载得留给拨号器；要上网请用「拨号上网」，拨号器会把 IPv4/IPv6 一起建好。
 auto_dial = true
-# QMI 的主机侧拨号器由 modemd 自己托管（默认开）：
-#   modemd 每轮组网循环把它拉起、看着、退出自动重试；模组拔了/手动断开就停掉；
-#   进程退出前按进程组一起收（连它起的 busybox udhcpc 一起），不留占着控制口的尾巴。
+# QMI / MBIM 的主机侧拨号由 modemd **内置实现**（默认开）：
+#   modemd 每轮组网循环拉起、探活、掉线重拨；模组拔了/手动断开就停掉；
+#   控制口按 sysfs 反查（cdc-wdm / GobiQMI / mhi_QMI），多模组不会串。
 # 关掉就只剩一张什么都不拨的空接口（除非你自己有别的拨号器）。
 host_dial = true
-# 拨号器可执行文件。留空 = 按模组厂商自动找（**四家各一份，不能互相顶替**）：
-#   移远 Quectel（EC20/RM500 等）      → quectel-CM   （源码 files/third_party/quectel-cm）
-#   广和通 Fibocom（FM150/FM350/FM650）→ fibocom-dial （源码 files/third_party/fibocom-dial）
-#   美格 MeiG（SRM815/SLM750）         → meig-cm      （源码 files/third_party/meig-cm）
-#   芯讯通 SIMCom（SIM7600/SIM8200）   → simcom-cm    （源码 files/third_party/simcom-cm/src）
-#   未识别 / 其它                      → quectel-CM
-# ★ **MBIM 一律用 quectel-CM（不管模组是哪家）**：只有它实现了 MBIM 那套
-#   （mbim-cm.c + SOFTWARE_MBIM；fibocom-dial / simcom-cm 里压根没有，meig-cm 有文件但没接上），
-#   而它认 MBIM 靠的是**标准 USB CDC 描述符**（与厂商无关）。
-#   ⚠️ MBIM 模式下 quectel-CM **必须有 APN**（没 `-s` 会直接 exit(-404)）；
-#      APN 取模组的 AT+CGDCONT?，或页面「拨号上网」里配过的那个。
-# 都先看 /usr/lib/modemd/，再看 /usr/bin、/usr/sbin。
-# ⚠️ QMAP 模组（移远 + 厂家 qmi_wwan_q，qmap_mode=1）会同时出现两张网卡：
-#    wwan0   父口（没有 IP）→ 拨号器的 -i、驱动属性
-#    wwan0_1 mux 数据口（地址在它上面）→ UCI 接口 modem<N>.device、netifd 的 DHCP、IPv6
-#    modemd 会自动分开处理（见 README「QMAP 模组」一节），不用手工配。
-# ⚠️ 拿别家的拨号器顶：真机实测 SIMCom 模组用 quectel-CM 会报 QMIType 11 has no
-#    clientID / QMUXError 0xe（那是高通/移远才有的 WDA 服务），拨不起来。
-#    四个拨号器都随包装在 /usr/lib/modemd/；想换成厂商自己给的更新版本，覆盖同路径或用
-#    这里指过去即可，不用重启（下一轮组网循环就会用新的）。
-# 指向不存在的路径会直接在页面/日志里报错（不会静默退回别的）。
-#
-# 2026-10-19 起还接受一个特殊值 "native"：用**本程序内置的 Rust QMI 拨号器**，
-# 不再依赖 third_party 里的 C 二进制（当前只接管 QMI；MBIM 仍交给 quectel-CM，
-# 只有它实现了 MBIM 那套）。原生后端会：
-#   · 从数据网卡 sysfs 反查 /dev/cdc-wdmN（多模组不会串）；
+# 拨号后端。**只剩内置一种实现**（2026-10-19 起厂商 C 拨号器已从仓库移除）：
+#   "native" / "rust" / "builtin" / 留空 —— 都表示用内置的 Rust QMI+MBIM 实现。
+# 旧配置里写 quectel-CM / fibocom-dial / meig-cm / simcom-cm 会**忽略并告警**
+# （那四个二进制不再随包安装，也没有替代的可执行文件）。
+# 内置后端会：
+#   · 从数据网卡 sysfs 反查控制口（cdc-wdm / GobiQMI / mhi_QMI，多模组不会串）；
 #   · 启动前把 qmi/raw_ip 置 Y；
-#   · CTL Sync → Get Client ID → WDS Start（v4 走 service 1、v6 走 0x11）；
-#   · 每轮组网循环用 Get Packet Service Status 探活，掉线立即重拨（失败退避 5 秒）；
-#   · 退出/断开时发 WDS Stop（带 start 返回的 handle），不留半开的承载。
-# ⚠️ 需要 cdc-wdm 控制口；FM350 / RW350 这类 RNDIS/ECM 模组不适用（它们不需要 QMI 拨号）。
-# ⚠️ 原生后端尚未在 QMI 真机上验证（测试机只有 FM350），默认仍为空 = 用厂商二进制。
-host_dial_bin = ""
-# 给厂家拨号器传的 `-n <pdn>`（QMAP 模组的 PDN / mux 序号）。默认 0 = 自动。
+#   · QMAP 模组先发 WDA Set Data Format，再把 v4/v6 两个 WDS client 绑到同一 mux；
+#   · QMI：CTL Sync → Get Client ID → WDS Start（v4 走 service 1、v6 走 0x11）；
+#     MBIM：OPEN → CONNECT → IP_CONFIGURATION；
+#   · 每轮组网循环探活，掉线立即重拨（失败退避 5 秒）；
+#   · 退出/断开时对称拆除，不留半开的承载。
+# ⚠️ FM350 / RW350 这类 RNDIS/ECM 模组不适用（没有 QMI 控制口，走模组侧 AT 拨号）。
+host_dial_bin = "native"
+# PDN / QMAP mux 序号。默认 0 = 自动：
 #   0  自动：先按**数据网卡名**反推（wwan0_1 → 1）；反推不到、但驱动是 QMAP 模式
-#      （/sys/class/net/<网卡>/qmap_mode = 1，厂家 qmi_wwan_q / qmi_wwan_f）时按默认承载传 1。
-#      实测 FM160-CN + qmi_wwan_f：不传它拨号器一直不 add_mux，父口 wwan0 永远 NO-CARRIER、
-#      没地址（netifd 的 DHCP 也拿不到）；传上 -n 1 立刻 link:1 并读回 IPv4 地址。
+#      （/sys/class/net/<网卡>/qmap_mode = 1，厂家 qmi_wwan_q / qmi_wwan_f）时按 1。
+#      QMAP 的 mux id = PDN + 0x80（PDN 1 → 0x81），单承载驱动固定 0x81。
+#      实测 FM160-CN + qmi_wwan_f：不绑 mux 时父口 wwan0 永远 NO-CARRIER、没地址；
+#      下发 Bind Mux(0x81) 后立刻 link:1 并读回 IPv4 地址。
 #   >0 强制用这个序号（比如 APN 配在 cid 3 上就写 3）。
-#   -1 永不传 -n（老行为：只按网卡名反推）。
-# 只影响 QMI 的厂家拨号器（quectel-CM / fibocom-dial / meig-cm）；simcom-cm 不认这个参数。
+#   -1 只按网卡名反推，不做 QMAP 兜底。
+# 同时作为 WDS Start 的 profile index 下发。
 host_dial_pdn = 0
 # 模组这一侧要不要用 IPv6（默认 true；页面上「拨号上网」那个开关写的就是它）。
 # 关掉 = 只走 IPv4：QMI / MBIM 不给拨号器加 -6、所有协议都不再建（并删掉已建的）
