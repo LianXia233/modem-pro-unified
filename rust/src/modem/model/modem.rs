@@ -229,11 +229,19 @@ impl Modem {
             p.command("AT+CMGF=0", t)?;
             let resp = p.command("AT+CMGL=4", t);
             let _ = p.command("AT+CMGF=1", t);
-            Ok(sms::parse_pdu_list(&resp?))
+            let resp = resp?;
+            // 一条短信都没有时 `AT+CMGL=4` 也是 `OK`：空列表不是错误，
+            // 只有固件明确回 ERROR 才算读失败（以前的写法把所有空列表都当错误，
+            // 页面因此显示「读取失败」，而不是「无短信」）。
+            let ok = super::super::at::is_ok(&resp);
+            if !ok && sms::parse_pdu_list(&resp).0.is_empty() {
+                return Err(crate::error::msg(format!(
+                    "PDU 模式读短信失败：{}",
+                    resp.trim()
+                )));
+            }
+            Ok(sms::parse_pdu_list(&resp))
         })?;
-        if list.is_empty() {
-            return Err(crate::error::msg("PDU 模式下未解出任何短信"));
-        }
         Ok(sms::group_sms_concat(list, &concat))
     }
 
@@ -342,6 +350,7 @@ impl Modem {
             model_raw: self.model_raw(),
             at_port_manual: self.at_port_manual(),
             running: self.at.lock().unwrap().is_some(),
+            cell_scan_at: self.cell_scan_at(),
         }
     }
 

@@ -20,4 +20,7 @@ pub struct ModemView {
     /// 这台模组的 AT 命令口**是用户手动指定的**（界面下拉里标「手动」）。
     pub at_port_manual: bool,
     pub running: bool,
+    /// 最近一次基站扫描的时间（没扫过就没有这个字段；见 `GET /api/cells`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cell_scan_at: Option<String>,
 }

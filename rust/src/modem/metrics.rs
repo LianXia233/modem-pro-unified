@@ -413,6 +413,7 @@ mod tests {
             ipv6: None,
             roaming: false,
             traffic: None,
+            ..Default::default()
         };
         assert!(m.note_network(0, &st).is_empty()); // 首次建基线
         let mut next = NetworkStatus { ..st.clone() };

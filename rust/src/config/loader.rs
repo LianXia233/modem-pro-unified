@@ -13,7 +13,7 @@ use super::Config;
 ///
 /// 所以按「主配置 → `<path>.bak` → 内置默认值」依次兜底，每一级都把原因打到
 /// stderr（procd 会收进 syslog）。默认值那一级是**收紧**的方向：登录闸门与
-/// 短信密码闸门都是「不写也算开」，不会因为配置坏了就敞开。
+/// 登录闸门是「不写也算开」，不会因为配置坏了就敞开。
 pub fn load(path: &str) -> Config {
     let Ok(text) = std::fs::read_to_string(path) else {
         eprintln!("读取配置 {path} 失败，改用内置默认值");
@@ -34,7 +34,7 @@ pub fn load(path: &str) -> Config {
                     Err(e2) => eprintln!("备份 {bak} 也解析失败: {e2}"),
                 }
             }
-            eprintln!("改用内置默认值（登录闸门与短信密码闸门保持收紧）");
+            eprintln!("改用内置默认值（登录闸门保持收紧）");
             Config::default_normalized()
         }
     }
@@ -85,9 +85,8 @@ mod tests {
         // 没写的段全部走默认值，且归一化把空串补上
         assert_eq!(cfg.net.wan_mode, "modem_pro");
         assert_eq!(cfg.ui.ubus_http, "http://127.0.0.1/ubus");
-        // 默认方向是收紧：两道闸门都不写也算开
+        // 默认方向是收紧：登录闸门不写也算开
         assert!(cfg.require_luci_login());
-        assert!(cfg.ui.sms_password_required);
     }
 
     #[test]
@@ -113,7 +112,6 @@ mod tests {
         assert_eq!(cfg.net.wan_mode, "modem_pro");
         // 兜底不能顺手把闸门放开
         assert!(cfg.require_luci_login());
-        assert!(cfg.ui.sms_password_required);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

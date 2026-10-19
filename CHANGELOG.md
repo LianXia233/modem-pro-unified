@@ -4,6 +4,40 @@
 
 ## [未发布]
 
+### WebUI 与后端契约对齐 + 取消短信访问密码
+
+#### 取消短信访问密码（用户要求）
+
+- 删除 `http/smsauth.rs` 与 `/api/sms/{auth,unlock,lock,password}` 四个接口；
+- 短信读 / 发 / 删 / 存储区、短信推送、微信机器人都只受**外层登录闸门**
+  （`[ui] require_luci_login`）约束；
+- WebSocket 不再接受 `sms_token` 查询参数， `sms` 推送与 `smscount` 一样走普通广播；
+- 配置里的 `[ui] sms_password` / `sms_password_required` 不再读取（旧配置可保留，无副作用）；
+- 前端删除锁屏卡、解锁/锁定按钮、「访问密码」子页签与令牌存储。
+
+#### 前后端字段对齐（WebUI 拿得到、拿得对）
+
+| 接口 | 修了什么 |
+| --- | --- |
+| `GET /api/network/status` | 补 `duplex` / `reg_5g` / `reg_eps`（CS/PS 都未注册时才补查）/ `serving` / `serving_count` / `neighbour_count` / `scanned_at` / `ca` / `ca_active` / `roam_allowed` / `roam_scope` / `airplane` / `cfun` / `raw_net_info`；`scanned_at` 不再把「没扫过」写成「刚刚」 |
+| `GET /api/cells` | 补 `ca_cmds`（按厂商给真实 CA 查询指令）/ `ca_note`；扫描后补运营商 / 网络接入信息 / 注册状态三行 |
+| `GET /api/usbnet` | 视图重写：`value/name/modes[]/mode_cmds/blocked_modes/need_reboot/cmd/note`，取值统一字符串；读不到当前值时不再显示「未知（）」 |
+| `GET /api/dial` | `usb.host_iface_hint` 字段名对齐（原 `host_iface`），补 `catalog_model/catalog_usb/catalog_pcie` |
+| `GET /api/session` | 补 `required` / `login_url`；未登录 401 响应体补 `need_login` + `login_url` |
+| `GET /api/modems` | 补 `cell_scan_at`（最近一次基站扫描时间，没扫过就没有） |
+| `GET /api/wechat` | 视图补齐：`stage/stage_cn/stage_msg/qr_png/qr_left/verify_required/last_sender/session_ready/heard_message/has_context/listen_on/last_incoming(+at)/last_send/sent_ok/sent_fail/token_mask/default_template` |
+
+#### 修掉的真 Bug
+
+- **短信列表为空被当成读失败**：`AT+CMGL=4` 回 `OK` 但零条时，后端报
+  `PDU 模式下未解出任何短信`，页面永远弹「读取失败」。现在空列表返回 `[]`（code 0），
+  只有固件明确回 ERROR 才算失败。
+- **扫码登录没有二维码**：新增 `qrcode` 依赖（仅核心，无 image/svg 特性），
+  后端把二维码内容离线画成 **SVG data URI**，页面 `<img>` 直接显示。
+- `cell_scan_at` / `scanned_at` 的「空结果填现在」问题（会让页面把没扫过显示成刚扫过）。
+- 前端：USB 网卡读不到当前值时下拉置灰并显示原因；主机侧网卡在拨号状态为空时
+  回落到 USB 识别结果；补内联 favicon（消除唯一的 404 控制台错误）。
+
 ### 移植 QModem 频段表：型号 → 支持频段（92 条）
 
 `/api/modules` 的 `bands` 之前是空的（页面显示「未提供」），锁频段页的

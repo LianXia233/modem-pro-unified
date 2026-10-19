@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="data:,">
 <title>5G 设备中心</title>
 <script>
 /* 主题要在首屏渲染前就定好，否则会先闪一下浅色再变深色。
@@ -1649,28 +1650,11 @@
   </section>
 
   <!-- ==================== 短信 ====================
-       解锁后的内容同样按子页签分区（列表 / 微信机器人 / 访问密码）。
-       ⚠️ 子页签栏放在 #smsArea 里面：没解锁时只显示锁屏卡，页签栏不应出现。 -->
+       按子页签分区（列表 / 微信机器人）。
+       ⚠️ 短信访问密码已于 2026-10-19 取消：本页只受「接口登录保护」约束
+       （[ui] require_luci_login，默认开），不再单独要密码。 -->
   <section id="tab-sms">
-    <!-- 锁屏：短信是隐私内容，没解锁就不发任何短信接口请求 -->
-    <div class="card" id="smsLockCard" hidden>
-      <div class="card-hd"><h3>短信已锁定</h3>
-        <span class="muted push-r">需要密码才能查看 / 发送短信</span>
-      </div>
-      <div class="row">
-        <input id="smsPwd" type="password" placeholder="短信访问密码" autocomplete="current-password" style="width:220px">
-        <button class="act" id="btnSmsUnlock">解锁</button>
-        <span class="muted" id="smsLockHint"></span>
-      </div>
-      <p class="muted" style="margin:12px 0 0">
-        密码在服务器配置文件 <code>config.toml</code> 的 <code>[ui]</code> 段：
-        <code>sms_password = "password"</code>（默认值）；也可以<b>解锁后在下方「访问密码」卡片里直接改</b>。
-        解锁状态只存在本标签页（关掉页签 / 点「锁定」就重新要密码），
-        服务端 30 分钟无操作也会自动失效；连续输错 5 次会锁 60 秒。
-      </p>
-    </div>
-
-    <div id="smsArea" hidden>
+    <div id="smsArea">
     <div class="subtabs" id="smsTabs" role="tablist" aria-label="短信分区">
       <button class="subtab on" data-sub="list" role="tab" aria-selected="true" title="存储用量 + 短信列表">
         <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 14.5a3 3 0 0 1-3 3H8.5l-4.5 3.2V6.5a3 3 0 0 1 3-3h10.5a3 3 0 0 1 3 3z"/><path d="M8 9h8M8 12.5h5"/></svg>
@@ -1679,10 +1663,6 @@
       <button class="subtab" data-sub="wechat" role="tab" aria-selected="false" title="收到新短信自动转发到微信（iLink Bot）">
         <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 3L3 10.5l6.4 2.1L11.5 19z"/><path d="M21 3l-9.5 9.5"/></svg>
         <span>微信机器人</span>
-      </button>
-      <button class="subtab" data-sub="pwd" role="tab" aria-selected="false" title="访问密码：保护本页的短信内容">
-        <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 2.8v5.9c0 4.4-2.9 7.7-7 9.3-4.1-1.6-7-4.9-7-9.3V5.8z"/><path d="M9.3 12.1l2 2 3.4-3.7"/></svg>
-        <span>访问密码</span>
       </button>
     </div>
 
@@ -1711,7 +1691,6 @@
         <button class="act ghost" id="btnSmsRead">刷新</button>
         <button class="act ghost" id="btnSmsStorage">刷新用量</button>
         <button class="act ghost" id="btnSmsExport">导出</button>
-        <button class="act ghost" id="btnSmsLock" title="立即锁定：丢掉本标签页的访问令牌">锁定</button>
         <button class="act danger" id="btnSmsDelAll">删除全部</button>
       </div>
       <div id="smsList" style="margin-top:10px"></div>
@@ -1719,7 +1698,7 @@
         进本页会自动读一次列表；收到新短信时后端会立刻重读并通过 WebSocket 推过来，
         页面会被弹窗提醒（可一键回复）。
         ⚠️ <code>AT+CMGL</code> 会把未读标成已读（3GPP 行为），所以自动读取后“未读”会归零。
-        本页受密码保护：锁屏时不会请求任何短信接口，后端也不会把新短信推给未解锁的页面。
+        本页受<b>路由器登录</b>保护：没登录路由器账号时任何接口都调不通（含 WebSocket 推送）。
       </p>
     </div>
     </div><!-- /subpane list -->
@@ -1739,26 +1718,6 @@
     </div>
     </div><!-- /subpane wechat -->
 
-    <div class="subpane" data-sub="pwd">
-    <div class="card">
-      <div class="card-hd"><h3>访问密码</h3>
-        <span class="muted push-r">保护「短信」页：解锁后才能看 / 发短信</span>
-      </div>
-      <div class="row">
-        <label class="sw" title="关掉后任何人打开本页都能看短信">
-          <input type="checkbox" id="smsPwdEnabled"><span class="track"><i></i></span><span>启用密码保护</span>
-        </label>
-        <button class="act" id="btnSmsPwdChange">修改密码</button>
-        <span class="muted" id="smsPwdState"></span>
-      </div>
-      <p class="muted" id="smsPwdNote" style="margin:12px 0 0">
-        密码存在服务器 <code>config.toml</code> 的 <code>[ui]</code> 段（<code>sms_password</code> /
-        <code>sms_password_required</code>）。在页面上改会<b>只改这两行</b>、其余内容与注释原样保留，
-        改前会备份成 <code>config.toml.bak</code>，且<b>不用重启进程</b>即生效。
-        改密码 / 关保护需要再输一次当前密码；成功后所有已解锁的会话会被吊销（其它页面要重新输密码）。
-      </p>
-    </div>
-    </div><!-- /subpane pwd -->
     </div><!-- /#smsArea -->
   </section>
 
@@ -2340,26 +2299,18 @@ async function doLogin() {
 
 async function api(path, opts) {
   opts = opts || {};
-  // 短信接口要访问令牌（其它接口会忽略这个头）：统一在这里带，免得每处调用都改
-  const smsTok = smsTokenGet();
-  if (smsTok) opts.headers = Object.assign({ 'X-SMS-Token': smsTok }, opts.headers || {});
   const res = await fetch(path, opts);
   const text = await res.text();
   let body;
   try { body = JSON.parse(text); }
   catch { throw new Error('非 JSON 响应: ' + text.slice(0, 200)); }
-  // 401 有两个来源，靠字段区分：need_login = 要求先登录路由器（LuCI 会话），
-  // code=401 = 短信页要密码（走原来的锁屏逻辑）。
+  // 401 = 要求先登录路由器（LuCI 会话）
   if (res.status === 401 || body.need_login) {
     onNeedLogin(body);
     throw new Error(body.msg || '需要登录：请用路由器管理员账号');
   }
   if (!isAuthFreePath(path)) clearNeedLogin();
-  if (body.code !== 0) {
-    // 401 = 短信需要密码：清掉本地令牌并翻回锁屏（服务端不一定真的登出，先按锁处理）
-    if (body.code === 401) onSMSLocked(body.msg);
-    throw new Error(body.msg || ('code=' + body.code));
-  }
+  if (body.code !== 0) throw new Error(body.msg || ('code=' + body.code));
   return body.data;
 }
 const post = (path, obj) => api(path, {
@@ -2370,9 +2321,7 @@ const post = (path, obj) => api(path, {
    例如「已写入 cid=2 的 APN；已重新激活 cid=2；IMS：已激活 cid=1」）。
    写 APN 的弹窗要把它展示给用户；大多数地方用 post 就够了。 */
 async function postFull(path, obj) {
-  const smsTok = smsTokenGet();
   const headers = { 'Content-Type': 'application/json' };
-  if (smsTok) headers['X-SMS-Token'] = smsTok;
   const res = await fetch(path, { method: 'POST', headers: headers, body: JSON.stringify(obj) });
   const body = await res.json();
   if (res.status === 401 || body.need_login) {
@@ -2380,10 +2329,7 @@ async function postFull(path, obj) {
     throw new Error(body.msg || '需要登录：请用路由器管理员账号');
   }
   if (!isAuthFreePath(path)) clearNeedLogin();
-  if (body.code !== 0) {
-    if (body.code === 401) onSMSLocked(body.msg);
-    throw new Error(body.msg || ('code=' + body.code));
-  }
+  if (body.code !== 0) throw new Error(body.msg || ('code=' + body.code));
   return body;
 }
 
@@ -4156,215 +4102,9 @@ function renderSMS(list) {
   }).join('');
 }
 
-/* ---------- 短信访问密码（锁定 / 解锁） ----------
-   设计取舍：真正的门在**后端**（短信接口要令牌、短信推送只发给解锁的连接），
-   这里只负责输入密码、保存令牌、以及令牌失效时翻回锁屏。
-   令牌存 sessionStorage：关掉标签页就没了（比 localStorage 更像“进一次要一次”）。 */
-const SMS_TOKEN_KEY = 'smsToken';
-// 同源的 /mini（LuCI 悬浮小窗里的那只 iframe，在**别的标签页**）读不到 sessionStorage，
-// 所以解锁后顺手往 localStorage 放一份 —— 它只在本页活着时有值（离开本页就撤掉，
-// 令牌本身也会闲置 30 分钟失效）。有了它，「任意 LuCI 页面弹新短信」才能显示正文。
-const SMS_TOKEN_LS = 'modemd.smsToken';
-const smsTokenGet = () => sessionStorage.getItem(SMS_TOKEN_KEY) || '';
-const smsTokenSet = t => {
-  if (t) sessionStorage.setItem(SMS_TOKEN_KEY, t); else sessionStorage.removeItem(SMS_TOKEN_KEY);
-  smsTokenShare(t);
-};
-const smsTokenShare = t => { try { if (t) localStorage.setItem(SMS_TOKEN_LS, t); else localStorage.removeItem(SMS_TOKEN_LS); } catch (_) { } };
-// 关掉/离开本页 = 撤销共享；从往返缓存回来（pageshow）再补上
-addEventListener('pagehide', () => smsTokenShare(''));
-addEventListener('pageshow', () => smsTokenShare(smsTokenGet()));
-
-function renderSMSLock(locked, hint) {
-  const lock = $('#smsLockCard'), area = $('#smsArea');
-  if (lock) lock.hidden = !locked;
-  if (area) area.hidden = !!locked;
-  const h = $('#smsLockHint');
-  if (h) h.textContent = hint || '';
-  if (locked) {
-    const p = $('#smsPwd');
-    if (p) { p.value = ''; setTimeout(() => p.focus(), 50); }
-  }
-}
-
-// api() 抓到 401 会调它：清掉本地令牌、翻回锁屏，并重连 WS（把失效的令牌从握手参数里摘掉）
-function onSMSLocked(msg) {
-  smsTokenSet('');
-  renderSMSLock(true, msg || '登录状态已失效，请重新输入密码');
-  connectWS();
-}
-
-// ensureSMSUnlocked 问后端“要不要密码 / 现在解锁了没”，顺便决定显示锁屏还是列表
-async function ensureSMSUnlocked() {
-  let st;
-  try {
-    st = await api('/api/sms/auth');
-  } catch (_) {
-    return false; // 拿不到状态就先别乱发短信接口
-  }
-  syncSMSAuthUI(st);
-  if (!st || !st.required) { renderSMSLock(false); return true; }
-  if (st.unlocked) { renderSMSLock(false); return true; }
-  renderSMSLock(true);
-  return false;
-}
-
-// 访问密码卡的控件状态（要不要密码、是不是还在用默认密码、外层登录是否已接管）
-let smsNeedPassword = false;
-let smsDefaultPassword = false;
-let smsOuterAuth = false;
-
-function syncSMSAuthUI(st) {
-  if (!st) return;
-  smsNeedPassword = !!st.required;
-  smsDefaultPassword = !!st.default;
-  smsOuterAuth = !!st.outer_auth;
-  const sw = $('#smsPwdEnabled');
-  if (sw) {
-    sw.checked = smsNeedPassword;
-    // 外层登录网关开着时短信密码是重复保护（后端已自动停用）⇒ 整个卡变成只读说明，
-    // 否则用户会以为“未启用＝谁都能看短信”。
-    sw.disabled = smsOuterAuth;
-  }
-  const btn = $('#btnSmsPwdChange');
-  if (btn) btn.disabled = smsOuterAuth;
-  const hint = $('#smsPwdState');
-  if (hint) {
-    hint.innerHTML = smsOuterAuth
-      ? '<span class="pill on">已由路由器登录保护</span> 短信密码已停用（外层登录已覆盖本页）'
-      : (!smsNeedPassword
-        ? '<span class="pill off">未启用</span> 任何人打开本页都能看短信'
-        : (smsDefaultPassword
-          ? '<span class="pill seg">已启用</span> ⚠️ 还在用默认密码 <code>password</code>，建议改掉'
-          : '<span class="pill on">已启用</span> 进本页需要密码'));
-  }
-  const note = $('#smsPwdNote');
-  if (note) {
-    note.innerHTML = smsOuterAuth
-      ? '当前的接口鉴权是<b>路由器登录</b>（<code>[ui] require_luci_login</code>）：没登录路由器账号就连不上任何接口，'
-        + '所以这里不再重复要一道短信密码（配置里那两行仍然保留，把外层登录关掉就会重新生效）。'
-        + '要关掉外层登录：LuCI 里 <b>服务 → 5G终端 · 服务控制 → 「接口登录保护」</b> 取消勾选（默认是开启的）。'
-      : '密码存在服务器 <code>config.toml</code> 的 <code>[ui]</code> 段（<code>sms_password</code> /'
-        + ' <code>sms_password_required</code>）。在页面上改会<b>只改这两行</b>、其余内容与注释原样保留，'
-        + '改前会备份成 <code>config.toml.bak</code>，且<b>不用重启进程</b>即生效。'
-        + '改密码 / 关保护需要再输一次当前密码；成功后所有已解锁的会话会被吊销（其它页面要重新输密码）。';
-  }
-  // 「锁定」按钮只有在真的要密码时才有意义（没密码时点了会把自己关在一个不需要密码的锁屏里）
-  const lockBtn = $('#btnSmsLock');
-  if (lockBtn) lockBtn.hidden = !smsNeedPassword;
-  // 列表页那句“本页受密码保护”也要跟着实际情况走
-  const pn = $('#smsProtectNote');
-  if (pn) {
-    pn.innerHTML = '进本页会自动读一次列表；收到新短信时后端会立刻重读并通过 WebSocket 推过来，'
-      + '页面会被弹窗提醒（可一键回复）。'
-      + '⚠️ <code>AT+CMGL</code> 会把未读标成已读（3GPP 行为），所以自动读取后“未读”会归零。'
-      + (smsOuterAuth
-        ? '本页受<b>路由器登录</b>保护：没登录路由器账号时任何接口都调不通（含 WebSocket 推送）。'
-        : (smsNeedPassword
-          ? '本页受密码保护：锁屏时不会请求任何短信接口，后端也不会把新短信推给未解锁的页面。'
-          : '⚠️ 本页<b>没有启用任何保护</b>：局域网内任何人打开这个地址都能看 / 发短信。'));
-  }
-}
-
-async function loadSMSAuthState() {
-  try { syncSMSAuthUI(await api('/api/sms/auth')); } catch (_) { /* 忽略：少一行状态而已 */ }
-}
-
-// 改密码 / 开关保护都走 POST /api/sms/password。
-// 服务端会吐销全部旧会话并补发一个新令牌（当前页面不至于被踢出去）。
-async function smsPasswordApply(body, okMsg) {
-  const r = await post('/api/sms/password', body);
-  smsTokenSet(r && r.token ? r.token : '');
-  connectWS(); // 带上新令牌重连，否则短信推送会被服务端跳过
-  await loadSMSAuthState();
-  renderSMSLock(!r || !r.required ? false : !smsTokenGet());
-  toast(okMsg || '已保存');
-  return r;
-}
-
-$('#btnSmsPwdChange').onclick = e => {
-  const need = smsNeedPassword;
-  openModal({
-    title: '修改短信访问密码',
-    body: (need ? `<div class="fld"><label>当前密码</label><input id="smsCurPwd" type="password" autocomplete="current-password"></div>` : '') +
-      `<div class="fld"><label>新密码（4~64 个字符）</label><input id="smsNewPwd" type="password" autocomplete="new-password"></div>
-       <div class="fld"><label>再输一次新密码</label><input id="smsNewPwd2" type="password" autocomplete="new-password"></div>
-       <p class="muted" style="margin:10px 0 0">写回服务器 <code>config.toml</code> 的 <code>[ui]</code> 段，
-       只改那两行、其余注释原样保留（改前备份 <code>config.toml.bak</code>），立即生效不用重启。</p>`,
-    actions: [
-      { label: '取消', kind: 'ghost', onClick: closeModal },
-      {
-        label: '保存', kind: 'primary',
-        onClick: b => mrun(b, async () => {
-          const np = $('#smsNewPwd').value, np2 = $('#smsNewPwd2').value;
-          if (np !== np2) throw new Error('两次输入的新密码不一致');
-          const body = { new_password: np, enabled: true };
-          if (need) body.current = $('#smsCurPwd').value;
-          await smsPasswordApply(body, '密码已更新；其它已解锁的页面需要重新输入');
-          closeModal();
-        }),
-      },
-    ],
-  });
-};
-
-$('#smsPwdEnabled').onchange = e => {
-  const el = e.target, want = el.checked;
-  if (!want && smsNeedPassword) {
-    // 关掉保护要再输一次当前密码：先把开关回弹，确认后才真的关
-    el.checked = true;
-    openModal({
-      title: '关闭短信密码保护',
-      body: `<div class="fld"><label>当前密码</label><input id="smsCurPwd" type="password" autocomplete="current-password"></div>
-        <p class="muted" style="margin:10px 0 0">关掉后<b>任何人（包括局域网内的其它设备）</b>打开这个页面都能看 / 发短信。
-        密码本身会留在配置文件里，以后再开启不用重输。</p>`,
-      actions: [
-        { label: '取消', kind: 'ghost', onClick: closeModal },
-        {
-          label: '关闭保护', kind: 'danger',
-          onClick: b => mrun(b, async () => {
-            await smsPasswordApply({ enabled: false, current: $('#smsCurPwd').value }, '已关闭短信密码保护');
-            closeModal();
-          }),
-        },
-      ],
-    });
-    return;
-  }
-  run(el, async () => {
-    await smsPasswordApply({ enabled: want }, want ? '已开启短信密码保护' : '已关闭短信密码保护');
-  });
-};
-
-$('#btnSmsUnlock').onclick = e => run(e.target, async () => {
-  const pwd = $('#smsPwd').value;
-  if (!pwd) throw new Error('请输入密码');
-  const r = await post('/api/sms/unlock', { password: pwd });
-  smsTokenSet(r && r.token ? r.token : '');
-  renderSMSLock(false);
-  connectWS(); // 带上令牌重连：之后新短信才会推过来
-  // ⚠️ 顺序有讲究：读短信会因"没有模组"失败，不能让它把解锁/微信卡片的加载带崩
-  let smsErr = '';
-  try { await loadSMS(); } catch (e) { smsErr = e.message; }
-  // 微信机器人卡片也在解锁区里（能改推送目标就能把短信转发出去）
-  loadWeChat(true).catch(() => {});
-  toast(smsErr ? ('短信已解锁，但读取失败：' + smsErr) : '短信已解锁');
-});
-
-// 回车即解锁（密码框就一个输入，不用再去点按钮）
-$('#smsPwd').onkeydown = e => { if (e.key === 'Enter') $('#btnSmsUnlock').click(); };
-
-$('#btnSmsLock').onclick = e => run(e.target, async () => {
-  try { await post('/api/sms/lock', {}); } catch (_) { /* 本地锁定最重要，服务端失败也无所谓 */ }
-  smsTokenSet('');
-  renderSMSLock(true, '已锁定');
-  connectWS();
-  toast('短信已锁定');
-});
-
 /* ---------- 微信机器人（新短信 → 微信） ----------
-   协议：腾讯 iLink Bot（后端 module/kernel/wechat.go）。登录靠扫码，凭据写回 config.toml。
-   ⚠️ 整张卡在短信解锁区里：能改「推送目标」就等于能把短信转发到任意微信。 */
+   协议：腾讯 iLink Bot（后端 rust/src/wechat/）。登录靠扫码，凭据写回 config.toml。
+   ⚠️ 能改「推送目标」就等于能把短信转发到任意微信 —— 本页只受登录闸门约束。 */
 let wxData = null;  // 最近一次 /api/wechat
 let wxSig = '';     // 渲染签名（stage + 关键计数），没变就不重绘（免得抢走输入焦点）
 let wxFilled = false;
@@ -5191,7 +4931,7 @@ const TAB_IDS = ['overview', 'dial', 'changes', 'cells', 'lock', 'schedule', 'sm
 const RAW_SUBS = ['params', 'quota', 'usbnet', 'imei', 'ussd', 'usb', 'pcie', 'modules', 'api'];
 const RAW_SUB_KEY = 'rawSub';
 // 「短信」解锁后的分区（子页签）：锁屏卡不在里面（没解锁不该看到页签栏）
-const SMS_SUBS = ['list', 'wechat', 'pwd'];
+const SMS_SUBS = ['list', 'wechat'];
 const SMS_SUB_KEY = 'smsSub';
 
 function loadTabData(name) {
@@ -5231,9 +4971,8 @@ function loadTabData(name) {
       loadSchedule().catch(() => {});
       break;
     case 'sms':
-      // ⚠️ 先过密码关：没解锁就只显示锁屏，一个短信接口都不发。
-      // 解锁后按当前子页签加载（列表 / 微信机器人 / 访问密码），不再一次全拉。
-      ensureSMSUnlocked().then(ok => { if (ok) showSmsSub(activeSmsSub()); });
+      // 按当前子页签加载（列表 / 微信机器人），不再一次全拉
+      showSmsSub(activeSmsSub());
       break;
     case 'raw':
       // 五个分区互斥显示：只拉当前分区要的数据，其余等点过去再拉（少占串口）
@@ -5819,9 +5558,8 @@ $('#btnAtpBind').onclick = e => run(e.target, async () => {
   await Promise.all([loadAtpBind(), loadUsb()]);
 });
 
-/* ---------- 「短信」页的子页签（解锁后的三块：列表 / 微信机器人 / 访问密码） ----------
-   连同「高级配置」一起：每块功能独立一屏，不用为了看微信机器人或访问密码滚到底。
-   ⚠️ 这里只切显示，不碰密码闸门：没解锁时 #smsArea 整块是 hidden 的（见 ensureSMSUnlocked）。 */
+/* ---------- 「短信」页的子页签（两块：列表 / 微信机器人） ----------
+   连同「高级配置」一起：每块功能独立一屏，不用为了看微信机器人滚到底。 */
 const activeSmsSub = () => { const b = document.querySelector('#smsTabs button.on'); return b ? b.dataset.sub : SMS_SUBS[0]; };
 
 function showSmsSub(name, opts) {
@@ -5839,7 +5577,7 @@ function showSmsSub(name, opts) {
 // 分区数据：进页面只拉当前这块（与原 loadTabData('sms') 拉的是同一批接口，只是拆开了）
 function loadSmsSub(name) {
   // 没模组就别去读短信（后端会回“模组不存在”）：锁屏/空态已经由 clearModemViews 处理
-  if (!modems.length && name !== 'pwd') return;
+  if (!modems.length) return;
   switch (name) {
     case 'list':
       // 进页面直接把列表读出来（用户要求；⚠️ AT+CMGL 会清掉未读标记）。
@@ -5848,9 +5586,6 @@ function loadSmsSub(name) {
       break;
     case 'wechat':
       loadWeChat(true).catch(() => {});
-      break;
-    case 'pwd':
-      // 密码卡的数据在解锁时就拿到了（/api/sms/auth），这里不用再发请求
       break;
   }
 }
@@ -6250,21 +5985,31 @@ function renderUSBnet(id) {
   // 后端也会拒（/api/usbnet/set），这里只是别让人白点一次。
   // ⚠️「当前就在这一档」时不置灰 —— 否则下拉显示不出当前值（禁用项选不中）。
   const blocked = st.blocked_modes || {};
-  sel.innerHTML = modes.map(m => {
-    const why = blocked[m.value];
-    const lock = !!why && m.value !== st.value;
-    const tip = why ? ('⛔ 只展示、不允许执行：' + why) : (cmds[m.value] || '');
-    return `<option value="${esc(m.value)}" title="${esc(tip)}"${lock ? ' disabled' : ''}>` +
-      `${esc(m.name)}（${esc(m.value)}）${why ? ' — 只展示' : ''}</option>`;
-  }).join('');
-  // 模组上报表外取值时补一个选项，原样显示
-  if (!modes.some(m => m.value === st.value)) sel.add(new Option('未知（' + st.value + '）', st.value));
-  sel.value = st.value;
-  const cur = modes.find(m => m.value === st.value);
-  const curCmd = cmds[st.value] || '';
-  $('#usbNetHint').textContent = '当前：' + (cur ? cur.name + '（' + st.value + '）' + (cur.note ? ' — ' + plain(cur.note) : '') : '未知（' + st.value + '）') +
-    (curCmd ? '（指令 ' + curCmd + '）' : '') +
-    (st.need_reboot ? '。修改后需重启模组生效。' : '');
+  if (!st.value) {
+    // 读不到当前值（固件没有这条查询指令）：不要显示「未知（）」那种半截文案，
+    // 直接把原因写清楚，下拉置灰（档位仍列出来给用户看这台机器支持哪些形态）。
+    sel.innerHTML = '<option value="">（本机读不到当前模式）</option>' +
+      modes.map(m => `<option value="${esc(m.value)}" disabled>${esc(m.name)}（${esc(m.value)}）</option>`).join('');
+    sel.disabled = true;
+    $('#usbNetHint').textContent = st.note || '本机固件没有可用的 USB 网卡模式查询指令';
+  } else {
+    sel.disabled = false;
+    sel.innerHTML = modes.map(m => {
+      const why = blocked[m.value];
+      const lock = !!why && m.value !== st.value;
+      const tip = why ? ('⛔ 只展示、不允许执行：' + why) : (cmds[m.value] || '');
+      return `<option value="${esc(m.value)}" title="${esc(tip)}"${lock ? ' disabled' : ''}>` +
+        `${esc(m.name)}（${esc(m.value)}）${why ? ' — 只展示' : ''}</option>`;
+    }).join('');
+    // 模组上报表外取值时补一个选项，原样显示
+    if (!modes.some(m => m.value === st.value)) sel.add(new Option('未知（' + st.value + '）', st.value));
+    sel.value = st.value;
+    const cur = modes.find(m => m.value === st.value);
+    const curCmd = cmds[st.value] || '';
+    $('#usbNetHint').textContent = '当前：' + (cur ? cur.name + '（' + st.value + '）' + (cur.note ? ' — ' + plain(cur.note) : '') : '未知（' + st.value + '）') +
+      (curCmd ? '（指令 ' + curCmd + '）' : '') +
+      (st.need_reboot ? '。修改后需重启模组生效。' : '');
+  }
   // 本机实际用的查询指令 + 该型号说明（取值/指令都来自模块清单）
   const cap = $('#usbNetCap');
   if (cap) {
@@ -6349,7 +6094,9 @@ function renderDial() {
   const dt = u.dial || {};
   // 主机侧网卡（真名由后端按 USB 拓扑找出来，如 eth2 / wwan0）——
   // DialType.protocol 只是"这类协议在主机上长什么样"的通用说法，两者一起显示才不会让人误会
-  const hostIface = (d && d.state && d.state.host_iface) || '';
+  // 主机侧网卡：拨号状态里没有时用 USB 类型识别到的那张（两处口径一致，别显示成 `-`）
+  const hostIface = (d && d.state && d.state.host_iface
+    || (u.host_iface_hint && u.host_iface_hint.iface) || '');
   if (!d) {
     box.innerHTML = '<span class="muted">加载中…</span>';
   } else {
@@ -8364,10 +8111,6 @@ const RAW_APIS = [
   { g: '短信', m: 'GET', p: '/api/sms/read?modem_id=0', d: '读短信（⚠ 会把未读标成已读）' },
   { g: '短信', m: 'POST', p: '/api/sms/send', d: '发短信', b: { modem_id: 0, phone: '13800138000', content: 'hello' } },
   { g: '短信', m: 'POST', p: '/api/sms/delete', d: '删除短信（index 或 all）', b: { modem_id: 0, index: 1, all: false } },
-  { g: '短信', m: 'GET', p: '/api/sms/auth', d: '密码要不要 / 解锁了没' },
-  { g: '短信', m: 'POST', p: '/api/sms/unlock', d: '解锁（换令牌）', b: { password: 'password' } },
-  { g: '短信', m: 'POST', p: '/api/sms/lock', d: '锁定（丢掉当前令牌）', b: {} },
-  { g: '短信', m: 'POST', p: '/api/sms/password', d: '改密码 / 开关保护（写回 config.toml）', b: { current: 'password', new_password: 'new-secret' } },
   { g: '参数（可写）', m: 'GET', p: '/api/params?modem_id=0', d: 'PDP / APN / 选网总览' },
   { g: '参数（可写）', m: 'POST', p: '/api/params/apn', d: '写 APN', b: { modem_id: 0, cid: 1, pdp_type: 'IPV4V6', apn: '3GNET' } },
   { g: '参数（可写）', m: 'POST', p: '/api/params/apn/delete', d: '删除 APN 配置（AT+CGDCONT=<cid>，回读确认）', b: { modem_id: 0, cid: 3 } },
@@ -8724,10 +8467,7 @@ function wsLabel() {
 function connectWS() {
   if (!wsLive) { wsLabel(); return; }
   const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-  // 短信令牌走查询参数（浏览器没法给 WebSocket 握手设自定义头）：
-  // 解锁过的连接才会收到 `sms` 推送，否则后端的 BroadcastSMS 会跳过我们。
-  const tok = smsTokenGet();
-  const url = proto + location.host + '/ws' + (tok ? '?sms_token=' + encodeURIComponent(tok) : '');
+  const url = proto + location.host + '/ws';
   let sock;
   try { sock = new WebSocket(url); }
   catch (e) { scheduleWSRetry(); return; }

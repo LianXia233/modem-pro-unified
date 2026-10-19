@@ -108,16 +108,13 @@
 ### 短信 / 微信
 | 状态 | Method | Path |
 | --- | --- | --- |
-| [x] | GET | `/api/sms/auth`（返回 `required`/`unlocked`/`default`/`ttl_s`/`outer_auth`） |
-| [x] | POST | `/api/sms/unlock`（`{"password"}` → 令牌；错 5 次锁 60s） |
-| [x] | POST | `/api/sms/lock` |
-| [x] | POST | `/api/sms/password`（改密码 / 开关保护，写回 config.toml 并吊销旧令牌） |
+| — | — | ~~`/api/sms/auth`、`/api/sms/unlock`、`/api/sms/lock`、`/api/sms/password`~~（2026-10-19 取消短信密码，接口已删除） |
 | [x] | GET | `/api/sms/read`（PDU/文本解码；`AT+CMGL` 副作用保留） |
 | [x] | POST | `/api/sms/send`（`{phone,content}`；中文走 UCS2，超长自动分段） |
 | [x] | POST | `/api/sms/delete`（`{index}` 单条 / `{all:true}` 全部） |
 | [x] | GET | `/api/sms/storage`（读各存储区用量与当前区） |
 | [x] | POST | `/api/sms/storage`（切存储区，回读确认并写回 config.toml） |
-| [x] | GET | `/api/wechat` | 读配置 + 登录态（不回传 token）；过短信密码闸门 |
+| [x] | GET | `/api/wechat` | 读配置 + 登录态 + 二维码 SVG（不回传 token）；只过登录闸门 |
 | [x] | POST | `/api/wechat/login` | 拿登录二维码（未过期的复用，不重复拿） |
 | [x] | POST | `/api/wechat/verify` | 轮询扫码结果；成功则凭据写回 config.toml |
 | [x] | POST | `/api/wechat/set` | 改配置：行级原地写回 + 内存覆盖即时生效 |
@@ -188,8 +185,7 @@
 `/api/quota/{set,reset,unblock}`、`/api/traffic/reset`、`/api/ussd`（POST 同步收到 `+CUSD` 时）、
 SIM 热插拔事件（`sim`，并清短信缓存后补推空 `sms` + `smscount`）。
 
-- `sms` 带正文，**过短信密码闸门**（与 `/api/sms/read` 同一把令牌：没配密码时人人可收）；
-  `smscount` 只有数字、不含正文，因此不过闸门（锁着也能看到有几条未读）。
+- `sms` 与 `smscount` 都走普通广播（短信密码已取消，只剩外层登录闸门）。
 - **屏端动作协议已完成**（客户端 → 服务端，一律 `{action, modem_id, ...}`）：
   `snapshot`（再来一份快照）/ `ping`（回 `pong`）/ `sms_read`+`index`（`AT+CMGR` 读一次即标已读，
   随后重读列表并推 `sms` + `smscount`）/ `sms_delete`+`index`（删完重读再推）/
@@ -213,18 +209,16 @@ SIM 热插拔事件（`sim`，并清短信缓存后补推空 `sms` + `smscount`�
 - 波动记录 / 采样历史只在**进程内环形缓冲**（波动 500 条、每模组 1800 段），不落盘；
   记录点挂在已有查询上（`/api/signal`、`/api/network/status`、`/api/cells`），**不额外发 AT**；
   采样值没变时只把最后一个点的时间往后推，曲线上仍是一条画到「现在」的平线。
-- 短信访问密码闸门：`require_luci_login` 开启、或 `sms_password_required=false`、或
-  `sms_password` 显式写成空串时**不需要**密码；令牌 TTL 30 分钟、最多 32 个、连错 5 次锁 60 秒、
-  默认密码 `password`；令牌优先取 `X-SMS-Token` 头，其次 query `sms_token`。
+- 短信访问密码已于 2026-10-19 **取消**（用户要求）：`[ui] sms_password*` 两行不再读取，
+  `/api/sms/{auth,unlock,lock,password}` 与 WS 的 `sms_token` 参数一并删除；
+  短信与微信接口只受外层 `require_luci_login` 约束。
 - 一个 AT 口 = 一个模组；同模组多 ttyUSB 合并待补。
 - 流量配额：用量按「当前累计 − 上次累计」累加（模组重启归零时把当前值当增量），首次采样只建基线；
   广和通只有瞬时速率 ⇒ 按 `速率 × 间隔` 积分（标 `estimated`）；台账写 `quota.json`（配置同目录）。
   超限时**只停上网用的 PDP 上下文**（`AT+CGACT=0,<cid>`，跳过 ims/sos/mms），`block_rf` 走 `AT+CFUN=4`。
 - 主动扫网会独占串口几分钟，必须能被 `/api/netscan/stop` 打断：中断后已收到的部分照常解析并标 `stopped`。
-- 短信写操作（发 / 删 / 切存储区）都过同一道短信密码闸门；改密码 / 开关保护要**再输一次当前密码**，
-  成功后吊销全部旧令牌并给当前页面补发新的。写回 `config.toml` 只改目标那一行，注释原样保留。
-- 推送闸门：`sms` 推送过密码闸门（与 `/api/sms/read` 共用令牌）；`smscount` 只推
-  `{total,unread}` 且**不过**闸门。
+- 短信写操作（发 / 删 / 切存储区）只走外层登录闸门（密码已取消）。
+- 推送：`sms` 带正文、`smscount` 只推 `{total,unread}`，两者都不再按令牌过滤。
 - LuCI 界面（2026-10-18 起）**只有 JS 视图 + ucode 控制器**世代，`luci/app/lua/**` 已删除：
   - ucode dispatcher **只扫** `/usr/share/luci/menu.d/*.json` 与
     `/usr/lib/lua/luci/controller/*.lua`；ucode 控制器要能被分发，必须在 menu.d 里

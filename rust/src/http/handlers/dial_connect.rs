@@ -55,7 +55,7 @@ pub(crate) fn push_dial(state: &AppState, st: &DialState) {
 
 /// 拨号会改链路 / 地址，顺手把「当前网络」卡片也刷一次。
 fn push_network(state: &AppState, modem: &crate::modem::model::Modem) {
-    let st = modem.network_status();
+    let st = modem.network_status(state.cfg.net.allow_roaming);
     // 拨号卡片的「在用 APN / 本机地址 / 主机网卡」与「网络」卡片是同一批数据，顺手同步
     modem.sync_dial_state(&st);
     let data = serde_json::to_value(&st).unwrap_or(serde_json::Value::Null);

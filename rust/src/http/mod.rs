@@ -29,7 +29,6 @@ mod response;
 mod router;
 pub(crate) mod schedule;
 mod server;
-mod smsauth;
 mod static_ui;
 mod ws;
 
@@ -46,8 +45,6 @@ pub struct AppState {
     pub(crate) cfg: Arc<Config>,
     pub(crate) ubus: UbusClient,
     pub(crate) ws: Arc<ws::WsHub>,
-    /// 短信访问密码的令牌表与失败节流（见 http/smsauth.rs）
-    pub(crate) sms_auth: smsauth::SmsAuth,
     /// 波动记录与信号采样历史（见 modem/metrics.rs）
     pub(crate) metrics: crate::modem::metrics::Metrics,
     /// 流量配额台账（quota.json，见 runtime/store.rs 与 http/quota.rs）
@@ -127,7 +124,6 @@ pub fn serve(
         cfg,
         ubus,
         ws: Arc::new(ws::WsHub::new()),
-        sms_auth: smsauth::SmsAuth::new(),
         metrics: crate::modem::metrics::Metrics::new(),
         quota: quota::store_for(config_path),
         imei: Arc::new(crate::runtime::store::ImeiStore::new(

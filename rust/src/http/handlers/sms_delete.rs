@@ -1,6 +1,6 @@
 //! `POST /api/sms/delete` —— 删一条（`{modem_id, index}`）或全部（`{modem_id, all:true}`）。
 //!
-//! 走短信密码闸门。删除是**不可恢复**的，所以参数要卡死：只认数字位置。
+//! 短信密码已取消（2026-10-19）；删除是**不可恢复**的，所以参数要卡死：只认数字位置。
 
 use std::collections::HashMap;
 
@@ -8,15 +8,12 @@ use serde_json::json;
 use tiny_http::Request;
 
 use crate::error::Result;
-use crate::http::{request, response, smsauth, AppState};
+use crate::http::{request, response, AppState};
 
 use super::modem_by_query;
 
 pub fn handle(mut req: Request, state: &AppState, query: &HashMap<String, String>) -> Result<()> {
     let params = request::merge_form(query, &request::read_body(&mut req));
-    if !state.sms_auth.unlocked(&state.cfg, &req) {
-        return smsauth::locked_response(req, state);
-    }
     let Some(modem) = modem_by_query(state, &params) else {
         return response::fail(req, -1, "modem not found");
     };

@@ -83,12 +83,27 @@
   "modem_id":0,"queried_at":"2026-10-18T10:10:34Z",
   "net_tech":"FDD LTE","tech":"lte","tech_label":"LTE",
   "plmn":"46011","mcc":"460","mnc":"11","operator":"中国电信",
-  "band":3,"band_label":"B3","band_text":"LTE BAND 3","earfcn":1300,
+  "band":3,"band_label":"B3","band_text":"LTE BAND 3","duplex":"FDD","earfcn":1300,
+  "raw_net_info":"+QNWINFO: \"FDD LTE\",\"46011\",\"LTE BAND 3\",1300",
   "apn":"ctnet.MNC011.MCC460.GPRS",
   "ipv4":"203.0.113.53","ipv6":"2001:db8::1",
-  "cs_reg":{…},"ps_reg":{…},"roaming":false,"traffic":{…}
+  "cs_reg":{…},"ps_reg":{…},"reg_5g":{…},"reg_eps":{…},
+  "serving":{…},"serving_count":1,"neighbour_count":3,"scanned_at":"2026-10-18T10:10:00Z",
+  "ca":[],"ca_active":false,
+  "roaming":false,"roam_allowed":true,"roam_scope":"none",
+  "airplane":false,"cfun":1,"traffic":{…}
 },"msg":"ok"}
 ```
+
+| 字段 | 说明 |
+| --- | --- |
+| `duplex` | 从接入技术串拆出的 `FDD` / `TDD`；认不出就省略 |
+| `reg_5g` / `reg_eps` | 5GS / EPS 注册状态；**只在 CS/PS 都报未注册时补查**（5G SA 下 CREG/CGREG 会长期停在 0,0） |
+| `serving` / `serving_count` / `neighbour_count` / `scanned_at` | 服务小区与数量，取自**基站扫描缓存**（没扫过就没有 `scanned_at`，不触发扫描） |
+| `ca` / `ca_active` | 分量载波；当前只做结构占位（实时 `AT+QCAINFO` 解析未实现，通常为空） |
+| `roam_allowed` / `roam_scope` | 「数据漫游」开关与范围（`none` / `domestic` / `global` / `unknown`） |
+| `airplane` / `cfun` | 飞行模式与 `AT+CFUN?` 原值（1 = 全功能，4 = 飞行） |
+| `raw_net_info` | QNWINFO 原文（去掉命令回显，多行用 ` | ` 连接），页面排查框直接显示 |
 
 地址字段的归一化口径（`modem/model/addr.rs`，与 `AT+CGPADDR` 那条路**同一套判据**）：
 
@@ -201,11 +216,14 @@ POST /api/at     {"modem_id":0,"cmd":"AT+CGSN"}
 ```
 
 ### GET /api/session
-当前是否已登录。
+当前是否已登录，以及登录闸门是否开着、LuCI 入口在哪。
 
 ```json
-{"code":0,"data":{"logged_in":false},"msg":"ok"}
+{"code":0,"data":{"logged_in":false,"required":true,"login_url":"/cgi-bin/luci/"},"msg":"ok"}
 ```
+
+> 未登录调其它接口时返回 HTTP 401 + `{"need_login":true,"login_url":"…"}`，
+> 页面据此弹登录条并把「去 LuCI」按钮指到 `login_url`。
 
 ### POST /api/login
 登录（转发 ubus `session.login`）。参数 `username`（默认 `root`）、`password`。
@@ -238,8 +256,28 @@ POST /api/at     {"modem_id":0,"cmd":"AT+CGSN"}
 ### POST /api/mode/set
 下发组网模式偏好（`{modem_id, value}`），写完回读确认。
 
+### GET /api/usbnet?modem_id=N
+USB 网卡模式（当前值 + 可选档位 + 每档的切换指令 + 不可执行原因）。
+
+```json
+{"code":0,"data":{
+  "value":"3","name":"RNDIS","supported":true,"need_reboot":true,
+  "modes":[{"value":"0","name":"RMNET"},{"value":"1","name":"ECM"},…],
+  "mode_cmds":{"0":"AT+QCFG=\"usbnet\",0","1":"AT+QCFG=\"usbnet\",1"},
+  "blocked_modes":{"3":"广和通 RNDIS 不允许在这里执行（切过去会整机掉 USB）"},
+  "cmd":"AT+QCFG=\"usbnet\"",
+  "note":"修改后需重启模组生效","raw":"+QCFG: \"usbnet\",3"
+},"msg":"ok"}
+```
+
+- 取值一律**字符串**（与页面 `<option value>` 直接对齐，不会出现 `"3" !== 3`）。
+- `value=""` = 本机固件没有查询指令（例如广和通），此时页面把下拉置灰、
+  只列出该厂商支持的档位，并把原因写在 `note`。
+- `blocked_modes` 里的是「只展示、不允许执行」的档位：后端会拒（`/api/usbnet/set`），
+  页面提前置灰并写明原因（不能从列表里删掉 —— 当前就在那一档时要能显示出来）。
+
 ### POST /api/usbnet/set
-设置 USB 网卡模式（`{modem_id, value}`，0~3）；写完需重启模组生效。
+设置 USB 网卡模式（`{modem_id, value}`，0~5）；写完需重启模组生效。
 
 ### GET /api/dial?modem_id=N[&force=1]
 「拨号上网」页一次拉全：拨号状态 + USB 类型识别 + 类型表 + 开关三件套。
@@ -255,7 +293,9 @@ POST /api/at     {"modem_id":0,"cmd":"AT+CGSN"}
            "steps":[{"name":"激活 PDP（AT+CGACT）","ok":true,"info":"cid=1 已激活","at":"…"}]},
   "usb":{"modem_id":0,"value":"1","name":"ECM","kind":"ecm","source":"at","confident":true,
          "query_cmd":"AT+QCFG=\"usbnet\"","dial":{"value":"1","name":"ECM","kind":"ecm","at_dial":true,"…":"…"},
-         "bus":"usb","probed_at":"…"},
+         "descriptor":{…},"host_iface_hint":{"iface":"eth2","driver":"cdc_ether",…},
+         "bus":"usb","catalog_model":"fm350-gl","catalog_usb":["rndis"],"catalog_pcie":["mbim"],
+         "probed_at":"…"},
   "class_notes":[],"types":[…],
   "auto_wan":{"at":"2026-10-18T12:00:00+08:00","modem_id":0,"kind":"qmi","mode":"modem_pro","ifaces":["modem0"],"applied":["建接口 modem0","modem0.proto=modem_pro","firewall.wan.network += modem0"],"skipped":[],"ok":true},
   "wan_ipv6":true,"wan_ipv6_mode":"dhcpv6","wan_ipv6_modes":[…],"dial_enabled":true,
@@ -330,24 +370,37 @@ IPv6 开关（`{on}`，**必须显式给值**）：写回 `[net] wan_ipv6` 并�
 
 ```json
 {"code":0,"data":{
-  "enabled":false,"logged_in":false,"state":"未登录",
-  "to_user_id":"","effective_target":null,
+  "enabled":false,"logged_in":false,
+  "stage":"idle","stage_cn":"未登录","stage_msg":"还没登录：先扫码登录…",
+  "qr_png":"","qr_left":0,"verify_required":false,
+  "state":"未登录","to_user_id":"","effective_target":null,
+  "last_sender":"","session_ready":false,"heard_message":false,"has_context":false,
+  "listen_on":true,"last_incoming":"","last_incoming_at":null,
   "template":"📩 新短信{parts}\n模组：{modem}\n号码：{number}\n时间：{time}\n内容：{content}",
   "listen":true,"allowed_senders":"","bot_id":"","bot_user_id":"",
-  "has_token":false,"transport_ok":true
+  "token_mask":"","has_token":false,"transport_ok":true,
+  "last_send":null,"sent_ok":0,"sent_fail":0,
+  "default_template":"📩 新短信{parts}…"
 },"msg":"ok"}
 ```
 
-- `state`：`未登录` / `等待扫码` / `已登录`。
+- `stage`：`idle` / `wait` / `ready` / `expired`（页面按它分支：等扫码时画二维码，
+  登录后换配置面板）；`stage_cn` 是给人看的中文。
+- `qr_png`：二维码的 **SVG data URI**（后端离线画，不联网也不依赖前端库）；
+  `qr_left` 是剩余秒数。
+- `last_sender` / `last_incoming` / `last_incoming_at`：最近给机器人发过消息的人与时间；
+  `session_ready` = 已登录 **且** 真的收到过对方消息（没收到时主动发会被服务端拒）。
+- `sent_ok` / `sent_fail` / `last_send`：推送计数与最近一次发送记录（含失败原因）。
+- `token_mask`：只露首尾 4 位的 token，**不回传完整凭据**。
 - `effective_target`：实际推送目标。`to_user_id` 显式指定时就是它；为空时是
   **学到的**「最近给机器人发过消息的人」（`listen` 开着才会学）；
   两者都空 ⇒ `null`，此时不会推送。
 - `transport_ok`：设备上有没有 `curl`。`false` 时推送必然失败
   （`https://` 需要 TLS，而 `std` 没有），页面上该说清楚。
 
-⚠️ **这个接口也过短信密码闸门**：`[wechat]` 比短信本身还敏感 ——
-能改推送目标就能把短信转发到任意微信，而它回显的正是 `to_user_id`
-与 `allowed_senders`。
+⚠️ 短信访问密码已于 2026-10-19 取消；本接口只受**外层登录闸门**约束
+（`[ui] require_luci_login`）。能改推送目标就能把短信转发到任意微信，
+所以这个开关的意义仍然在「谁能登录路由器」。
 
 ### POST /api/wechat/login
 拿登录二维码（`{}`，无参数）。返回 `{state:"waiting_scan", qr_url, expires_at}`。
@@ -492,7 +545,7 @@ IPv6 开关（`{on}`，**必须显式给值**）：写回 `[net] wan_ipv6` 并�
 返回最新锁网状态。芯讯通方言未验证解锁写法，会明确拒绝。
 
 ### POST /api/sms/send
-发短信（走短信密码闸门）。请求体 `{modem_id, phone, content}`：
+发短信。请求体 `{modem_id, phone, content}`：
 中文 / emoji 自动切 UCS2（`AT+CSCS="UCS2"` + `AT+CSMP=17,167,0,8`），超长自动分段。
 
 **广和通 MTK 平台（FM350 / RW350 系列）整条序列换成 PDU 模式**——该平台 TEXT 模式下
@@ -511,15 +564,6 @@ UDH 各让 7 字节。UDH 开启时不自动发 `UDHI`。分段发送中途失�
 
 ```json
 {"code":0,"data":{"modem_id":0,"all":false,"removed":1},"msg":"ok"}
-```
-
-### POST /api/sms/password
-改密码 / 开关保护（需再输一次当前密码，失败走与解锁相同的限流）。请求体
-`{current?, new_password?, enabled?}`；写回 `config.toml` 的 `[ui]` 段（只改那两行、
-注释原样保留、改前备份 `config.toml.bak`），**不用重启**即生效；成功后吊销全部旧令牌。
-
-```json
-{"code":0,"data":{"required":true,"token":"<40 位>","ttl_s":1800,"default":false},"msg":"ok"}
 ```
 
 ### POST /api/sms/storage

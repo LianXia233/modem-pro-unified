@@ -2556,6 +2556,64 @@ QModem 为 MPL-2.0；`rust/src/modem/modem_catalog.json` 与 `catalog.rs` 的数
 
 ---
 
+## 44. WebUI 契约对齐 + 取消短信密码（2026-10-19）
+
+### 44.1 取消短信访问密码
+
+用户明确要求「取消短信的密码功能」。做法不是把校验关掉留个死开关，而是**整条链路删除**：
+
+| 删除对象 | 说明 |
+| --- | --- |
+| `http/smsauth.rs`（400 行） | 令牌表、失败节流、运行期覆盖、IP 锁定 |
+| `/api/sms/{auth,unlock,lock,password}` | 路由 + handler + 前端调用 |
+| `AppState::sms_auth` 与 WS `sms_token` | 推送不再按连接过滤 |
+| `[ui] sms_password*` | 配置字段、默认值、`config.toml` 注释、`patch.rs` 样例 |
+| 前端锁屏卡 / 解锁按钮 / 访问密码子页 | 短信页现在直接进列表，只有两个子页签 |
+
+保留的是**外层登录闸门**（`[ui] require_luci_login`，默认开）：短信与微信接口仍然
+要求登录路由器账号，只是不再额外要一道密码。
+
+### 44.2 字段级对齐（不是「有字段就行」，是能拿到正确值）
+
+用脚本把前端所有 `snake_case` 属性访问与后端字段/JSON key 做了差集，再逐条核；
+最后用**无头 Chromium + CDP 隧道**（SSH 转发到设备 9527）逐页签实跑，抓 `pageerror`/console。
+
+| 接口 | 补的字段 | 数据来源 |
+| --- | --- | --- |
+| `/api/network/status` | `duplex`、`reg_5g`/`reg_eps`、`serving`/`serving_count`/`neighbour_count`/`scanned_at`、`roam_allowed`/`roam_scope`、`airplane`/`cfun`、`raw_net_info` | QNWINFO 串、`C5GREG`/`CEREG`（仅 CS/PS 都未注册时）、基站扫描缓存、`AT+CFUN?`、`[net] allow_roaming` |
+| `/api/cells` | `ca_cmds`、`ca_note`，扫描后补 `operator`/`net_info`/`network_reg` | `VendorSpec::vendor_cmds()` 里含 `CAINFO` 的指令；`AT+COPS?`/厂商 net_info/`AT+CGREG?` |
+| `/api/usbnet` | 整个视图重写（`modes[]`/`mode_cmds`/`blocked_modes`/`need_reboot`/`cmd`/`note`，取值字符串） | 厂商 `usbnet_write()` 策略 + QCFG 回读 |
+| `/api/dial` | `usb.host_iface_hint`（改名）、`catalog_model/usb/pcie` | 支持清单 |
+| `/api/session` | `required` / `login_url`；401 体加 `need_login` | 配置 + 常量 |
+| `/api/modems` | `cell_scan_at` | 扫描缓存时间（不触发扫描） |
+| `/api/wechat` | `stage/stage_cn/qr_png/qr_left/token_mask/last_sender/session_ready/heard_message/listen_on/last_incoming(+at)/last_send/sent_ok/sent_fail/default_template` | 登录态、学到的发送者、发送计数、二维码离线渲染 |
+
+**没做的两项（如实保留为空，前端自动隐藏，不编数据）**：
+`extra_net`（芯讯通 CNWINFO / 鼎桥 HFREQINFO）与 `ambr`（签约速率 / CQI / QCI）——
+上游 Go 有解析器，Rust 侧尚未移植；前端对这两组字段本来就是「有才显示」。
+
+### 44.3 顺带修掉的真 Bug
+
+1. **空短信列表被当成读失败**：`AT+CMGL=4` 零条时也回 `OK`，旧代码把所有空列表
+   报成 `PDU 模式下未解出任何短信`，短信页永远显示读取失败。现在空列表 = `[]`。
+2. **扫码登录没有二维码**：新增 `qrcode`（`default-features=false`），后端离线生成
+   **SVG data URI**；不依赖 `image` crate，也不联网。
+3. **「没扫过」显示成「刚扫过」**：`CellScanResult::empty()` 原先把 `scanned_at`
+   填当前时间；改为空串，`/api/modems` 的 `cell_scan_at` 也走「没有就不给」。
+4. **USB 网卡「未知（）」**：读不到当前值时页面显示半截文案；现在下拉置灰 +
+   原因说明，档位仍列出（只读）。
+
+### 44.4 验证
+
+- `cargo test` **584 全绿**（删除短信密码 9 条用例，新增空列表/二维码/视图用例）；
+- `cargo clippy --all-targets` 零告警；`node --check` 前端脚本通过；
+- **无头 Chromium 实跑**（SSH 隧道 → 设备 9527）：概览 / 基站扫描 / 锁网 / 拨号 /
+  短信（列表 + 微信）/ 高级配置（配额 + USB 网卡）/ AT / 日志 / 定时 / 变更，
+  只有一个 favicon 404（已用内联 icon 消除），无 `pageerror`；
+- 设备上 `/api/sms/read` 返回 `{"code":0,"data":[]}`，`/api/sms/auth` 为 404。
+
+---
+
 ## 12. 编码规范与要求（强约束）
 
 1. **模块拆分**：宁细勿粗，一个接口一个 handler 文件；解析逻辑放 `model/*` 并配单测。

@@ -32,8 +32,6 @@ const MAX_FRAME: usize = 1 << 20;
 /// 一个已建立的 WebSocket 连接（对外只暴露写能力）。
 pub struct WsClient {
     pub id: u64,
-    /// 握手携带的短信访问令牌（短信推送按令牌过滤，见 docs/PORTING.md）。
-    pub sms_token: Option<String>,
     /// 屏端（`/display/ws`）：被动连接，只读缓存，不算「有人在看」。
     ///
     /// 那块屏 7x24 在线，不能因为它就让模组每秒被问一遍 —— 周期推送循环
@@ -97,39 +95,10 @@ impl WsHub {
         }
     }
 
-    /// 广播一条**只给部分连接**的事件（`allow` 返回 false 的连接跳过）。
-    ///
-    /// 用于短信推送：内容带正文，必须过短信密码闸门（见 `http/smsauth.rs`），
-    /// 闸门与短信接口是同一把。条数角标（`smscount`）不含正文，走普通
-    /// [`Self::broadcast`] 即可。
-    pub fn broadcast_sms(
-        &self,
-        msg_type: &str,
-        modem_id: Option<u32>,
-        data: Value,
-        allow: impl Fn(&WsClient) -> bool,
-    ) {
-        let clients: Vec<Arc<WsClient>> = self.lock().clone();
-        for client in clients {
-            if !allow(&client) {
-                continue;
-            }
-            if let Err(e) = client.send_event(msg_type, modem_id, data.clone()) {
-                log::debug!("推送失败（客户端 {}）: {e}", client.id);
-            }
-        }
-    }
-
-    fn register(
-        &self,
-        stream: TcpStream,
-        sms_token: Option<String>,
-        display: bool,
-    ) -> Arc<WsClient> {
+    fn register(&self, stream: TcpStream, display: bool) -> Arc<WsClient> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let client = Arc::new(WsClient {
             id,
-            sms_token,
             display,
             stream: Mutex::new(stream),
         });
@@ -183,11 +152,7 @@ pub fn serve(stream: TcpStream, head: &[u8], state: Arc<AppState>, loopback: boo
     );
     stream.write_all(response.as_bytes())?;
 
-    let client = state.ws.register(
-        stream.try_clone()?,
-        query.get("sms_token").cloned(),
-        path == "/display/ws",
-    );
+    let client = state.ws.register(stream.try_clone()?, path == "/display/ws");
     log::info!("WebSocket 已连接: {} (id={})", path, client.id);
 
     let result = pump(&mut stream, &client, &state);
@@ -527,12 +492,12 @@ mod tests {
     }
 
     /// 建一对互联的 TCP，服务端那侧注册成客户端（返回客户端侧供测试读）。
-    fn pair(hub: &WsHub, token: Option<&str>) -> TcpStream {
+    fn pair(hub: &WsHub) -> TcpStream {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let client = TcpStream::connect(addr).unwrap();
         let server = listener.accept().unwrap().0;
-        let _: Arc<super::WsClient> = hub.register(server, token.map(str::to_string), false);
+        let _: Arc<super::WsClient> = hub.register(server, false);
         client
     }
 
@@ -548,41 +513,15 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_sms_gate_filters_by_token() {
+    fn broadcast_reaches_everyone() {
+        // 短信密码取消后，短信正文与角标一样走普通广播
         let hub = WsHub::new();
-        let mut good = pair(&hub, Some("tok-ok"));
-        let mut bad = pair(&hub, Some("tok-bad"));
-        let mut none = pair(&hub, None);
-
-        hub.broadcast_sms("sms", Some(0), json!([{"index": 7}]), |c| {
-            c.sms_token.as_deref() == Some("tok-ok")
-        });
-
-        // 闸门放行的那条：收到带正文的 sms
-        let got = read_some(&mut good).expect("放行的连接该收到 sms");
-        assert!(got.contains("\"type\":\"sms\""), "帧内容不对: {got}");
-        assert!(got.contains("\"index\":7"), "帧里没有正文: {got}");
-
-        // 令牌不对的、没带令牌的：一个字都不该收到
-        assert!(read_some(&mut bad).is_none(), "令牌不对不该收到");
-        assert!(read_some(&mut none).is_none(), "没带令牌不该收到");
-    }
-
-    #[test]
-    fn ungated_broadcast_reaches_everyone() {
-        // smscount 只有 {total,unread}、不含正文，走普通广播：人人可收
-        let hub = WsHub::new();
-        let mut good = pair(&hub, Some("tok-ok"));
-        let mut bad = pair(&hub, Some("tok-bad"));
-        let mut none = pair(&hub, None);
+        let mut a = pair(&hub);
+        let mut b = pair(&hub);
 
         hub.broadcast("smscount", Some(0), json!({"total": 3, "unread": 1}));
 
-        for (c, tag) in [
-            (&mut good, "带对令牌"),
-            (&mut bad, "带错令牌"),
-            (&mut none, "无令牌"),
-        ] {
+        for (c, tag) in [(&mut a, "连接 A"), (&mut b, "连接 B")] {
             let got = read_some(c).unwrap_or_else(|| panic!("{tag} 也该收到 smscount"));
             assert!(
                 got.contains("\"type\":\"smscount\""),
@@ -596,10 +535,10 @@ mod tests {
     fn broken_client_is_dropped_not_fatal() {
         // 写失败的连接不能带崩广播（对端已关时 send 会报错，循环要继续）
         let hub = WsHub::new();
-        let dead = pair(&hub, Some("tok-ok"));
+        let dead = pair(&hub);
         drop(dead); // 对端直接关掉
-        let mut alive = pair(&hub, Some("tok-ok"));
-        hub.broadcast_sms("sms", None, json!([{"index": 1}]), |_| true);
+        let mut alive = pair(&hub);
+        hub.broadcast("sms", None, json!([{"index": 1}]));
         let got = read_some(&mut alive).expect("活着的连接该照常收到");
         assert!(got.contains("\"type\":\"sms\""));
     }

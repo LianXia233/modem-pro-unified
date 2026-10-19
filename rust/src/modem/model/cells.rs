@@ -62,7 +62,17 @@ pub struct CellScanResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network_reg: Option<String>,
     pub ca_active: bool,
+    /// 本机实际可用的载波聚合查询指令（页面「没有 CA」的空态里要显示它，
+    /// 不能把移远的 `AT+QCAINFO` 写死 —— 换机型就是错的）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ca_cmds: Vec<String>,
+    /// 空态说明（为什么没有 CA / 什么时候才会有）。
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub ca_note: String,
 }
+
+/// 没有载波聚合时的说明（与厂商无关的事实，别写成"不支持"）。
+const CA_EMPTY_NOTE: &str = "空闲态下模组通常只上报主载波；进入连接态并由网络配置辅载波后，\n才会出现 SCC（本页数据来自基站扫描，不含实时 CA 查询）";
 
 fn is_zero(v: &i32) -> bool {
     *v == 0
@@ -108,14 +118,17 @@ impl CellScanResult {
             net_info: None,
             network_reg: None,
             ca_active: false,
+            ca_cmds: Vec::new(),
+            ca_note: String::new(),
         }
     }
 
     /// 空结果（缓存尚未填充时）。
+    ///
+    /// `scanned_at` 必须留空：填成"现在"会让页面把「从没扫过」显示成「刚刚扫过」。
     pub fn empty(modem_id: u32) -> Self {
         Self {
             modem_id,
-            scanned_at: crate::logging::timestamp(),
             ..Default::default()
         }
     }
@@ -152,15 +165,66 @@ impl Modem {
                 }
             }
         }
-        let result = CellScanResult::from_cells(self.id, cells);
+        let mut result = CellScanResult::from_cells(self.id, cells);
+        result.ca_cmds = self.ca_cmds();
+        result.ca_note = CA_EMPTY_NOTE.to_string();
+        // 扫描页底部那三行（运营商 / 网络接入信息 / 注册状态）：扫描本来就慢，
+        // 顺手补上比让页面显示三个 `-` 有用。运营商在小区行里常常没有，
+        // 用 `AT+COPS?` 的全名兜底。
+        if result.operator.as_deref().unwrap_or("").is_empty() {
+            result.operator = self.network().ok().and_then(|n| n.operator);
+        }
+        if let Ok(info) = self.net_info() {
+            if !info.trim().is_empty() {
+                result.net_info = Some(info);
+            }
+        }
+        let reg = self
+            .with_at(|p| p.command("AT+CGREG?", self.cmd_timeout))
+            .map(|raw| super::regstate::parse(&raw, "+CGREG"))
+            .unwrap_or_default();
+        if reg.raw.is_some() {
+            result.network_reg = Some(reg.text);
+        }
         self.set_cells_cache(result.clone());
         result
     }
 
     /// 最近一次扫描缓存（不触发扫描）；尚未扫描时返回空结果。
     pub fn cells_cached(&self) -> CellScanResult {
+        let mut r = self
+            .cells_cache()
+            .unwrap_or_else(|| CellScanResult::empty(self.id));
+        // 缓存里不带「这台机器有哪些 CA 指令」（那是厂商属性，不是扫描结果），
+        // 每次取出时补上，界面才能把空态说明写对。
+        if r.ca_cmds.is_empty() {
+            r.ca_cmds = self.ca_cmds();
+        }
+        if r.ca_note.is_empty() {
+            r.ca_note = CA_EMPTY_NOTE.to_string();
+        }
+        r
+    }
+
+    /// 本机厂商声明过的 CA 查询指令（`AT+QCAINFO` / `AT+GTCAINFO?` / `AT#CAINFOEXT?`…）。
+    pub fn ca_cmds(&self) -> Vec<String> {
+        self.vendor()
+            .spec()
+            .vendor_cmds()
+            .iter()
+            .filter(|c| c.to_ascii_uppercase().contains("CAINFO"))
+            .map(|c| (*c).to_string())
+            .collect()
+    }
+
+    /// 最近一次扫描时间（不触发扫描；从没扫过就没有）。
+    ///
+    /// 不能直接用 [`Self::cells_cached`]：它的空结果会把 `scanned_at` 填成"现在"，
+    /// 页面会把「没扫过」显示成「刚刚扫过」。
+    pub fn cell_scan_at(&self) -> Option<String> {
         self.cells_cache()
-            .unwrap_or_else(|| CellScanResult::empty(self.id))
+            .map(|c| c.scanned_at)
+            .filter(|s| !s.is_empty())
     }
 }
 

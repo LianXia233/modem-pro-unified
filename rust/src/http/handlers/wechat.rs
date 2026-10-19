@@ -11,12 +11,10 @@
 //! | `POST /api/wechat/test` | 发一条测试消息 |
 //! | `POST /api/wechat/logout` | 登出（清凭据） |
 //!
-//! ## 两道闸门
+//! ## 闸门
 //!
-//! 1. **外层登录闸门**（`router.rs` 的 `auth::is_authorized`）：所有接口都要过；
-//! 2. **短信密码闸门**（`http/smsauth.rs`）：`[wechat]` 比短信本身还敏感 ——
-//!    能改推送目标就能把短信转发到任意微信，所以**每一个**接口都过，
-//!    包括看起来只读的 `GET /api/wechat`（它回显 to_user_id 与 allowed_senders）。
+//! 只剩**外层登录闸门**（`router.rs` 的 `auth::is_authorized`）：短信密码已于
+//! 2026-10-19 取消（用户要求），微信接口跟着不再单独要密码。
 //!
 //! ⚠️ `login` / `verify` / `test` 会**同步跑 curl**（到公网的 HTTPS，
 //! 超时 15 秒），会占住一个 HTTP 工作线程。tiny_http 的线程池够用，
@@ -167,20 +165,13 @@ pub fn logout(req: Request, state: &AppState) -> Result<()> {
 
 // ---------- 闸门 ----------
 
-/// 两道闸门。过了返回 `None`；没过返回「该回的 HTTP 状态 + 文案」。
+/// 闸门。过了返回 `None`；没过返回「该回的 HTTP 状态 + 文案」。
 ///
 /// 为什么不自己回响应：`tiny_http::Request` 是**一次性**的，被闸门吃掉就
 /// 没法再回业务响应了。让闸门只判、由调用方回，六个 handler 都一样直白。
-///
-/// 也不用 `smsauth::guard` 那样的现成 helper：那是按「短信接口」报错的，
-/// 这里要说明白是「微信机器人接口」，用户才知道该输哪个密码。
 fn gate(state: &AppState, req: &Request) -> Option<(u16, &'static str)> {
     if !crate::http::auth::is_authorized(state, req) {
         return Some((401, "请先登录路由器管理账号"));
-    }
-    // `required()` 里已含「外层登录开着就自动停用」的判定
-    if !state.sms_auth.unlocked(&state.cfg, req) {
-        return Some((401, "需要短信访问密码：微信机器人比短信更敏感"));
     }
     None
 }

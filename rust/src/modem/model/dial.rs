@@ -503,10 +503,18 @@ pub struct DialTypeInfo {
     pub dial: Option<DialType>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub descriptor: Option<UsbDesc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// 主机侧网卡探测结果（页面字段名沿用上游 `host_iface_hint`）
+    #[serde(rename = "host_iface_hint", skip_serializing_if = "Option::is_none")]
     pub host_iface: Option<HostIfaceHint>,
     /// 总线：usb（PCIe 识别属后续阶段，暂不产出）
     pub bus: String,
+    /// 命中模块支持清单时给出本型号（型号不在清单里就留空，不猜）
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub catalog_model: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub catalog_usb: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub catalog_pcie: Vec<String>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub note: String,
     pub probed_at: String,
@@ -1358,8 +1366,8 @@ impl Modem {
 
         // ① 固件自己说（移远系：0=QMI/NDIS、1=ECM、2=MBIM、3=RNDIS、5=NCM）
         let st = self.usbnet();
-        if st.supported {
-            info.value = st.value.to_string();
+        if st.supported && !st.value.is_empty() {
+            info.value = st.value.clone();
             info.source = "at".into();
             info.confident = true;
             info.name = usbnet_mode_name(&info.value).to_string();
@@ -1459,6 +1467,12 @@ impl Modem {
         }
         if info.kind.is_empty() {
             info.kind = "unknown".into();
+        }
+        // ④ 支持清单：本型号在 USB / PCIe 两种形态下支持哪些数据协议（页面直接显示）
+        if let Some(e) = crate::modem::catalog::lookup(&self.model().unwrap_or_default()) {
+            info.catalog_model = e.model.clone();
+            info.catalog_usb = e.usb.clone();
+            info.catalog_pcie = e.pcie.clone();
         }
         *self.dial_type.lock().unwrap() = Some((info.clone(), Instant::now()));
         info

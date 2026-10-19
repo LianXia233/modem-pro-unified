@@ -58,10 +58,6 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/dial/disconnect"),
     ("GET", "/api/usbnet"),
     ("POST", "/api/usbnet/set"),
-    ("GET", "/api/sms/auth"),
-    ("POST", "/api/sms/unlock"),
-    ("POST", "/api/sms/lock"),
-    ("POST", "/api/sms/password"),
     ("GET", "/api/sms/read"),
     ("POST", "/api/sms/send"),
     ("POST", "/api/sms/delete"),
@@ -126,7 +122,15 @@ pub fn handle(req: Request, state: Arc<AppState>) -> Result<()> {
     let query = request::parse_query(&url);
 
     if !auth::is_authorized(&state, &req) {
-        return response::fail_status(req, 401, -1, "请先登录路由器管理账号");
+        // `need_login` 让页面即使在非 401 平台代理下也能识别；`login_url` 是 LuCI 入口，
+        // 页面「去 LuCI」按钮直接用（不写死路径）。
+        return response::fail_status_data(
+            req,
+            401,
+            -1,
+            serde_json::json!({ "need_login": true, "login_url": "/cgi-bin/luci/" }),
+            "请先登录路由器管理账号",
+        );
     }
 
     let m = method(&req);
@@ -199,13 +203,9 @@ pub fn handle(req: Request, state: Arc<AppState>) -> Result<()> {
         ("POST", "/api/lock/mode") => handlers::lock_mode::handle(req, &state, &query),
         ("POST", "/api/lock/unlock") => handlers::lock_unlock::handle(req, &state, &query),
         ("GET", "/api/modules") => handlers::modules::handle(req, &state, &query),
-        ("GET", "/api/sms/auth") => handlers::sms_auth::handle(req, &state),
-        ("POST", "/api/sms/unlock") => handlers::sms_unlock::handle(req, &state, &query),
-        ("POST", "/api/sms/lock") => handlers::sms_lock::handle(req, &state),
         ("GET", "/api/sms/read") => handlers::sms_read::handle(req, &state, &query),
         ("POST", "/api/sms/send") => handlers::sms_send::handle(req, &state, &query),
         ("POST", "/api/sms/delete") => handlers::sms_delete::handle(req, &state, &query),
-        ("POST", "/api/sms/password") => handlers::sms_password::handle(req, &state, &query),
         ("GET", "/api/sms/storage") => handlers::sms_storage::handle(req, &state, &query),
         ("POST", "/api/sms/storage") => handlers::sms_storage_set::handle(req, &state, &query),
         ("GET", "/api/at") | ("POST", "/api/at") => handlers::at::handle(req, &state, &query),
@@ -226,7 +226,7 @@ pub fn handle(req: Request, state: Arc<AppState>) -> Result<()> {
         ("GET", "/api/session") => handlers::session::session(req, &state),
         ("POST", "/api/login") => handlers::session::login(req, &state, &query),
         ("POST", "/api/logout") => handlers::session::logout(req),
-        // 企业微信推送（每个接口都过短信密码闸门，见 handlers/wechat.rs）
+        // 企业微信推送（短信密码已取消，只剩外层登录闸门）
         ("GET", "/api/wechat") => handlers::wechat::handle(req, &state),
         ("POST", "/api/wechat/login") => handlers::wechat::login(req, &state),
         ("POST", "/api/wechat/verify") => handlers::wechat::verify(req, &state),

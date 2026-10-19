@@ -26,7 +26,7 @@ pub struct NetworkInfo {
 }
 
 /// 网络状态总览（`GET /api/network/status`）。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct NetworkStatus {
     pub modem_id: u32,
     pub queried_at: String,
@@ -44,6 +44,9 @@ pub struct NetworkStatus {
     pub mnc: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub band_text: Option<String>,
+    /// FDD / TDD（从接入技术串里拆出来；认不出就没有）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duplex: Option<String>,
     #[serde(skip_serializing_if = "is_zero_i32")]
     pub band: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -54,6 +57,26 @@ pub struct NetworkStatus {
     pub operator: Option<String>,
     pub cs_reg: RegState,
     pub ps_reg: RegState,
+    /// 5GS 域注册状态：5G SA 下 CREG/CGREG 会长期停在 0,0（看着像「未注册」），
+    /// 真正的注册状态在 `+C5GREG` 里。**只在 CS/PS 都报未注册时才补查**。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reg_5g: Option<RegState>,
+    /// EPS 域注册状态（5GS 也拿不到时的兜底）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reg_eps: Option<RegState>,
+    /// 服务小区（取自基站扫描缓存；没扫过就没有）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serving: Option<super::cells::CellInfo>,
+    pub serving_count: usize,
+    pub neighbour_count: usize,
+    /// 上面这些缓存数据的扫描时间（没扫过就没有）
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub scanned_at: String,
+    /// 载波聚合的分量载波（PCC + SCC）。当前数据面**只从扫描缓存取**，
+    /// 没有实现实时 `AT+QCAINFO` 解析，所以通常为空（前端按空态渲染）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ca: Vec<CcInfo>,
+    pub ca_active: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub apn: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -61,8 +84,36 @@ pub struct NetworkStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ipv6: Option<String>,
     pub roaming: bool,
+    /// 「数据漫游」开关（`[net] allow_roaming`，默认 true）
+    pub roam_allowed: bool,
+    /// 漫游范围：none / domestic / global / unknown
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub roam_scope: String,
+    /// 飞行模式（`AT+CFUN?` 的 4 = 开）
+    pub airplane: bool,
+    /// 模组功能模式原值（1 = 全功能，4 = 飞行模式）
+    #[serde(skip_serializing_if = "is_zero_i32")]
+    pub cfun: i32,
+    /// 固件上报的 QNWINFO 原文（页面「刷新网络信息」的排查框要显示它）
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub raw_net_info: String,
     /// 累计流量与实测速率（见 model/traffic.rs；不支持计量时 `supported=false`）
     pub traffic: Option<TrafficView>,
+}
+
+/// 一个分量载波（载波聚合）。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CcInfo {
+    /// PCC / SCC（空 = 未标注）
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub role: String,
+    pub band: i32,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub band_label: String,
+    #[serde(skip_serializing_if = "is_zero_i32")]
+    pub bandwidth: i32,
+    #[serde(skip_serializing_if = "is_zero_i32")]
+    pub earfcn: i32,
 }
 
 fn is_zero_i32(v: &i32) -> bool {
@@ -104,7 +155,10 @@ impl Modem {
     }
 
     /// 网络状态总览。
-    pub fn network_status(&self) -> NetworkStatus {
+    ///
+    /// `allow_roaming` 来自 `[net] allow_roaming`（页面「漫游」提示要用它判断
+    /// 「国际漫游 + 开关关闭 = 数据链路该停」）。
+    pub fn network_status(&self, allow_roaming: bool) -> NetworkStatus {
         let qnw = self
             .with_at(|p| p.command("AT+QNWINFO", self.cmd_timeout))
             .unwrap_or_default();
@@ -139,6 +193,55 @@ impl Modem {
         let (apn, ipv4, ipv6) = self.query_active_context();
         let roaming = ps_reg.roaming;
 
+        // 5GS / EPS 兜底：只在 CS/PS 都说未注册时补查（平时正常的模组不多发指令）
+        let (mut reg_5g, mut reg_eps) = (None, None);
+        if !cs_reg.registered && !ps_reg.registered {
+            let raw = self
+                .with_at(|p| p.command("AT+C5GREG?", self.cmd_timeout))
+                .unwrap_or_default();
+            if raw.contains("+C5GREG") {
+                let st = regstate::parse(&raw, "+C5GREG");
+                if st.stat > 0 {
+                    reg_5g = Some(st);
+                }
+            }
+            if reg_5g.is_none() {
+                let raw = self
+                    .with_at(|p| p.command("AT+CEREG?", self.cmd_timeout))
+                    .unwrap_or_default();
+                if raw.contains("+CEREG") {
+                    let st = regstate::parse(&raw, "+CEREG");
+                    if st.stat > 0 {
+                        reg_eps = Some(st);
+                    }
+                }
+            }
+        }
+
+        // 服务小区 / 数量：只读扫描缓存，**不触发扫描**（扫描要好几秒）
+        let cells = self.cells_cached();
+        let serving = cells.serving.first().cloned();
+
+        // 漫游范围：不漫游时不用多读 IMSI
+        let roam_scope = if roaming {
+            let imsi = self
+                .with_at(|p| p.command("AT+CIMI", self.cmd_timeout))
+                .map(|raw| super::siminfo::parse_imsi(&raw))
+                .unwrap_or(None);
+            super::siminfo::roam_state(true, imsi.as_deref(), f.plmn.as_deref()).scope
+        } else {
+            "none".to_string()
+        };
+
+        // 飞行模式：CFUN 原值同时给页面（4 = 飞行模式）
+        let air = self.airplane();
+        let duplex = f.net_tech.as_deref().map(duplex_of);
+        let cfun = if air.supported {
+            if air.enabled { 4 } else { 1 }
+        } else {
+            0
+        };
+
         NetworkStatus {
             modem_id: self.id,
             queried_at: crate::logging::timestamp(),
@@ -149,16 +252,31 @@ impl Modem {
             mnc: f.mnc,
             plmn: f.plmn,
             band_text: f.band_text,
+            duplex,
             band: f.band.unwrap_or(0),
             band_label: f.band_label,
             earfcn: f.earfcn,
             operator: f.operator,
             cs_reg,
             ps_reg,
+            reg_5g,
+            reg_eps,
+            serving,
+            serving_count: cells.serving_count,
+            neighbour_count: cells.neighbour_count,
+            // 没扫过就是空串（cells_cached 的空结果不带时间戳）
+            scanned_at: self.cell_scan_at().unwrap_or_default(),
+            ca: Vec::new(),
+            ca_active: false,
             apn,
             ipv4,
             ipv6,
             roaming,
+            roam_allowed: allow_roaming,
+            roam_scope,
+            airplane: air.enabled,
+            cfun,
+            raw_net_info: raw_lines(&qnw),
             traffic: Some(self.traffic_view()),
         }
     }
@@ -275,6 +393,31 @@ pub fn parse_qnwinfo(resp: &str) -> QnwInfo {
     out.band = out.band_text.as_deref().and_then(parse_band);
     out.earfcn = f.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
     out
+}
+
+/// AT 应答 → 一行（去掉命令回显与空行，用 ` | ` 连接）。
+fn raw_lines(resp: &str) -> String {
+    let mut lines: Vec<&str> = resp
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("AT+"))
+        .collect();
+    if lines.len() > 1 {
+        lines.retain(|l| *l != "OK");
+    }
+    lines.join(" | ")
+}
+
+/// 从接入技术串里取双工方式（`TDD NR5G` → `TDD`）。
+fn duplex_of(net_tech: &str) -> String {
+    let u = net_tech.to_ascii_uppercase();
+    if u.contains("TDD") {
+        "TDD".to_string()
+    } else if u.contains("FDD") {
+        "FDD".to_string()
+    } else {
+        String::new()
+    }
 }
 
 /// PLMN → MCC（前三位，国家码）。

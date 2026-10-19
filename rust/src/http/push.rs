@@ -38,7 +38,7 @@ pub fn push_network_state(state: &AppState, modem: &Modem, st: &NetworkStatus) {
 
 /// 后台循环用：查一次网络状态并推送（查失败只记日志，不打扰别人）。
 pub fn push_network(state: &AppState, modem: &Modem) {
-    let st = modem.network_status();
+    let st = modem.network_status(state.cfg.net.allow_roaming);
     push_network_state(state, modem, &st);
 }
 
@@ -98,21 +98,16 @@ pub fn push_lock(state: &AppState, modem: &Modem, st: &LockStatus) {
     state.ws.broadcast("lock", Some(modem.id), data);
 }
 
-/// 推短信列表（读短信 / 换卡后调用；内容带正文，过短信密码闸门）。
+/// 推短信列表（读短信 / 换卡后调用）。
 ///
-/// 闸门与短信接口同一把：没配密码时人人可收；配了就要握手时带的令牌还有效。
+/// 短信密码已经取消（2026-10-19，用户要求）：内容与角标一样走普通广播，
+/// 访问控制只剩外层「要不要登录路由器」这一道。
 pub fn push_sms(state: &AppState, modem: &Modem, list: &[Sms]) {
-    let need = state.sms_auth.required(&state.cfg);
-    let auth = &state.sms_auth;
     let data = serde_json::to_value(list).unwrap_or(Value::Null);
-    state.ws.broadcast_sms("sms", Some(modem.id), data, |c| {
-        !need || auth.token_valid(c.sms_token.as_deref().unwrap_or(""))
-    });
+    state.ws.broadcast("sms", Some(modem.id), data);
 }
 
 /// 推短信条数角标（`{total, unread}`）。
-///
-/// 只有数字、没有任何短信内容，因此**不过密码闸门**（锁着也能看到有几条未读）。
 pub fn push_smscount(state: &AppState, modem: &Modem) {
     let (total, unread) = modem.sms_counts();
     let data = json!({ "total": total, "unread": unread });

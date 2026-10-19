@@ -7,14 +7,11 @@ use std::collections::HashMap;
 use tiny_http::Request;
 
 use crate::error::Result;
-use crate::http::{response, smsauth, AppState};
+use crate::http::{response, AppState};
 
 use super::modem_by_query;
 
 pub fn handle(req: Request, state: &AppState, query: &HashMap<String, String>) -> Result<()> {
-    if !state.sms_auth.unlocked(&state.cfg, &req) {
-        return smsauth::locked_response(req, state);
-    }
     let Some(modem) = modem_by_query(state, query) else {
         return response::fail(req, -1, "modem not found");
     };

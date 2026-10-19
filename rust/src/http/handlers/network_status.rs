@@ -15,7 +15,7 @@ pub fn handle(req: Request, state: &AppState, query: &HashMap<String, String>) -
     let Some(modem) = modem_by_query(state, query) else {
         return response::fail(req, -1, "modem not found");
     };
-    let status = modem.network_status();
+    let status = modem.network_status(state.cfg.net.allow_roaming);
     push_changes(
         state,
         modem.id,

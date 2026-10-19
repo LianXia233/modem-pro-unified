@@ -9,15 +9,12 @@ use tiny_http::Request;
 
 use crate::config::patch;
 use crate::error::Result;
-use crate::http::{request, response, smsauth, AppState};
+use crate::http::{request, response, AppState};
 
 use super::modem_by_query;
 
 pub fn handle(mut req: Request, state: &AppState, query: &HashMap<String, String>) -> Result<()> {
     let params = request::merge_form(query, &request::read_body(&mut req));
-    if !state.sms_auth.unlocked(&state.cfg, &req) {
-        return smsauth::locked_response(req, state);
-    }
     let Some(modem) = modem_by_query(state, &params) else {
         return response::fail(req, -1, "modem not found");
     };

@@ -15,7 +15,16 @@ pub fn session(req: Request, state: &AppState) -> Result<()> {
         Some(sid) => state.ubus.session_valid(&sid).unwrap_or(false),
         None => false,
     };
-    response::ok(req, serde_json::json!({ "logged_in": logged_in }))
+    response::ok(
+        req,
+        serde_json::json!({
+            "logged_in": logged_in,
+            // 「跟随 LuCI 登录」闸门是否开着（页面据此决定要不要显示登录条）
+            "required": state.cfg.require_luci_login(),
+            // LuCI 入口：页面「去 LuCI」按钮用，不写死路径
+            "login_url": "/cgi-bin/luci/",
+        }),
+    )
 }
 
 /// `POST /api/login` —— 校验密码并下发 cookie。

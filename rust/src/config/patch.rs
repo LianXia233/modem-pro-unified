@@ -150,9 +150,9 @@ mod tests {
     const SAMPLE: &str = "\
 # 顶部注释
 [ui]
-# 密码说明
-sms_password = \"password\"
-sms_password_required = true
+# 登录说明
+require_luci_login = true
+login_attempts = 5
 
 [sms]
 sms_memory = \"SM\"
@@ -160,10 +160,10 @@ sms_memory = \"SM\"
 
     #[test]
     fn replaces_existing_key_and_keeps_comments() {
-        let out = replace_value(SAMPLE, "ui", "sms_password", "\"new-secret\"");
-        assert!(out.contains("sms_password = \"new-secret\""));
-        assert!(out.contains("# 密码说明"));
-        assert!(out.contains("sms_password_required = true"));
+        let out = replace_value(SAMPLE, "ui", "require_luci_login", "false");
+        assert!(out.contains("require_luci_login = false"));
+        assert!(out.contains("# 登录说明"));
+        assert!(out.contains("login_attempts = 5"));
         assert!(out.contains("sms_memory = \"SM\""));
         assert!(out.ends_with('\n'));
     }
@@ -187,10 +187,10 @@ sms_memory = \"SM\"
 
     #[test]
     fn commented_out_key_is_not_touched() {
-        let src = "[ui]\n# sms_password = \"old\"\n";
-        let out = replace_value(src, "ui", "sms_password", "\"x\"");
-        assert!(out.contains("# sms_password = \"old\""));
-        assert!(out.contains("\nsms_password = \"x\""));
+        let src = "[ui]\n# require_luci_login = false\n";
+        let out = replace_value(src, "ui", "require_luci_login", "true");
+        assert!(out.contains("# require_luci_login = false"));
+        assert!(out.contains("\nrequire_luci_login = true"));
     }
 
     #[test]
@@ -202,7 +202,7 @@ sms_memory = \"SM\"
 
     #[test]
     fn no_trailing_newline_is_preserved() {
-        let out = replace_value("[ui]\nsms_password = \"a\"", "ui", "sms_password", "\"b\"");
-        assert!(out.ends_with("\"b\""));
+        let out = replace_value("[ui]\nrequire_luci_login = true", "ui", "require_luci_login", "false");
+        assert!(out.ends_with("false"));
     }
 }

@@ -230,15 +230,9 @@ block_interval = 30
 activate_ims = true
 
 [ui]
-# 短信访问密码：进「短信」页 / 调短信接口都要它（默认就是 password）。
-#   sms_password = ""            -> 不启用密码校验
-#   sms_password_required = false  -> 同样关掉密码校验
-# ⚠️ 外层登录（下面 require_luci_login）开着时这一层**自动停用**：能调接口的人
-#    本来就已经登录过路由器账号了，再要一道短信密码是重复保护（配置仍保留，
-#    把外层登录关掉就重新生效）。
-# 也可以在切「短信」页解锁后直接改（会写回本文件，不用重启；见 module/config/config.go）。
-sms_password_required = true
-sms_password = "password"
+# 短信访问密码已于 2026-10-19 取消（用户要求）：短信接口只受下面的
+# 「接口登录保护」约束。旧配置里的 sms_password / sms_password_required
+# 两行会被忽略（不再读取），可以删掉。
 
 # 是否要求「先登录路由器管理员账号」才给调接口（设备中心 / 小窗 / 脚本都算）。
 #
@@ -262,8 +256,7 @@ sms_password = "password"
 #     （否则连登录都做不了；登录接口靠限流挡暴力猜密码：同 IP 60 秒 5 次）；
 #   · 127.0.0.1（设备本机）免登录 —— 本机脚本 / 排障 / 打包自检不受影响；
 #   · 这台机器上找不到 ubus（非 OpenWrt，比如 Windows 上跑 modemd）时整体不启用；
-#   · ubus 调不起来（超时）时放行并记日志，只有 rpcd 明确回答「没这个会话」才拒绝；
-#   · 上面那层短信密码**自动停用**（能调接口的人本来就已经登录过路由器账号了）。
+#   · ubus 调不起来（超时）时放行并记日志，只有 rpcd 明确回答「没这个会话」才拒绝。
 require_luci_login = true
 
 # ubus 的 HTTP JSON-RPC 端点：登录/退出用它（**密码走请求体，不会出现在 ps 里**）。
@@ -281,7 +274,7 @@ require_luci_login = true
 #   listen  是否长轮询收“微信发给机器人的消息”（用来学推送目标）
 #   allowed_senders  只接受这些发送者（逗号分隔子串，留空 = 不限制）
 # ⚠️ 这个段比短信本身还敏感：能改推送目标就能把短信转发到任意微信，
-#    所以相关接口都要过短信密码闸门。
+#    所以相关接口只给**已登录路由器账号**的请求用（[ui] require_luci_login）。
 enabled = false
 base_url = "https://ilinkai.weixin.qq.com"
 bot_token = ""

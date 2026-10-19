@@ -16,9 +16,12 @@
 //!    会把进程线程占满（同步 curl，会阻塞调用方）。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
 use serde::Serialize;
 
 use crate::config::WeChatConfig;
@@ -58,19 +61,120 @@ pub struct Overrides {
 pub struct WeChatView {
     pub enabled: bool,
     pub logged_in: bool,
+    /// 登录阶段：idle / wait / ready / expired（与页面 `stage` 分支同名）
+    pub stage: &'static str,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub stage_cn: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub stage_msg: String,
+    /// 二维码（离线渲染成 SVG data URI；页面直接放 `<img src>`）
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub qr_png: String,
+    /// 二维码内容（排查/手工打开用）
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub qr_url: String,
+    /// 二维码剩余秒数
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub qr_left: u64,
+    /// 需要配对码（当前登录流程没有这一阶段，恒 false）
+    pub verify_required: bool,
+    /// 旧字段：登录态短名（保留给 /api/wechat 的老调用方）
     pub state: &'static str,
     pub to_user_id: String,
     /// 生效的推送目标（显式配置优先，否则是学到的发送者）。
     pub effective_target: Option<String>,
+    /// 最近给机器人发过消息的人
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub last_sender: String,
+    /// 能不能主动发消息：真的收到过对方消息（或扫码用户已就绪）才算
+    pub session_ready: bool,
+    /// 收到过对方消息
+    pub heard_message: bool,
+    /// 有会话上下文令牌（当前实现不维护，恒 false）
+    pub has_context: bool,
+    /// 长轮询监听是否开着
+    pub listen_on: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub last_incoming: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_incoming_at: Option<String>,
     pub template: String,
     pub listen: bool,
     pub allowed_senders: String,
     pub bot_id: String,
     pub bot_user_id: String,
-    /// 有没有 token（**不回传 token 本身**：这比短信还敏感）。
+    /// 掩码后的 token（**不回传完整 token**）
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub token_mask: String,
+    /// 有没有 token
     pub has_token: bool,
     /// curl 是否可用（不可用时推送必然失败，页面上该说清楚）。
     pub transport_ok: bool,
+    /// 最近一次发送记录
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_send: Option<SendRecord>,
+    pub sent_ok: u64,
+    pub sent_fail: u64,
+    /// 默认模板（页面「恢复默认」按钮用）
+    pub default_template: String,
+}
+
+/// 最近一次发送记录（成功/失败都记）。
+#[derive(Debug, Clone, Serialize)]
+pub struct SendRecord {
+    pub at: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub msg: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub test: bool,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+/// token 掩码：只露首尾 4 位，中间省略（面板不泄露完整凭据）。
+fn mask_token(t: &str) -> String {
+    let t = t.trim();
+    let n = t.chars().count();
+    if n == 0 {
+        return String::new();
+    }
+    if n <= 8 {
+        return "••••".to_string();
+    }
+    let head: String = t.chars().take(4).collect();
+    let tail: String = t.chars().skip(n - 4).collect();
+    format!("{head}…{tail}")
+}
+
+/// 二维码内容 → SVG data URI。
+///
+/// 为什么是 SVG 而不是 PNG：`qrcode` crate 不开 `image` 特性时零额外依赖，
+/// 手写一小段 `<path>` 就能出图；`<img src="data:image/svg+xml;base64,…">`
+/// 浏览器照样渲染，固件体积也不用背一个图像库。
+fn qr_data_uri(content: &str) -> String {
+    if content.trim().is_empty() {
+        return String::new();
+    }
+    let Ok(code) = qrcode::QrCode::new(content.as_bytes()) else {
+        return String::new();
+    };
+    let width = code.width();
+    let colors = code.to_colors();
+    let mut path = String::new();
+    for (i, c) in colors.iter().enumerate() {
+        if *c == qrcode::Color::Dark {
+            let x = i % width;
+            let y = i / width;
+            path.push_str(&format!("M{x} {y}h1v1h-1z"));
+        }
+    }
+    let svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {width} {width}\" shape-rendering=\"crispEdges\"><rect width=\"{width}\" height=\"{width}\" fill=\"#fff\"/><path d=\"{path}\" fill=\"#000\"/></svg>"
+    );
+    format!("data:image/svg+xml;base64,{}", B64.encode(svg))
 }
 
 /// 企业微信客户端（一个进程一个，挂在 `AppState` 上）。
@@ -85,6 +189,13 @@ pub struct WeChatClient {
     pushed: Mutex<HashMap<u32, Vec<String>>>,
     /// 上次推送时刻（节流）。
     last_push: Mutex<Option<Instant>>,
+    /// 最近一次收到对方消息（发送者 + 时刻）
+    last_incoming: Mutex<Option<(String, String)>>,
+    /// 最近一次发送记录
+    last_send: Mutex<Option<SendRecord>>,
+    /// 推送成功 / 失败计数
+    sent_ok: AtomicU64,
+    sent_fail: AtomicU64,
 }
 
 impl WeChatClient {
@@ -101,6 +212,10 @@ impl WeChatClient {
             ov: Mutex::new(Overrides::default()),
             pushed: Mutex::new(HashMap::new()),
             last_push: Mutex::new(None),
+            last_incoming: Mutex::new(None),
+            last_send: Mutex::new(None),
+            sent_ok: AtomicU64::new(0),
+            sent_fail: AtomicU64::new(0),
         }
     }
 
@@ -191,19 +306,91 @@ impl WeChatClient {
     /// 给页面的视图。
     pub fn view(&self) -> WeChatView {
         let st = self.login_state();
+        let now = crate::logging::unix_now();
+        let (stage, stage_cn, stage_msg, qr_url, qr_left) = match &st {
+            LoginState::LoggedIn { .. } => (
+                "ready",
+                "已登录",
+                "已登录：收到新短信会按模板推到微信。",
+                String::new(),
+                0,
+            ),
+            LoginState::QrPending { url, expires_at } => {
+                let left = (*expires_at - now).max(0) as u64;
+                if left == 0 {
+                    (
+                        "expired",
+                        "二维码已失效",
+                        "二维码已过期：点「重新生成二维码」再来一次。",
+                        url.clone(),
+                        0,
+                    )
+                } else {
+                    (
+                        "wait",
+                        "等待扫码",
+                        "用手机微信扫码，并在手机上点「确认」。",
+                        url.clone(),
+                        left,
+                    )
+                }
+            }
+            LoginState::LoggedOut => (
+                "idle",
+                "未登录",
+                "还没登录：先扫码登录，然后在微信里给机器人发一条消息。",
+                String::new(),
+                0,
+            ),
+        };
+        let last_sender = self.learned_sender();
+        let heard = !last_sender.is_empty();
+        let (last_incoming, last_incoming_at) = self
+            .last_incoming
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|(s, at)| (s, Some(at)))
+            .unwrap_or_default();
         WeChatView {
             enabled: self.enabled(),
             logged_in: st.can_push(),
+            stage,
+            stage_cn: stage_cn.to_string(),
+            stage_msg: stage_msg.to_string(),
+            qr_png: qr_data_uri(&qr_url),
+            qr_url,
+            qr_left,
+            verify_required: false,
             state: st.label(),
             to_user_id: self.to_user_id(),
-            effective_target: pick_target(&self.to_user_id(), &self.learned_sender()),
+            effective_target: pick_target(&self.to_user_id(), &last_sender),
+            last_sender: last_sender.clone(),
+            session_ready: st.can_push() && heard,
+            heard_message: heard,
+            has_context: false,
+            listen_on: self.listen(),
+            last_incoming,
+            last_incoming_at,
             template: self.template(),
             listen: self.listen(),
             allowed_senders: self.allowed_senders(),
             bot_id: self.cfg.bot_id.clone(),
             bot_user_id: self.cfg.bot_user_id.clone(),
+            token_mask: mask_token(&self.cfg.bot_token),
             has_token: st.can_push(),
             transport_ok: transport::available(),
+            last_send: self.last_send.lock().unwrap().clone(),
+            sent_ok: self.sent_ok.load(Ordering::Relaxed),
+            sent_fail: self.sent_fail.load(Ordering::Relaxed),
+            default_template: super::DEFAULT_TEMPLATE.to_string(),
+        }
+    }
+
+    /// 把最近一次发送标记为「测试消息」（`/api/wechat/test` 用）。
+    pub fn mark_last_test(&self) {
+        if let Some(r) = self.last_send.lock().unwrap().as_mut() {
+            r.test = true;
         }
     }
 
@@ -217,7 +404,10 @@ impl WeChatClient {
         if !should_learn_sender(msg, &self.allowed_senders()) {
             return false;
         }
-        *self.last_sender.lock().unwrap() = msg.sender.trim().to_string();
+        let sender = msg.sender.trim().to_string();
+        *self.last_sender.lock().unwrap() = sender.clone();
+        *self.last_incoming.lock().unwrap() =
+            Some((sender, crate::logging::timestamp()));
         true
     }
 
@@ -310,7 +500,28 @@ impl WeChatClient {
     }
 
     /// 发一条纯文本（`/api/wechat/test` 与上面的推送共用）。
+    ///
+    /// 成功/失败都会更新面板上的计数与「最近一次发送」—— 页面那两格
+    /// （`sent_ok` / `sent_fail` / `last_send`）就是靠它。
     pub fn send_text(&self, target: &str, text: &str) -> Result<()> {
+        let r = self.send_text_inner(target, text);
+        match &r {
+            Ok(()) => self.sent_ok.fetch_add(1, Ordering::Relaxed),
+            Err(_) => self.sent_fail.fetch_add(1, Ordering::Relaxed),
+        };
+        *self.last_send.lock().unwrap() = Some(SendRecord {
+            at: crate::logging::timestamp(),
+            ok: r.is_ok(),
+            msg: match &r {
+                Ok(()) => String::new(),
+                Err(e) => e.to_string(),
+            },
+            test: false,
+        });
+        r
+    }
+
+    fn send_text_inner(&self, target: &str, text: &str) -> Result<()> {
         let url = api_url(&self.base_url(), super::api::SEND_PATH);
         let body = serde_json::json!({
             "bot_token": self.token(),

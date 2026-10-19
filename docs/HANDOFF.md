@@ -58,8 +58,8 @@
 | `/api/params` | ✅ | 读 + 写（`apn` / `apn/delete` / `pdp` / `netselect`）均已完成 |
 | `/api/ussd` | ✅ | GET 读最近一次应答 `{modem_id, result}`（可为 null）；POST 下发（校验字符集 + `AT+CPIN?` 判 PIN 锁）；`+CUSD` 应答由 URC 消费循环自动推送（同步到达的那条由下发接口当场收下并推，两条路不重复） |
 | `/api/logs`、`/api/modules`、`/api/at`、`/api/at/presets` | ✅ | `at` 的 `resp` 为应答行数组、失败也回 `data:{cmd,resp}`；`presets` 按厂商合并清单（无模组回 code 0 兜底）；`modules` 的 `?model=`/`?modem_id=` 待补 |
-| `/api/sms/auth`、`/api/sms/unlock`、`/api/sms/lock`、`/api/sms/read`、`/api/sms/storage`(GET) | ✅ | `model/sms.rs` PDU/文本解码 + `http/smsauth.rs` 密码闸门 |
-| `/api/sms/send`、`/api/sms/delete`、`/api/sms/password`、`/api/sms/storage`(POST) | ✅ | 文本模式 `AT+CMGS`（UCS2 + 分段）/ `AT+CMGD` / `AT+CPMS`；写回 config.toml 走 `config/patch.rs`（行级替换，注释保留） |
+| `/api/sms/read`、`/api/sms/storage`(GET) | ✅ | `model/sms.rs` PDU/文本解码（**密码已取消**，只受登录闸门） |
+| `/api/sms/send`、`/api/sms/delete`、`/api/sms/storage`(POST) | ✅ | 文本模式 `AT+CMGS`（UCS2 + 分段）/ `AT+CMGD` / `AT+CPMS`；写回 config.toml 走 `config/patch.rs`（行级替换，注释保留） |
 | `/api/signal/history`、`/api/changes`、`/api/changes/clear` | ✅ | `modem/metrics.rs`：波动记录 + 采样历史（进程内环形缓冲）；记录点挂在已有查询上，不额外发 AT |
 | `/api/quota`、`/api/quota/set`、`/api/quota/reset`、`/api/quota/unblock`、`/api/traffic/reset` | ✅ | `http/quota.rs` + `runtime/store.rs`（`quota.json`）+ `model/traffic.rs` / `model/quota.rs` |
 | `/api/netscan`、`/api/netscan/stop` | ✅ | `model/netscan.rs`：`AT+COPS=?`（可中断）+ 芯讯通 `AT+CNWSEARCH` |
@@ -118,9 +118,8 @@ docs/               INTEGRATION / BUILD / API / PORTING / PROGRESS / HANDOFF（�
    NO-CARRIER）；`AT+CMGL` 有「标已读」副作用；
    `/api/sms/storage` 同路径 GET 读 / POST 切；一个 AT 口 = 一个模组；
    AT 解析按量纲定位（`+CESQ` 换算、`+QENG` NR/LTE 下标、Fibocom SSB 扩展等）不得回退。
-9. **短信密码闸门**：`require_luci_login` 开启 / `sms_password_required=false` / `sms_password`
-   为空串时**不需要**密码；令牌 TTL 30 分钟、最多 32 个、连错 5 次锁 60 秒、默认密码 `password`；
-   令牌优先 `X-SMS-Token` 头、其次 query `sms_token`；未解锁访问返回 HTTP 401 + `locked`。
+9. **短信密码已取消**（2026-10-19 用户要求）：短信 / 微信接口只受 `require_luci_login` 约束；
+   `[ui] sms_password*` 不再读取，`/api/sms/{auth,unlock,lock,password}` 与 WS `sms_token` 已删除。
 10. **前端不动**：任何改动不得要求修改 `rust/web/*.html` 的接口调用方式。
 11. **流量配额**：用量按差分/积分累计（首次采样只建基线），台账写**配置文件同目录**的
     `quota.json`（重启不丢），config.toml 只给默认值；超限时**只停上网用的 PDP 上下文**
