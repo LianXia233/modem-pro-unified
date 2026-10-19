@@ -152,9 +152,9 @@ define Package/modem-pro/install
 	$(INSTALL_DATA) $(CURDIR)/luci/app/ucode/controller/modemd_api.uc $(1)/usr/share/ucode/luci/controller/modemd_api.uc
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/modemd
 	$(INSTALL_DATA) $(CURDIR)/luci/app/js/view/modemd/*.js $(1)/www/luci-static/resources/view/modemd/
-	# 共享 JS 模块（api/task/store/fmt）：异步化架构的页面侧
+	# 共享 JS 模块与样式（api/task/store/fmt/icons/css）：异步化与白色毛玻璃架构
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/modemd
-	$(INSTALL_DATA) $(CURDIR)/luci/app/htdocs/luci-static/resources/modemd/*.js $(1)/www/luci-static/resources/modemd/
+	$(INSTALL_DATA) $(CURDIR)/luci/app/htdocs/luci-static/resources/modemd/* $(1)/www/luci-static/resources/modemd/
 
 	# 菜单 + ACL
 	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d

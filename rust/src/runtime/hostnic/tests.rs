@@ -263,9 +263,11 @@ fn hostnic_store_roundtrip() {
 
 #[test]
 fn hostnic_file_sits_next_to_config() {
+    let dir = std::path::Path::new("/etc/modemd");
+    let cfg = dir.join("config.toml").to_string_lossy().to_string();
     assert_eq!(
-        hostnic_file("/etc/modemd/config.toml"),
-        "/etc/modemd/hostnic.json"
+        hostnic_file(&cfg),
+        dir.join("hostnic.json").to_string_lossy()
     );
     assert_eq!(hostnic_file(""), "hostnic.json");
 }

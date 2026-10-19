@@ -1,9 +1,17 @@
 {
-	"admin/modemd": {
-		"title": "5G 终端",
-		"order": 26,
+	"admin/modem": {
+		"title": "Mobile Network",
+		"order": 25,
 		"action": {
 			"type": "firstchild"
+		}
+	},
+	"admin/modem/modemd": {
+		"title": "5G 终端",
+		"order": 20,
+		"action": {
+			"type": "alias",
+			"path": "admin/modemd/overview"
 		},
 		"depends": {
 			"acl": [
@@ -12,8 +20,6 @@
 		}
 	},
 	"admin/modemd/overview": {
-		"title": "设备中心",
-		"order": 1,
 		"action": {
 			"type": "view",
 			"path": "modemd/overview"
@@ -25,8 +31,6 @@
 		}
 	},
 	"admin/modemd/dial": {
-		"title": "拨号上网",
-		"order": 2,
 		"action": {
 			"type": "view",
 			"path": "modemd/dial"
@@ -38,8 +42,6 @@
 		}
 	},
 	"admin/modemd/cells": {
-		"title": "基站扫描",
-		"order": 3,
 		"action": {
 			"type": "view",
 			"path": "modemd/cells"
@@ -51,8 +53,6 @@
 		}
 	},
 	"admin/modemd/lock": {
-		"title": "锁网",
-		"order": 4,
 		"action": {
 			"type": "view",
 			"path": "modemd/lock"
@@ -64,8 +64,6 @@
 		}
 	},
 	"admin/modemd/sms": {
-		"title": "短信",
-		"order": 5,
 		"action": {
 			"type": "view",
 			"path": "modemd/sms"
@@ -77,8 +75,6 @@
 		}
 	},
 	"admin/modemd/tools": {
-		"title": "调试工具",
-		"order": 6,
 		"action": {
 			"type": "view",
 			"path": "modemd/tools"
@@ -90,8 +86,6 @@
 		}
 	},
 	"admin/modemd/modules": {
-		"title": "支持模块",
-		"order": 7,
 		"action": {
 			"type": "view",
 			"path": "modemd/modules"
@@ -103,8 +97,6 @@
 		}
 	},
 	"admin/modemd/service": {
-		"title": "服务控制",
-		"order": 8,
 		"action": {
 			"type": "view",
 			"path": "modemd/service"
