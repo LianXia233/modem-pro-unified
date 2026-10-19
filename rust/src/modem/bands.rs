@@ -288,8 +288,14 @@ pub fn declared(model: &str, tech: Tech) -> Declared {
             tech.as_str()
         )
     } else {
+        // 中文排版：`NR（NSA/SA 并集）` 后面不再多一个空格，`LTE 频段` 仍保留空格
+        let gap = if tech.note_label().ends_with('）') {
+            ""
+        } else {
+            " "
+        };
         format!(
-            "Modem-Pro 频段表（出厂口径）：支持 {} 个 {} 频段，可与上方「设备能力」对照",
+            "Modem-Pro 频段表（出厂口径）：支持 {} 个 {}{gap}频段，可与上方「设备能力」对照",
             bands.len(),
             tech.note_label()
         )
