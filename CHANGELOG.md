@@ -4,6 +4,12 @@
 
 ## [未发布]
 
+### 清理：移除误入库的 `downloads/fluxdown`
+
+`downloads/fluxdown/FluxDown-0.5.7-linux-x64/`（一个与项目无关的 FluxDown 桌面应用二进制
+集）是在「优化 Actions 编译速度」那次提交里被顺手 `git add` 进来的，已从仓库删除，并把
+`/downloads/` 加进 `.gitignore` 防止再犯。（历史里仍留有该二进制；如需彻底抹除需重写历史。）
+
 ### 修复：主线 APK 通道编 fibocom-dial 报「隐式声明 / 裸 return」
 
 上一轮 CI 24.10 IPK 通道已绿（产出 `modem-pro_1.0.0-r1_aarch64_generic.ipk`），

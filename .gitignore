@@ -6,6 +6,9 @@
 # 本地迁移参考副本（仅本机对照，不纳入版本控制）
 /legacy-go/
 
+# 临时下载物（第三方二进制 / 压缩包，不入库；曾误提交过 downloads/fluxdown）
+/downloads/
+
 # OpenWrt 构建产物
 *.ipk
 *.apk
