@@ -4,6 +4,28 @@
 
 ## [未发布]
 
+### 修复：云编译把 luci-base 当构建依赖，连带去编 luci 组件而缺头文件
+
+上一轮 CI 两个通道都挂在「编译 modem-pro」：日志里先编 `feeds/luci/modules/luci-base`
+（及其 `contrib/package/csstidy`），接着编 `ucode-mod-html` 报
+`ucode/module.h: No such file or directory`、`rpcd-mod-luci` 报缺 `netlink/msg.h`、
+`lucihttp` 报缺 `lua.h`。
+
+- **根因**：`modem-pro` 的 `DEPENDS:=+luci-base +odhcp6c` 本是**运行时**依赖，但 OpenWrt
+  执行 `make package/modem-pro/compile` 时也会先把这些依赖编出来；而流水线用
+  `feeds install -p luci luci-base` 装的是 **luci feed 的真实 luci-base**，于是连带拉出整串
+  luci 组件去编译。这些组件要 base feed 的头文件（`lua.h` / `ucode/module.h` /
+  `netlink/msg.h`），而 **SDK 里没有 base feed**，必然失败。
+- **修复**：feeds 只拉本地 `modem_pro` / `ci_stub` 两个 feed（**不拉 `packages` / `luci`**），
+  `luci-base` 与 `odhcp6c` 均改由 `ci_stub` 的 stub 提供（只声明包名、不编任何东西、
+  不发布），`make package/modem-pro/compile` 因此不再连带去编任何 luci 组件。
+- **stub 细节**：stub 的 Makefile 必须 `include $(INCLUDE_DIR)/package.mk`（否则
+  `make -r DUMP=1` 无 dumpinfo 目标、feeds 索引里查不到包名，扫描静默失败），
+  并补全 `PKG_VERSION` / `PKG_RELEASE`。
+- **本地复现验证**：24.10.8 SDK 上按新流程完整跑通，产物
+  `modem-pro_1.0.0-r1_aarch64_generic.ipk`，control 声明 `Depends: libc, luci-base, odhcp6c`；
+  全程只编 toolchain / 两个 stub / modem-pro，未再出现任何 luci 组件。
+
 ### 编译提速：Rust 后端改宿主工具链直编（跳过 rust 源码编译）
 
 原云编译最大耗时是 OpenWrt 从源码编译 `feeds/packages` 的 rust/host 工具链
@@ -30,7 +52,7 @@
     `aarch64-unknown-linux-musl` target，版本由 `RUST_TOOLCHAIN` 固定）；
   - 缓存由 `dl/` + `staging_dir/host*` 改为 `~/.cargo/registry` + `~/.cargo/git` +
     `.cargo-target`，key 绑定 `rust/Cargo.lock` / `Makefile` / 本文件哈希；
-  - feeds 更新只拉 `packages`/`luci`，不再安装 `lang/rust`；
+  - feeds 只拉本地 `modem_pro`/`ci_stub` 两个 feed（不拉 `packages`/`luci`），也不安装 `lang/rust`；
   - **在 feeds 扫描之前**就把选包与开关（含 `CONFIG_MODEM_PRO_HOST_RUST=y`）写进
     `.config`；并把 `MODEM_PRO_HOST_RUST=1` 提到 **job 级 `env`**，让 feeds 扫描阶段
     也带上该开关——这是绕开 rust/host 源码编译的关键；
@@ -48,7 +70,7 @@
   - 流程细分：依赖 → stub → SDK → 缓存 → feeds → 选包 → 编译（V=s）→
     产物 + SHA256 → artifact；失败按 step 定位；
   - Rust 后端构建方式见上方「编译提速」条目（已改宿主工具链直编）；
-  - SDK 无 base 包源码，`DEPENDS:+odhcp6c` 用本地 stub feed 满足（不发布）；
+  - SDK 无 base 包源码，`DEPENDS:+luci-base +odhcp6c` 均为运行时依赖，用本地 stub feed 满足（不发布）；
   - 推 `v*` 标签自动创建 Release 并上传两档产物与校验和。
 
 ### 修复：GitHub Actions 首跑失败（feed 名 / 元数据污染 / 拨号器开关）

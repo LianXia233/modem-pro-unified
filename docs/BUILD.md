@@ -204,8 +204,8 @@ cargo run -- -config ../docs/example-config.toml
 | 24.10 IPK | 最新 24.10.x | `modem-pro_*.ipk` |
 
 流程细分（每步一个 Action step，失败直接定位）：
-安装依赖 → **安装宿主 Rust 工具链** → 生成 odhcp6c stub → 下载 SDK → 缓存 cargo →
-feeds → 选包配置 → 编译（V=s）→ 收集产物 + SHA256 → 上传 artifact。
+安装依赖 → **安装宿主 Rust 工具链** → 生成构建用 stub（luci-base + odhcp6c）→ 下载 SDK →
+缓存 cargo → feeds → 选包配置 → 编译（V=s）→ 收集产物 + SHA256 → 上传 artifact。
 
 要点：
 - **触发**：推 `v*` 标签（编译 + 自动建 Release 上传产物）或手动 `workflow_dispatch`（只编译）；
@@ -216,6 +216,11 @@ feeds → 选包配置 → 编译（V=s）→ 收集产物 + SHA256 → 上传 a
   **不再**从源码编译 rust host 工具链（原路冷启动 1~2 小时），也不再安装 feeds 的 `lang/rust`；
 - **缓存**：`~/.cargo/registry` + `~/.cargo/git` + `.cargo-target`（cargo 依赖与编译产物），
   key 绑定 `rust/Cargo.lock` / `Makefile` / workflow 文件哈希，二次起只需几分钟；
-- **odhcp6c stub**：SDK 不带 base 包源码，`DEPENDS:+odhcp6c` 由本地 stub feed
-  满足；stub 不发布，真机由固件自带；
+- **feeds 只拉本地 feed**：`feeds update modem_pro ci_stub`，**不拉 `packages` / `luci`**
+  （SDK 无 base feed，编不了整棵 LuCI/base 依赖树）；
+- **构建用 stub（luci-base + odhcp6c）**：`DEPENDS:+luci-base +odhcp6c` 是**运行时**依赖
+  （真机由固件自带），但 `make package/modem-pro/compile` 会把它们也先编——若装 luci feed
+  的真实 luci-base，就会连带编 ucode-mod-html / rpcd-mod-luci / lucihttp，而这些要 base feed
+  的头文件，必失败。故两者都用「只声明包名、不编任何东西」的 stub 提供，stub 不发布；
+  stub 的 Makefile 必须 `include $(INCLUDE_DIR)/package.mk`，否则 feeds 索引查不到包名；
 - **发布**：`v1.0.0` 起 Release 附 APK/IPK 与 SHA256SUMS。

@@ -7,8 +7,9 @@
 > - [`API.md`](./API.md)：对外接口契约。`INTEGRATION.md` / `BUILD.md`：整合方案与编译。
 >
 > 快照时间：2026-10-19 ｜ 分支 `main` ｜ 远端 `https://github.com/LianXia233/modem-pro-unified`
-> 最近提交：云编译**真正**跳过 rust host（根因修复，见 §38）；
-> 此前 `96a06a8`（docs：致谢补充 350 系列参考工程 luci-app-fm350）
+> 最近提交：云编译修复第二处——luci-base 改用 stub，不再连带编 luci 组件（见 §39）；
+> 此前：云编译**真正**跳过 rust host（根因修复，见 §38）、`96a06a8`（docs：致谢补充
+> 350 系列参考工程 luci-app-fm350）
 > 工作区：广和通 FM350 / RW350 系列对齐 **P0-1（IPv6 归一化接进网络链路）、
 > P0-2（频段锁定写）均已完成、实机验证通过**（见 §16 / §17）；
 > **P0-3（IMEI 的 MFG 块备份）已按替代方案完成**（见 §20）；
@@ -2326,6 +2327,43 @@ rust/host（从源码编 rustc + LLVM，冷启动 1~2 小时）。但实测云�
 YAML 通过解析校验；前两次 CI 日志逐行定位——`Entering .../feeds/packages/lang/rust` 与
 `[1/3898] LLVMDemangle` 出现在编译步骤首秒，且该步骤**没有**再打印 `Collecting package info`，
 证明它复用了 feeds 阶段扫描出的构建依赖。CI 侧继续用移动 `v1.0.0` 标签触发确认。
+
+---
+
+## 39. 云编译修复第二处：luci-base 被当构建依赖（2026-10-19）
+
+**背景**：§38 修好 rust/host 后，新 run 两个通道都在「编译 modem-pro」步骤失败
+（主线 2m1s / 24.10 3m5s，远早于 rust 编译），日志里编的是 luci 组件。
+
+**根因**：`modem-pro` 的 `DEPENDS:=+luci-base +odhcp6c` 是**运行时**依赖，但 OpenWrt 执行
+`make package/modem-pro/compile` 时会把 `DEPENDS` 里的包也先编出来。流水线用
+`feeds install -p luci luci-base` 装的是 **luci feed 的真实 luci-base**，于是连带编出
+`feeds/luci/modules/luci-base`（及其 `csstidy`）、`ucode-mod-html`、`rpcd-mod-luci`、
+`lucihttp`。这些组件要 base feed 的头文件（`lua.h` / `ucode/module.h` / `netlink/msg.h`），
+而 **SDK 没有 base feed**，报缺头文件失败。日志实证：
+
+```
+make[2]: Entering directory '.../sdk/feeds/luci/modules/luci-base'
+make[2]: Entering directory '.../sdk/feeds/luci/contrib/package/ucode-mod-html'
+.../ucode-mod-html/html.c:26:10: fatal error: ucode/module.h: No such file or directory
+```
+
+**修复（`.github/workflows/build.yml`）**：
+
+- `feeds update` 由 `packages luci modem_pro ci_stub` 改为 **`modem_pro ci_stub`**，
+  **完全不拉 `packages` / `luci`**（SDK 里也编不了整棵 LuCI/base 依赖树）。
+- `feeds install` 由 `-p luci luci-base` 改为 **`-p ci_stub luci-base`**（`odhcp6c` 本就走
+  `ci_stub`）：两个运行时依赖都由「只声明包名、不编任何东西」的 stub 提供，stub 不发布。
+- 新增 `luci-base` stub，与既有 `odhcp6c` stub 同规则：Makefile 必须
+  `include $(INCLUDE_DIR)/package.mk` 并补全 `PKG_VERSION` / `PKG_RELEASE`，否则
+  `make -r DUMP=1` 无 dumpinfo 目标、feeds 索引查不到包名（扫描静默失败）。
+
+**验证**：本地 24.10.8 SDK（TUNA 镜像）按新流程完整跑通：
+`./scripts/feeds update modem_pro ci_stub` → 装 stub → `make defconfig`（`modem-pro=m`，
+`PACKAGE_luci-base` / `PACKAGE_odhcp6c` 正常登记）→ `make package/modem-pro/compile V=s`。
+编译顺序只有 toolchain（SDK 自带）→ 两个 stub（no-op）→ modem-pro；
+**未再出现任何 luci 组件**；产物 `modem-pro_1.0.0-r1_aarch64_generic.ipk`，
+control 为 `Depends: libc, luci-base, odhcp6c`，rust 编译 51s、整包打包 65s。
 
 ---
 
