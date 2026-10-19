@@ -27,9 +27,13 @@
   `third_party` 例外。
 - **配置兼容**：旧值 `host_dial_bin = "quectel-CM"` 等不会报错，只告警一次并按内置实现跑；
   `proto=quectel` 的接口不再可用，改用 `proto=modem_pro`。
-- **验证**：`cargo test` **570 全绿**（新增 WDA 帧 / QMAP 计划 / 控制口策略 9 条）、
-  `cargo clippy --all-targets` 与 `cargo build` 零告警。
-- ⚠️ **真机未验证**：测试机 FM350/RW350 是 ECM，没有控制口。QMI（含 QMAP）、MBIM、
+- **QMAP 收尾**：`Set Data Format` 应答里的 `rx_urb_size`（TLV `0x16`）现在会回读并
+  覆盖请求值（与驱动 `rx_urb_size` 对齐，和 quectel-CM 同口径）。
+- **无硬件也能跑会话**：`qmi_link` 支持注入可读写句柄，新增假设备（socketpair）端到端用例，
+  逐帧校验 `CTL Sync → 3×ClientID → WDA SetDataFormat → BindMux(v4/v6) → Start(v4/v6) → Runtime`
+  的顺序、client id 归属与 TLV 内容。
+- **验证**：`cargo test` **573 全绿**、`cargo clippy --all-targets` 与 `cargo build` 零告警。
+- ⚠️ **真机未验证**：测试机 FM350/RW350 是 RNDIS，没有控制口。QMI（含 QMAP）、MBIM、
   PCIe/MHI 三种数据面仍需实机跑通（验证矩阵见 `docs/PROGRESS.md` §41.4）。
 
 ### 清理：移除误入库的 `downloads/fluxdown`

@@ -43,7 +43,7 @@
 | 3 | 写操作域接口 | ✅ 完成 | ~100%（流量配额、短信、参数与开关、IMEI 写、重启/校时、锁网写、AT 直发域、拨号域、定时器、USB/PCIe 绑定、atport 绑定均已完成） |
 | 4 | WebSocket 全量推送 | ✅ 完成 | 100%（握手 + snapshot + 各面板推送函数齐备；写操作成功后顺手广播；短信推送过密码闸门） |
 | 5 | 后台循环（采样 / 配额 / 定时 / 热插拔 / 组网 / 微信 / 历史） | ✅ 完成 | 100%（push / traffic / quota / change / hotplug / sim / logs / **urc** / **netprov** 九类循环已接线；SIM 热插拔巡检含换卡清短信缓存，且 `+GTSIM` / 注册态 URC 可把巡检加速到下一拍；**自动组网 netprov 已完成**（§23）、**企业微信推送已完成**（§24）；`+CUSD` 应答直接推页面、`+CMTI` 触发一次短信重读（§21 / §22）） |
-| 6 | 内置拨号（QMI / MBIM / QMAP） | ✅ 完成（代码）/ ⚠️ 真机待验证 | 100% 代码面：控制口反查（cdc-wdm / GobiQMI / mhi_QMI）、QMI WDS、MBIM Basic Connect、QMAP `WDA Set Data Format` + `Bind Mux`、掉线重拨与 5s 退避；`/api/dial/connect` 对 QMI/MBIM 从「拒绝」改为「交办」。**验证缺口**：线协议有 golden-bytes 单测，数据呼叫缺 QMI/MBIM/PCIe 真机（测试机 FM350 为 ECM，无控制口） |
+| 6 | 内置拨号（QMI / MBIM / QMAP） | ✅ 完成（代码）/ ⚠️ 真机待验证 | 100% 代码面：控制口反查（cdc-wdm / GobiQMI / mhi_QMI）、QMI WDS、MBIM Basic Connect、QMAP `WDA Set Data Format` + `Bind Mux`、掉线重拨与 5s 退避；`/api/dial/connect` 对 QMI/MBIM 从「拒绝」改为「交办」。**验证缺口**：线协议有 golden-bytes 单测，数据呼叫缺 QMI/MBIM/PCIe 真机（测试机 FM350 为 RNDIS，无控制口） |
 
 量化的工程指标（可作为「没跑偏」的自检）：`cargo build` **零告警**、`cargo test` **570 项全绿**、
 已迁移接口在实机上返回 **HTTP 200** 的统一信封。
@@ -1971,7 +1971,7 @@ supervisor 每轮：同计划 → 探活；掉线 → 重建；失败 → **5 �
   `cargo build` 零告警。
 - 实机（FM350-GL / ImmortalWrt，**未重启设备、未碰 IMEI、未动 WAN**）：
   - `vendor= fibocom`，`/api/vendor/cmds` 与 `/api/at/presets`（45 条）都来自新模块；
-  - `host_dial_bin = "native"` 时服务正常、FM350（ECM）不受影响（原生只接管 QMI），
+  - `host_dial_bin = "native"` 时服务正常、FM350（RNDIS）不受影响（原生只接管 QMI），
     配置已还原为 `""`；
   - `modem0` 仍 up（`10.42.0.16`），WAN 地址未变。
 - ⚠️ **原生 QMI 未在 QMI 真机验证**（测试机只有 FM350）：线协议有单测，
@@ -2172,7 +2172,7 @@ runtime/dialer/
 - 单测 **575 全绿**（本轮新增 19：MBIM 帧/命令/连接/地址解析 10 条、
   厂商策略 4 条、vendor 方言 2 条、模式解析 1 条、其余为替换后的既有用例）；
 - `cargo build` 零告警、`cargo clippy --all-targets` 零告警；
-- ⚠️ **原生 QMI/MBIM 仍未在真机验证**（测试机 FM350 是 RNDIS/ECM，没有 cdc-wdm）：
+- ⚠️ **原生 QMI/MBIM 仍未在真机验证**（测试机 FM350 是 RNDIS，没有 cdc-wdm）：
   线协议有 golden-bytes 与真实布局断言，数据呼叫需要 QMI/MBIM 模组。
 
 ---
@@ -2434,7 +2434,7 @@ gnu89 模式下上述两类都不再是错误，**一个开关同时解决两类
 | `WDS Bind Mux Data Port`（TLV 0x10/0x11/0x13） | `dialer/qmi.rs::wds_bind_mux` | 同上 `WdsSetQMUXBindMuxDataPort()`；v4/v6 各绑一次 |
 | mux id 规则：单承载 `0x81`，多承载 `PDN + 0x80` | `native/mod.rs::qmap_settings` | `qmap_bridge_mode.c` 的 `muxid = pdp + 0x80` |
 | 端点类型：USB `DATA_EP_TYPE_HSUSB(2)` / PCIe `(3)` | `qmi::QmapSettings::{usb,pcie}` | `QMIThread.c` 的 `qmap_settings` 赋值 |
-| 聚合窗口：`qmap_size` sysfs，缺省 16 KiB | `native/mod.rs::qmap_size` | `qmap_bridge_mode.c` 的 `qmap_size` 回退 |
+| 聚合窗口：`qmap_size` sysfs，缺省 16 KiB；应答回读覆盖 | `native/mod.rs::qmap_size`、`qmi.rs::parse_data_format_rx_urb` | `qmap_bridge_mode.c`、`QMIThread.c` 的 `linkProto` 回填 |
 | 控制口发现：`cdc-wdm` / `GobiQMI` / `mhi_QMI` | `native/mod.rs::find_control` | 三种驱动各自的 sysfs 布局 |
 | GobiNet 跳过 WDA | `ControlKind::handles_data_format` | `GobiNetCM.c`：「set data format in GobiNet Driver」 |
 | MBIM 对所有厂商可用（不再依赖 `mbim-cm.c`） | `vendors::supports` | MBIM Basic Connect 是标准协议 |
@@ -2443,17 +2443,22 @@ gnu89 模式下上述两类都不再是错误，**一个开关同时解决两类
 ### 41.3 为什么敢默认切
 
 - 线协议有 golden-bytes 与真实布局断言（QMI 13 字节头、WDA TLV 顺序、MBIM 48 字节命令头）；
-- `cargo test` **570 项全绿**、`cargo clippy --all-targets` 零告警、`cargo build` 零告警；
+- 另有一条**假设备端到端用例**：socketpair 冒充 `/dev/cdc-wdm`，逐帧核对 QMAP 会话的
+  请求顺序（Sync → ClientID×3 → SetDataFormat → BindMux×2 → Start×2 → Runtime）与 client id 归属；
+- `cargo test` **573 项全绿**、`cargo clippy --all-targets` 零告警、`cargo build` 零告警；
 - 切换后**接口形态不变**：地址/DNS/默认路由仍由 netifd 的 `proto=modem_pro` 取，
   内置后端只做「数据呼叫生命周期」，与外部拨号器的职责边界一致。
 
 ### 41.4 仍然缺的（唯一风险）
 
-**真机验证**。测试机 FM350 / RW350 是 RNDIS/ECM，没有控制口，所以：
+**真机验证**。测试机 FM350 / RW350 是 **RNDIS**，没有控制口，所以：
 
 - QMAP 的 `Set Data Format` + `Bind Mux` 只有单测，没在 qmi_wwan_q/f 上跑过；
 - MHI/GobiNet 的控制口反查没有对应硬件；
-- MBIM 的 `CONNECT` / `IP_CONFIGURATION` 只有布局单测。
+- MBIM 的 `CONNECT` / `IP_CONFIGURATION` 只有布局单测；
+- **上游 `qmi_wwan` 的 QMAP mux 创建**（`qmi/add_mux`）未自动做：厂家驱动（`qmi_wwan_q/f`）
+  会按 `qmap_mode` 预建 mux，这是主路径；主线 `qmi_wwan` 需要额外的 add_mux 写入，
+  在拿到真机/sysfs 语义前**不盲写**，避免建错接口。
 
 需要的验证矩阵：**QMI 非 QMAP（如 EC20）→ QMI QMAP（RM500Q/FM160）→ MBIM（FM150）→ PCIe MHI**。
 每张卡看四件事：`wwan0` / `wwan0_1` 是否 up、`udhcpc` 能否拿到地址、`ping -I` 是否通、

@@ -40,7 +40,7 @@
 | 3 | 写操作域 | ✅ 完成 | 已完成：流量配额、短信、参数与开关（`params/apn|pdp|netselect`、`mode/set`、`usbnet/set`、`airplane/set`、`roam/set`）、`imei(set/restore)`、`modem(reset/clock)`、`lock(band/cell/mode/unlock)`、`at`(发/port/presets)、`changes/clear`、`dial`(connect/disconnect/enable/mode/ipv6 + GET)、`schedule`(GET + set/delete/toggle/run)、usb/pcie/atport 绑定 |
 | 4 | WebSocket 推送 | ✅ 完成 | 握手 + `snapshot` + 各面板 `push_*` 全部接线；写操作成功后顺手广播（cells / lock / sms+smscount / quota / traffic / ussd）；短信推送过密码闸门（带令牌才收 `sms`，`smscount` 不过闸门） |
 | 5 | 后台循环 | ✅ 完成 | push / traffic / quota / change / hotplug / sim / logs / **urc** / **netprov** 九类循环已接线（SIM 巡检 2s 一拍、到点或 URC 置脏才发 AT；换卡清短信缓存并补推空 `sms`+`smscount`；**urc 循环**消费 `at/urc.rs` 暂存的主动上报，折算成「SIM / 网络 / 短信置脏」并把巡检加速到下一拍，`+CUSD` 直接推页面、`+CMTI` 触发一次短信重读，见 `PROGRESS.md` §21 / §22；**netprov 自动组网**见 §23、**企业微信推送**见 §24） |
-| 6 | 内置拨号 | ✅ 已完成（代码）/ ⚠️ 真机待验证 | `hostdial`：QMI/MBIM 数据呼叫由 `modemd` 内置实现（含 QMAP 绑 mux）；`/api/dial/connect` 对这两类从「拒绝」改为「委托」（见 `PROGRESS.md` §25）。**QMI/MBIM 真机均未验证**：测试机为 FM350（ECM，无控制口） |
+| 6 | 内置拨号 | ✅ 已完成（代码）/ ⚠️ 真机待验证 | `hostdial`：QMI/MBIM 数据呼叫由 `modemd` 内置实现（含 QMAP 绑 mux）；`/api/dial/connect` 对这两类从「拒绝」改为「委托」（见 `PROGRESS.md` §25）。**QMI/MBIM 真机均未验证**：测试机为 FM350（RNDIS，无控制口） |
 
 ### 2.1 只读域明细
 

@@ -43,6 +43,16 @@ impl QmiLink {
         })
     }
 
+    /// 测试用：从任意可读写文件构造（`UnixStream::pair()` 的一端）。
+    #[cfg(test)]
+    pub fn from_file(file: File) -> Self {
+        Self {
+            file,
+            rx: Vec::new(),
+            tid: 0,
+        }
+    }
+
     fn next_tid(&mut self) -> u16 {
         self.tid = self.tid.wrapping_add(1);
         if self.tid == 0 {
@@ -177,7 +187,7 @@ impl QmiLink {
         &mut self,
         client: u8,
         settings: &qmi::QmapSettings,
-    ) -> Result<(), String> {
+    ) -> Result<Option<u32>, String> {
         let tid = self.next_tid();
         let frame = qmi::wda_set_data_format(tid, client, settings);
         let deadline = Instant::now() + CTL_TIMEOUT;
@@ -190,7 +200,8 @@ impl QmiLink {
         )?;
         qmi::result(&payload)
             .map_err(|(r, e)| format!("Set Data Format 失败 result={r} error={e}"))?;
-        Ok(())
+        // 设备会回它实际接受的聚合窗口；拿它覆盖请求值（与驱动 rx_urb_size 对齐）
+        Ok(qmi::parse_data_format_rx_urb(&payload))
     }
 
     /// 把 WDS client 绑到 QMAP 的 mux 上（`Bind Mux Data Port`）。
@@ -303,7 +314,19 @@ impl QmiSession {
         if !super::ensure_raw_ip(iface) {
             return Err(format!("{iface} 的 qmi/raw_ip 设置失败"));
         }
-        let mut link = QmiLink::open(wdm)?;
+        let link = QmiLink::open(wdm)?;
+        Self::start_with(link, apn, ipv6, pdn, disable_autoconnect, qmap)
+    }
+
+    /// 真正的会话流程（与 [`QmiLink::open`] 解耦，便于用假设备跑顺序测试）。
+    fn start_with(
+        mut link: QmiLink,
+        apn: &str,
+        ipv6: bool,
+        pdn: i64,
+        disable_autoconnect: bool,
+        qmap: Option<qmi::QmapSettings>,
+    ) -> Result<(Self, String), String> {
         link.sync()?;
         let client4 = link.client_id(qmi::SVC_WDS)?;
 
@@ -319,7 +342,8 @@ impl QmiSession {
 
         // QMAP：数据格式 + 绑 mux（缺了这两步，驱动不会 add_mux，数据口永远 NO-CARRIER）
         let mut wda_client = None;
-        if let Some(q) = qmap {
+        let mut qmap = qmap;
+        if let Some(mut q) = qmap {
             let wda = match link.client_id(qmi::SVC_WDA) {
                 Ok(w) => w,
                 Err(e) => {
@@ -330,9 +354,19 @@ impl QmiSession {
                     return Err(format!("QMAP 需要 WDA client，申请失败：{e}"));
                 }
             };
-            let setup = link
-                .set_data_format(wda, &q)
-                .and_then(|_| link.bind_mux(qmi::SVC_WDS, client4, &q));
+            let setup = link.set_data_format(wda, &q).and_then(|accepted| {
+                // 设备回读的窗口优先（与驱动对齐）；没回就用请求值
+                if let Some(size) = accepted.filter(|v| *v > 0) {
+                    if size != q.rx_urb_size {
+                        log::info!(
+                            "原生 QMAP：设备接受的 rx_urb_size={size}（请求 {}）",
+                            q.rx_urb_size
+                        );
+                    }
+                    q.rx_urb_size = size;
+                }
+                link.bind_mux(qmi::SVC_WDS, client4, &q)
+            });
             if let Err(e) = setup {
                 let _ = link.release_client_id(qmi::SVC_WDA, wda);
                 let _ = link.release_client_id(qmi::SVC_WDS, client4);
@@ -350,6 +384,7 @@ impl QmiSession {
                 }
             }
             wda_client = Some(wda);
+            qmap = Some(q);
         }
 
         // 先关自动连接再 Start：顺序与 quectel-cm 的 QmiWwanInit() 一致
@@ -455,5 +490,149 @@ impl QmiSession {
 impl Drop for QmiSession {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::Ipv4Addr;
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
+    use std::os::unix::net::UnixStream;
+    use std::sync::{Arc, Mutex};
+
+    /// 假设备记录下来的请求：`(service, message, transaction, client)`。
+    type Seen = Arc<Mutex<Vec<(u8, u16, u16, u8)>>>;
+
+    /// 组一帧应答：结果码 + body。
+    fn reply(service: u8, client: u8, tid: u16, msg: u16, body: &[u8]) -> Vec<u8> {
+        let mut p = qmi::tlv(0x02, &[0, 0, 0, 0]);
+        p.extend_from_slice(body);
+        qmi::encode(service, client, tid, msg, &p)
+    }
+
+    /// 假设备：按请求回最小合法应答，并记录收到的 (service, message, transaction, client)。
+    fn fake_device(mut stream: UnixStream, seen: Seen) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut buf: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                }
+                loop {
+                    let Some(m) = qmi::take(&mut buf) else {
+                        break;
+                    };
+                    seen.lock()
+                        .unwrap()
+                        .push((m.service, m.message, m.transaction, m.client));
+                    let body: Vec<u8> = match (m.service, m.message) {
+                        (qmi::SVC_CTL, qmi::CTL_GET_CLIENT_ID) => {
+                            let svc = qmi::find_tlv(&m.payload, 0x01, false)
+                                .and_then(|v| v.first().copied())
+                                .unwrap_or(qmi::SVC_WDS);
+                            let cid = match svc {
+                                qmi::SVC_WDS => 1,
+                                qmi::SVC_WDS_IPV6 => 2,
+                                qmi::SVC_WDA => 3,
+                                _ => 9,
+                            };
+                            let mut t = qmi::tlv(0x01, &[svc]);
+                            t.extend(qmi::tlv(0x02, &[cid]));
+                            t
+                        }
+                        (qmi::SVC_WDS, qmi::WDS_START_NETWORK)
+                        | (qmi::SVC_WDS_IPV6, qmi::WDS_START_NETWORK) => {
+                            qmi::tlv(0x01, &0x1234u32.to_le_bytes())
+                        }
+                        (qmi::SVC_WDS, qmi::WDS_GET_RUNTIME_SETTINGS) => {
+                            let mut t = qmi::tlv(0x1E, &[10, 4, 83, 16]);
+                            t.extend(qmi::tlv(0x20, &[10, 4, 83, 1]));
+                            t.extend(qmi::tlv(0x29, &1500u32.to_le_bytes()));
+                            t
+                        }
+                        // 设备接受 32K 窗口（比请求的 16K 大）：客户端应回填
+                        (qmi::SVC_WDA, qmi::WDA_SET_DATA_FORMAT) => {
+                            qmi::tlv(0x16, &(32 * 1024u32).to_le_bytes())
+                        }
+                        (qmi::SVC_WDS, qmi::WDS_GET_PKT_STATUS) => qmi::tlv(0x01, &[2, 0, 0, 0]),
+                        _ => Vec::new(),
+                    };
+                    if stream
+                        .write_all(&reply(m.service, m.client, m.transaction, m.message, &body))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn qmap_session_sequence_matches_quectel() {
+        let (a, b) = UnixStream::pair().expect("socketpair");
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let handle = fake_device(b, seen.clone());
+
+        let stream = unsafe { File::from_raw_fd(a.into_raw_fd()) };
+        let link = QmiLink::from_file(stream);
+        let qmap = qmi::QmapSettings::usb(0x81, 16 * 1024);
+        let (mut sess, note) = QmiSession::start_with(link, "ctnet", true, 0, true, Some(qmap))
+            .expect("假设备应能让会话建立");
+        assert!(note.is_empty(), "{note}");
+
+        // 呼叫与取址
+        assert_eq!(sess.alive(), Some(true), "Get Pkt Status=2 应判为已连接");
+        assert_eq!(sess.settings.mtu, Some(1500));
+        assert_eq!(sess.settings.ipv4, Some(Ipv4Addr::new(10, 4, 83, 16)));
+
+        // 设备回读的窗口覆盖请求值
+        let st = sess.status();
+        assert_eq!(st["qmap"]["mux_id"], 0x81);
+        assert_eq!(st["qmap"]["rx_urb_size"], 32 * 1024);
+
+        // 请求顺序
+        let seen = seen.lock().unwrap();
+        let seq: Vec<(u8, u16)> = seen.iter().map(|(s, m, _, _)| (*s, *m)).collect();
+        assert_eq!(seq[0], (qmi::SVC_CTL, qmi::CTL_SYNC));
+        assert_eq!(seq[1], (qmi::SVC_CTL, qmi::CTL_GET_CLIENT_ID));
+        let wda_pos = seq
+            .iter()
+            .position(|x| *x == (qmi::SVC_WDA, qmi::WDA_SET_DATA_FORMAT))
+            .expect("必须下发 Set Data Format");
+        let bind_pos = seq
+            .iter()
+            .position(|x| *x == (qmi::SVC_WDS, qmi::WDS_BIND_MUX_DATA_PORT))
+            .expect("v4 必须绑 mux");
+        let start_pos = seq
+            .iter()
+            .position(|x| *x == (qmi::SVC_WDS, qmi::WDS_START_NETWORK))
+            .expect("必须 Start");
+        assert!(wda_pos < bind_pos, "先设数据格式再绑 mux");
+        assert!(bind_pos < start_pos, "绑 mux 必须早于 Start");
+        assert!(
+            seen.iter().any(|(s, m, _, _)| *s == qmi::SVC_WDS_IPV6
+                && *m == qmi::WDS_BIND_MUX_DATA_PORT),
+            "v6 client 也要绑 mux"
+        );
+        // 用的是设备分配的 WDA client id（3），而不是 WDS 的 1
+        assert!(seen
+            .iter()
+            .any(|(s, m, _, c)| *s == qmi::SVC_WDA && *m == qmi::WDA_SET_DATA_FORMAT && *c == 3));
+        // Start 用的是 WDS client 1
+        assert!(seen
+            .iter()
+            .any(|(s, m, _, c)| *s == qmi::SVC_WDS && *m == qmi::WDS_START_NETWORK && *c == 1));
+        drop(seen);
+
+        sess.stop();
+        // 关掉本端 fd，假设备读到 EOF 才会退出（否则 join 永远等）
+        drop(sess);
+        let _ = handle.join();
     }
 }

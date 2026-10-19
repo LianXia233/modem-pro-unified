@@ -45,7 +45,7 @@
 //! | GobiNet | `/dev/GobiQMIx` | 与 cdc-wdm 同一套 QMUX 帧 |
 //! | `pcie_mhi` | `/dev/mhi_QMIx` | PCIe / MHI，帧格式相同，端点类型不同 |
 //!
-//! RNDIS/ECM 模组（FM350 / RW350）不走这里：它们没有 QMI 控制口，
+//! RNDIS 模组（FM350 / RW350）不走这里：它们没有 QMI 控制口，
 //! 数据面由模组侧 AT 拨号完成。
 
 pub mod qmi_link;
@@ -157,10 +157,31 @@ fn sysfs_device(iface: &str) -> Option<PathBuf> {
 }
 
 /// USB 接口路径归一：`.../1-1.2/1-1.2:1.0` 与 `.../1-1.2` 视为同一设备。
+///
+/// **只认 USB 接口后缀**（`:<配置>.<接口>`，两段都是数字）。PCIe 设备名里
+/// 也有冒号（`0000:01:00.0`），按「含冒号就切」会把它们错误地砍成父目录。
 fn usb_dev_dir(p: &Path) -> PathBuf {
-    match p.file_name().and_then(|n| n.to_str()) {
-        Some(n) if n.contains(':') => p.parent().map(Path::to_path_buf).unwrap_or_else(|| p.to_path_buf()),
-        _ => p.to_path_buf(),
+    let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+        return p.to_path_buf();
+    };
+    let is_usb_iface = name
+        .rsplit_once(':')
+        .map(|(dev, iface)| {
+            // USB 设备名形如 `1-1.2`（带 `-`）；PCIe 的 `0000:01` 不带
+            dev.contains('-')
+                && iface.split_once('.').is_some_and(|(cfg, num)| {
+                    !cfg.is_empty()
+                        && !num.is_empty()
+                        && !num.contains('.')
+                        && cfg.chars().all(|c| c.is_ascii_digit())
+                        && num.chars().all(|c| c.is_ascii_digit())
+                })
+        })
+        .unwrap_or(false);
+    if is_usb_iface {
+        p.parent().map(Path::to_path_buf).unwrap_or_else(|| p.to_path_buf())
+    } else {
+        p.to_path_buf()
     }
 }
 
@@ -689,6 +710,19 @@ mod tests {
         assert_eq!(resolve_pdn("wwan0", 0, 1), 1, "单承载 QMAP 兜底 1");
         assert_eq!(resolve_pdn("wwan0", -1, 1), 0, "-1 表示只按网卡名");
         assert_eq!(resolve_pdn("wwan0", 0, 0), 0, "非 QMAP 不猜");
+    }
+
+    #[test]
+    fn usb_interface_path_is_normalised_to_device() {
+        use std::path::PathBuf;
+        // qmi_wwan 的 netdev device 是 USB 接口目录（带 :1.0），GobiQMI 也回指它；
+        // 归一后两者才能比较，否则永远匹配不上
+        let a = usb_dev_dir(&PathBuf::from("/sys/devices/pci0/usb1/1-1.2/1-1.2:1.0"));
+        let b = usb_dev_dir(&PathBuf::from("/sys/devices/pci0/usb1/1-1.2"));
+        assert_eq!(a, b);
+        // 不带冒号的路径原样返回（PCIe 设备名里也有冒号，不能误切）
+        let p = PathBuf::from("/sys/devices/pci0000:00/0000:01:00.0");
+        assert_eq!(usb_dev_dir(&p), p);
     }
 
     #[test]

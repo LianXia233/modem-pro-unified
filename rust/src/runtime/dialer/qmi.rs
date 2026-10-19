@@ -368,6 +368,19 @@ pub fn wda_set_data_format(transaction: u16, client: u8, s: &QmapSettings) -> Ve
     encode(SVC_WDA, client, transaction, WDA_SET_DATA_FORMAT, &p)
 }
 
+/// 解析 `Set Data Format` 应答里的下行聚合窗口（TLV `0x16`）。
+///
+/// 设备会把**它实际接受的** `rx_urb_size` 回给你（与驱动里的 `rx_urb_size`
+/// 必须一致）。quectel-CM 也拿这个值回填 `qmap_settings.rx_urb_size`，
+/// 我们照做：回读失败就保持请求值。
+pub fn parse_data_format_rx_urb(payload: &[u8]) -> Option<u32> {
+    let v = find_tlv(payload, 0x16, true)?;
+    if v.len() < 4 {
+        return None;
+    }
+    Some(u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+}
+
 /// WDS `Bind Mux Data Port`：把某个 WDS client 绑到 QMAP 的 mux 上。
 ///
 /// TLV：`0x10` 端点（ep_type + iface_id）、`0x11` mux id、`0x13` client type
@@ -671,6 +684,20 @@ mod tests {
         assert_eq!(find_tlv(&m.payload, 0x13, false), Some(&1u32.to_le_bytes()[..]));
         let ep = find_tlv(&m.payload, 0x10, false).expect("端点 TLV");
         assert_eq!(ep.len(), 8);
+    }
+
+    #[test]
+    fn data_format_response_returns_rx_urb_size() {
+        // 应答：结果码 + TLV 0x16（窗口） + 其他无关 TLV
+        let mut p = tlv(0x02, &[0, 0, 0, 0]);
+        p.extend(tlv(0x16, &(32 * 1024u32).to_le_bytes()));
+        p.extend(tlv(0x11, &2u32.to_le_bytes()));
+        assert_eq!(parse_data_format_rx_urb(&p), Some(32 * 1024));
+        // 没有 TLV / 长度不足 ⇒ None（调用方保持请求值）
+        assert_eq!(parse_data_format_rx_urb(&[]), None);
+        let mut short = tlv(0x02, &[0, 0, 0, 0]);
+        short.extend(tlv(0x16, &[1, 2]));
+        assert_eq!(parse_data_format_rx_urb(&short), None);
     }
 
     #[test]

@@ -10,7 +10,7 @@
 //!   `[net] host_dial_pdn` 指定的那一条（单通道足够覆盖家用场景）；
 //! - **PCIe 模式**（`query_pcie_mode.c`）：PCIe 挂载的模组走 MHI；控制口由
 //!   [`super::find_control`] 从 `/dev/mhi_QMI*` 反查，端点类型自动切成 PCIe；
-//! - FM350 / RW350 是 RNDIS/ECM，本来就不走这里（由 `netprov` 配 static 地址）。
+//! - FM350 / RW350 是 **RNDIS**（不是 ECM），本来就不走这里（由 `netprov` 配 static 地址）。
 
 use super::{Caps, DataLink};
 

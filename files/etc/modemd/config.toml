@@ -127,7 +127,7 @@ host_dial = true
 #     MBIM：OPEN → CONNECT → IP_CONFIGURATION；
 #   · 每轮组网循环探活，掉线立即重拨（失败退避 5 秒）；
 #   · 退出/断开时对称拆除，不留半开的承载。
-# ⚠️ FM350 / RW350 这类 RNDIS/ECM 模组不适用（没有 QMI 控制口，走模组侧 AT 拨号）。
+# ⚠️ FM350 / RW350 这类 **RNDIS** 模组不适用（没有 QMI 控制口，地址走模组侧 DHCP/static）。
 host_dial_bin = "native"
 # PDN / QMAP mux 序号。默认 0 = 自动：
 #   0  自动：先按**数据网卡名**反推（wwan0_1 → 1）；反推不到、但驱动是 QMAP 模式
