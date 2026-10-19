@@ -198,7 +198,7 @@ pub fn handle(req: Request, state: Arc<AppState>) -> Result<()> {
         ("POST", "/api/lock/cell") => handlers::lock_cell::handle(req, &state, &query),
         ("POST", "/api/lock/mode") => handlers::lock_mode::handle(req, &state, &query),
         ("POST", "/api/lock/unlock") => handlers::lock_unlock::handle(req, &state, &query),
-        ("GET", "/api/modules") => handlers::modules::handle(req),
+        ("GET", "/api/modules") => handlers::modules::handle(req, &state, &query),
         ("GET", "/api/sms/auth") => handlers::sms_auth::handle(req, &state),
         ("POST", "/api/sms/unlock") => handlers::sms_unlock::handle(req, &state, &query),
         ("POST", "/api/sms/lock") => handlers::sms_lock::handle(req, &state),

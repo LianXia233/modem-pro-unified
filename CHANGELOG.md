@@ -4,6 +4,22 @@
 
 ## [未发布]
 
+### 对齐上游：支持清单从 7 个骨架型号扩到 91 个（QModem）
+
+`GET /api/modules` 之前是重构留下的骨架（7 条、裸数组），而前端「支持模块」页按
+`{count, vendors, models}` + 逐型号 `plan` 渲染 —— 页面实际是坏的。本轮按上游
+（Go 版 `module/catalog/modem_catalog.json` + `apiModules`）补齐：
+
+- 内嵌 QModem `docs/support_list.md` 全量 91 个型号（12 家厂商、41 个有 PCIe），
+  数据与解析按 MPL-2.0 使用（见 `rust/src/modem/catalog.rs` 文件头）。
+- `/api/modules` 返回 `{count, usb_count, pcie_count, vendor_count, vendors, models}`；
+  `?model=` / `?modem_id=` 返回 `{plan}`，含 `in_catalog / usb_modes / pcie_modes /
+  usb_text / pcie_text / platform / commands / gaps`。
+- `commands` 只列**有出处的**模式切换 AT（QModem 指令脚本里的 `AT+QCFG="usbnet",N` 等），
+  没登记的模式进 `gaps` 并附原因，**不编造**。
+- 型号识别做「最长关键字优先 + 去分隔符归一」：`FM350-GL` 命中 `fm350-gl`（USB RNDIS /
+  PCIe MBIM），不会误命中更短的键；不在清单里明确 `in_catalog=false`。
+
 ### 重大变更：删除 `third_party/`，QMI/MBIM 拨号全部内化
 
 四家厂商的 C 拨号器（quectel-CM / fibocom-dial / meig-cm / simcom-cm）与 8 个厂商内核模块

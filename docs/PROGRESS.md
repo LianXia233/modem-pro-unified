@@ -2473,6 +2473,50 @@ gnu89 模式下上述两类都不再是错误，**一个开关同时解决两类
 
 ---
 
+## 42. 与上游对照：重构完整度核查 + 支持清单补全（2026-10-19）
+
+对照对象：`LianXia233/modem-pro`（Go 后端，重构来源）与 `FUjr/QModem`（功能/机型参考）。
+
+### 42.1 接口面：齐了
+
+| 维度 | Go 上游 | Rust 重构 | 结论 |
+| --- | --- | --- | --- |
+| `/api/*` 路由 | 93 条（去掉测试串） | 94 条（多 `/api/ntp`、`/api/ntp/set`、`/api/ntp/sync`） | ✅ 无缺失 |
+| 厂商方言 | 14 家 | 14 家（`rust/src/modem/vendor/`） | ✅ |
+| 主机侧拨号 | 仅 `hostdial/spec.go`（117 行，选二进制） | 内置 QMI/MBIM/QMAP（3572 行） | ✅ 已超越 |
+
+### 42.2 找到的一处真缺口：`/api/modules` 是骨架
+
+- Rust 版只剩 7 个型号的裸数组（`catalog.rs` 66 行），字段 `usb_kind/host_dial`；
+- 前端「支持模块」页要的是 `{count,vendors,models}`，且点型号要 `{plan}` —— 页面实际打不开；
+- Go 上游有完整 91 型号清单（`module/catalog/modem_catalog.json`）+ 统计/匹配/文案逻辑。
+
+**本轮已补**：`rust/src/modem/modem_catalog.json`（91 型号）+ `catalog.rs` 重写
+（统计、厂商标籤、最长匹配、USB/PCIe 模式、切换 AT）+ `handlers/modules.rs` 重写
+（三种用法 + `plan` + `gaps`）。单测 8 条覆盖型号数、最长匹配、FM350=RNDIS/PCIe MBIM、
+未知型号不猜、切换指令来源。
+
+### 42.3 仍与 Go 上游有差距的部分（非拨号域）
+
+| 能力 | Go 上游 | Rust 现状 | 影响 |
+| --- | --- | --- | --- |
+| 逐型号 AT 指令面 | `modem_at_plan.go`（35K，从真实实现反射出来） | 只给清单登记的 USB/PCIe 切换 AT；其余走 `/api/vendor/cmds` | 页面「AT 指令面」信息量较少，但不会说谎 |
+| 平台变体表 | `module/variant`（厂商 × 平台） | 厂商级 `VendorSpec`，平台差异散在 model | 个别平台（如 Fibocom MTK vs 高通）取值可能需补 |
+| 主机磁盘占用 | `hostdisk`（statfs） | 未实现 | 屏端少一个指标，不影响业务 |
+
+### 42.4 QModem 里没抄的部分（明确不适用/不做）
+
+- `qmodem_uplink_manager`（多 WAN 负载/故障切换）：本项目由 netifd 管 WAN，语义不同；
+- `qmodem_sipd` / `voipd`：VoIP 不在本项目范围；
+- `quectel_CM_5G_M`：C 拨号器已删除，能力已在 Rust 内实现（QMAP/MHI/MBIM）。
+
+### 42.5 许可
+
+QModem 为 MPL-2.0；`rust/src/modem/modem_catalog.json` 与 `catalog.rs` 的数据/解析
+按 MPL-2.0 使用，文件头已注明；仓库其余代码保持 MIT。
+
+---
+
 ## 12. 编码规范与要求（强约束）
 
 1. **模块拆分**：宁细勿粗，一个接口一个 handler 文件；解析逻辑放 `model/*` 并配单测。

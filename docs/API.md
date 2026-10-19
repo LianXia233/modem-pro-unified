@@ -120,11 +120,34 @@
   模组上报名（`AT+COPS?` format=0 才有）→ 原始 PLMN。
 
 ### GET /api/modules
-支持模块清单。
+支持模块清单（91 个型号，数据源自 QModem `support_list.md`）与逐型号 AT 指令面。
+
+三种用法：
+
+| 请求 | 返回 |
+| --- | --- |
+| `/api/modules` | `{count, usb_count, pcie_count, vendor_count, vendors, models}` |
+| `/api/modules?model=RM500Q-GL` | `{plan}`：按型号离线推导（`in_catalog` 标出是否在清单里） |
+| `/api/modules?modem_id=0` | `{plan}`：按在网模组的实测型号，`live=true` |
 
 ```json
-{"code":0,"data":[{"model":"rm500","vendor":"quectel","usb_kind":"qmi","host_dial":true}],"msg":"ok"}
+{"code":0,"data":{
+  "count":91,"usb_count":90,"pcie_count":41,"vendor_count":12,
+  "vendors":[{"vendor":"quectel","name":"移远 Quectel","count":30}],
+  "models":[{"vendor":"fibocom","vendor_name":"广和通 Fibocom","model":"fm350-gl",
+             "platform":"mediatek","usb_modes":["rndis"],"pcie_modes":["mbim"],
+             "usb_text":"RNDIS","pcie_text":"MBIM"}]
+},"msg":"ok"}
 ```
+
+`plan` 关键字段：`model / vendor / vendor_name / platform / platform_name /
+in_catalog / live / usb_modes / pcie_modes / usb_text / pcie_text /
+cmd_impl / commands[] / gaps[] / gap_notes[]`。
+
+`commands` 里目前只放**清单登记的 USB/PCIe 模式切换指令**（`AT+QCFG="usbnet",0` 这类，
+来源 QModem 指令脚本），每条形如
+`{key,label,cmd,parser,format,on,source}`；没有切换指令的模式会进 `gaps` + `gap_notes`，
+**不编造**。型号不在清单里时 `in_catalog=false`、`commands=[]`，只回显识别到的厂商。
 
 ### GET|POST /api/at
 直发 AT。参数 `modem_id`、`cmd`（POST 可用 form 或单层 JSON；form 值按百分号解码）。
