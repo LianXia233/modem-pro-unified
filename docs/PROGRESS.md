@@ -2295,27 +2295,37 @@ Rust 独立模块实现。
 rust/host（从源码编 rustc + LLVM，冷启动 1~2 小时）。但实测云编译仍卡在 `编译 modem-pro`
 步骤 ~58 分钟，日志里是 CMake `[2878/3710]` 在编 **LLVM**——也就是 rust/host 根本没被跳过。
 
-**根因**：`MODEM_PRO_HOST_RUST=1` 是 **make 命令行变量**。OpenWrt 的**包元数据扫描在子
-make 里进行**，该子 make 不保证继承命令行变量；扫描阶段看不到开关 → `HAVE_RUST:=1` →
-`PKG_BUILD_DEPENDS:=rust/host` 被写进包元数据 → 构建时照常从源码编 rustc + LLVM。
-（`.config` 里的 `CONFIG_MODEM_PRO_*` 能被保留，反而是可靠通道。）
+**根因（经过两次失败才定位）**：不是「开关传不进去」，而是**扫描时机 + 元数据缓存**。
 
-**修复**（两处，互为保险）：
+1. 第一次修复把开关做成 `.config` 符号、编译步骤改环境变量，**仍失败**：`.config` 里
+   确实有 `CONFIG_MODEM_PRO_HOST_RUST=y`，编译步骤照样从第一秒就进 rust 目录编 rustc+LLVM。
+2. 真正原因：OpenWrt 的**包元数据扫描在 `feeds update/install` 期间就跑了**——`include/scan.mk`
+   对每个包在**包目录下**执行 `make -r DUMP=1`，该子 make 经 `rules.mk` 读 `.config`，据
+   `PKG_BUILD_DEPENDS` 决定 `Build-Depends`，结果写进 `tmp/.packageinfo`。而那时 `.config`
+   **还没有** `CONFIG_MODEM_PRO_HOST_RUST`（选包/开关原先写在 feeds 之后的「生成配置」步骤）
+   → 扫描按 `HAVE_RUST=1` 记下 `Build-Depends: rust/host`；
+3. `tmp/.packageinfo` 的失效戳只认包 Makefile 列表（`scan.mk` 的 FILELIST md5），**改
+   `.config` 不会触发重扫**；编译步骤的 make 直接复用这份元数据 → rust 照编。于是
+   「`.config` 符号」与「编译步骤环境变量」都救不了：依赖早被固化进缓存元数据。
 
-- **`Makefile`**：把开关同时做成 `.config` 符号——新增 `MODEM_PRO_HOST_RUST` 到
-  `Package/modem-pro/config`（默认 `n`），并用
-  `MODEM_PRO_HOST_RUST ?= $(if $(filter y,$(CONFIG_MODEM_PRO_HOST_RUST)),1,0)`
-  取值：命令行/环境变量优先，未给则回退 `.config`。`.config` 由 `rules.mk` 在解析每个包
-  Makefile 时读取，**扫描阶段一定可见**，故扫描侧不再误挂 rust/host；本地默认行为不变
-  （符号未设 → flag=0 → 仍走 feeds 路径）。
+**修复（关键在顺序，而非再叠开关）**：
+
 - **`.github/workflows/build.yml`**：
-  - 选包配置追加 `CONFIG_MODEM_PRO_HOST_RUST=y`；
-  - 编译步骤把 `MODEM_PRO_HOST_RUST=1` / `MODEM_PRO_CARGO_TARGET_DIR` 从 **make 命令行参数**
-    改为 **make 之前的环境变量**（环境变量必被子 make 继承），双保险；
+  - 新增「写入选包与构建开关（**务必在 feeds 扫描之前**）」步骤：SDK 解压后、`feeds
+    update/install` 之前，就把 `CONFIG_MODEM_PRO_HOST_RUST=y`（连同选包与四家拨号器开关）
+    写进 `.config`，让 feeds 期间的扫描按 `HAVE_RUST=0` 记录、不再挂 rust/host；
+  - 把 `MODEM_PRO_HOST_RUST=1` 提到 **job 级 `env`**，使**每个步骤**（含 feeds 扫描）都带上；
+  - 「生成配置」步骤只保留 `make defconfig` + 核对；编译步骤只再传 `MODEM_PRO_CARGO_TARGET_DIR`；
   - 超时上限 60 → 90 分钟，给编 vendor 拨号器 + kmod 留余量（原 60 是被 LLVM 拖爆的）。
+- **`Makefile`**：保留两种等价写法——命令行/环境变量 `MODEM_PRO_HOST_RUST=1`，或 `.config`
+  符号 `CONFIG_MODEM_PRO_HOST_RUST`（默认 `n`，也可在 menuconfig 勾选），取值
+  `MODEM_PRO_HOST_RUST ?= $(if $(filter y,$(CONFIG_MODEM_PRO_HOST_RUST)),1,0)`；
+  本地默认行为不变（符号未设 → flag=0 → 仍走 feeds 路径）。
 
-**验证**：`?=` 取值三路（命令行 / 环境变量 / `.config`）用最小 make 用例逐一跑通；
-workflow YAML 通过解析校验。CI 侧由移动 `v1.0.0` 标签触发重编确认。
+**验证**：`?=` 三路取值（命令行 / 环境变量 / `.config`）用最小 make 用例逐一跑通、workflow
+YAML 通过解析校验；前两次 CI 日志逐行定位——`Entering .../feeds/packages/lang/rust` 与
+`[1/3898] LLVMDemangle` 出现在编译步骤首秒，且该步骤**没有**再打印 `Collecting package info`，
+证明它复用了 feeds 阶段扫描出的构建依赖。CI 侧继续用移动 `v1.0.0` 标签触发确认。
 
 ---
 

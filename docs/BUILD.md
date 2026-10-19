@@ -15,9 +15,10 @@ Rust 守护进程有两种编译方式，按**宿主直编开关**切换。开�
 - 命令行 / 环境变量：`MODEM_PRO_HOST_RUST=1`（本地常用）；
 - `.config` 符号：`CONFIG_MODEM_PRO_HOST_RUST=y`（**CI 用这条**，menuconfig 里也能勾）。
 
-> 为何提供 `.config` 写法：OpenWrt 的**包元数据扫描在子 make 里进行**，命令行变量不一定
-> 传到扫描进程；而 `.config` 由 `rules.mk` 在每个包 Makefile 解析时读取，扫描阶段一定可见。
-> 若扫描阶段看不到开关，就会把 `rust/host` 当成构建依赖，又去源码编译 rustc + LLVM。
+> 为何提供 `.config` 写法、且**必须在跑 feeds 之前**就写进去：OpenWrt 的**包元数据扫描在
+> `feeds update/install` 期间就会跑**（子 make 在每个包目录下 `make -r DUMP=1`），它读 `.config`
+> 决定各包的 `Build-Depends`，结果落进 `tmp/.packageinfo` 并被后续 make 复用（之后改 `.config`
+> **不会**触发重扫）。若扫描时看不到开关，就会把 `rust/host` 当成构建依赖、又去源码编 rustc + LLVM。
 
 | 方式 | 开关 | 依赖 | 说明 |
 | --- | --- | --- | --- |
@@ -208,9 +209,10 @@ feeds → 选包配置 → 编译（V=s）→ 收集产物 + SHA256 → 上传 a
 
 要点：
 - **触发**：推 `v*` 标签（编译 + 自动建 Release 上传产物）或手动 `workflow_dispatch`（只编译）；
-- **Rust 走宿主工具链**：`.config` 里 `CONFIG_MODEM_PRO_HOST_RUST=y`（并在编译步骤用
-  环境变量 `MODEM_PRO_HOST_RUST=1` 双保险——OpenWrt 的元数据扫描在子 make 里跑，环境变量
-  才保证被继承），宿主 `rustup` + 官方 `aarch64-unknown-linux-musl` target 交叉编译，
+- **Rust 走宿主工具链**：在 feeds 扫描**之前**就把 `CONFIG_MODEM_PRO_HOST_RUST=y` 写进
+  `.config`，并把 `MODEM_PRO_HOST_RUST=1` 提到 job 级 `env`——**否则 feeds 扫描会把
+  `rust/host` 记进包元数据（`tmp/.packageinfo`），之后怎么设开关都照样编 rustc + LLVM**；
+  宿主 `rustup` + 官方 `aarch64-unknown-linux-musl` target 交叉编译，
   **不再**从源码编译 rust host 工具链（原路冷启动 1~2 小时），也不再安装 feeds 的 `lang/rust`；
 - **缓存**：`~/.cargo/registry` + `~/.cargo/git` + `.cargo-target`（cargo 依赖与编译产物），
   key 绑定 `rust/Cargo.lock` / `Makefile` / workflow 文件哈希，二次起只需几分钟；

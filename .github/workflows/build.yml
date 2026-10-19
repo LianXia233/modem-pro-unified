@@ -43,6 +43,10 @@ env:
   PKG: modem-pro
   # 宿主 Rust 工具链（需与 rust/Cargo.toml 的 rust-version 兼容；升级时只改这里）
   RUST_TOOLCHAIN: "1.92.0"
+  # 宿主直编开关放到 job 级 env：OpenWrt 的**包元数据扫描发生在 feeds 步骤**（子 make 在
+  # 每个包目录下 `make -r DUMP=1`），必须让它也看到本开关，否则扫描会把 rust/host 记为
+  # modem-pro 的 Build-Depends，写进 tmp/.packageinfo 后被后续 make 复用，怎么设都白搭。
+  MODEM_PRO_HOST_RUST: "1"
 
 jobs:
   build:
@@ -137,6 +141,25 @@ jobs:
             *)         curl -fsSL "$BASE/$SDK" | tar -xJ    --strip-components=1 -C sdk ;;
           esac
 
+      - name: 写入选包与构建开关（务必在 feeds 扫描之前）
+        working-directory: sdk
+        run: |
+          # 关键顺序：OpenWrt 的**包元数据扫描在 feeds update/install 期间就会跑**
+          # （scan.mk 在每个包目录下 `make -r DUMP=1`），它读 .config 决定各包的
+          # Build-Depends，结果写进 tmp/.packageinfo，后续 make 直接复用——而且
+          # 之后改 .config 并不会触发重扫。所以 CONFIG_MODEM_PRO_HOST_RUST 必须在
+          # feeds 扫描【之前】就落进 .config，否则扫描仍按 HAVE_RUST=1 记下
+          # `Build-Depends: rust/host`，之后无论怎样设开关都照样去源码编 rustc + LLVM。
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_modem-pro=y
+          CONFIG_MODEM_PRO_HOST_RUST=y
+          CONFIG_MODEM_PRO_QUECTEL=y
+          CONFIG_MODEM_PRO_FIBOCOM=y
+          CONFIG_MODEM_PRO_MEIG=y
+          CONFIG_MODEM_PRO_SIMCOM=y
+          EOF
+          grep -E "^CONFIG_PACKAGE_modem-pro=|^CONFIG_MODEM_PRO_HOST_RUST=" .config
+
       - name: 缓存 cargo 依赖与编译产物
         uses: actions/cache@v6
         with:
@@ -183,17 +206,11 @@ jobs:
           ./scripts/feeds install -p ci_stub odhcp6c
           ./scripts/feeds install -p modem_pro modem-pro
 
-      - name: 生成配置（选包 + 四家拨号器全开）
+      - name: 生成配置（defconfig 归一化 + 核对）
         working-directory: sdk
         run: |
-          cat >> .config <<'EOF'
-          CONFIG_PACKAGE_modem-pro=y
-          CONFIG_MODEM_PRO_HOST_RUST=y
-          CONFIG_MODEM_PRO_QUECTEL=y
-          CONFIG_MODEM_PRO_FIBOCOM=y
-          CONFIG_MODEM_PRO_MEIG=y
-          CONFIG_MODEM_PRO_SIMCOM=y
-          EOF
+          # 选包与开关已在「写入选包与构建开关」步骤（feeds 扫描前）写入 .config；
+          # feeds 装完包后这里再 defconfig：把这些符号归一化并补齐依赖。
           make defconfig
           echo "── 配置核对 ──"
           grep -E "^CONFIG_PACKAGE_modem-pro=|^CONFIG_MODEM_PRO_" .config
@@ -203,12 +220,10 @@ jobs:
         working-directory: sdk
         run: |
           set -o pipefail
-          # MODEM_PRO_HOST_RUST=1              —— 宿主 rustup 工具链直编，跳过 feeds 的 rust 源码编译
-          # MODEM_PRO_CARGO_TARGET_DIR         —— 固定到工作区，给上面的 cargo 缓存复用编译产物
-          # 变量放在 make 之前（= 环境变量）而非 make 命令行参数：OpenWrt 的包元数据扫描
-          # 在子 make 里跑，环境变量必然被继承，命令行参数则不保证传到扫描进程；
-          # 开关另在 .config 里有 CONFIG_MODEM_PRO_HOST_RUST=y 兜底（见上一步），双保险。
-          MODEM_PRO_HOST_RUST=1 \
+          # MODEM_PRO_HOST_RUST=1      —— 已提到 job 级 env（见文件顶部 env 段）：这样
+          #                               feeds 扫描阶段也带该开关，扫描才不会把 rust/host
+          #                               记进包元数据；
+          # MODEM_PRO_CARGO_TARGET_DIR —— 固定到工作区，给上面的 cargo 缓存复用编译产物。
           MODEM_PRO_CARGO_TARGET_DIR="$GITHUB_WORKSPACE/.cargo-target" \
           make package/modem-pro/compile V=s -j"$(nproc)" 2>&1 | tee build.log
 

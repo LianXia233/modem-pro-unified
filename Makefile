@@ -39,10 +39,12 @@ PKG_USE_MIPS16:=0
 #   开关取值来源（按优先级）：
 #     ① 命令行 / 环境变量：本地或 CI 直接 `MODEM_PRO_HOST_RUST=1 make ...`；
 #     ② 都没有时回退到 .config 符号 CONFIG_MODEM_PRO_HOST_RUST。
-#   为何需要 ②：OpenWrt 的**包元数据扫描在子 make 里进行**，命令行变量不一定能传进去；
-#   扫描阶段一旦看不到本开关，就会把 rust/host 当作构建依赖，又跑去源码编译 rustc + LLVM
-#   （正是要绕开的那 1~2 小时）。而 .config 由 rules.mk 在解析每个包 Makefile 时读取，
-#   扫描阶段一定可见，故 ② 最稳；CI 用 ②，本地两条都行。
+#   为何还要 ②：OpenWrt 的**包元数据扫描在 feeds update/install 期间就跑了**（子 make 在
+#   每个包目录下 `make -r DUMP=1`），它读 .config 决定各包的 Build-Depends，结果落进
+#   tmp/.packageinfo 并被后续 make 复用，且之后改 .config 不会触发重扫。因此 CI 必须把
+#   CONFIG_MODEM_PRO_HOST_RUST=y 在 feeds 扫描【之前】就写进 .config，并把 ① 提到 job 级
+#   env，让扫描阶段也带上——否则扫描会把 rust/host 记成构建依赖，之后怎么设都去源码编
+#   rustc + LLVM（正是要绕开的那 1~2 小时）。
 MODEM_PRO_HOST_RUST ?= $(if $(filter y,$(CONFIG_MODEM_PRO_HOST_RUST)),1,0)
 MODEM_PRO_RUST_TARGET:=aarch64-unknown-linux-musl
 MODEM_PRO_CARGO_TARGET_DIR ?= $(PKG_BUILD_DIR)/rust/target
