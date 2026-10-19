@@ -43,8 +43,10 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # 通用 ARM64：包架构 aarch64_generic（A53/A55/A72 等 64 位设备通用，
-  # 无内核模块依赖，任何 aarch64 固件可装）
+  # 目标平台由 job 级 matrix 给出（见 jobs.build.env.TARGET）：
+  #   · armsr/armv8          → 包架构 aarch64_generic（A53/A55/A72 等 64 位通用）
+  #   · mediatek/filogic     → 包架构 aarch64_cortex-a53（MT7981/7986 等 filogic 设备）
+  # 两者都是纯用户态（无内核模块），同一份 aarch64 musl 二进制，只有包架构不同。
   TARGET: armsr/armv8
   PKG: modem-pro
   # 宿主 Rust 工具链（需与 rust/Cargo.toml 的 rust-version 兼容；升级时只改这里）
@@ -64,11 +66,22 @@ jobs:
       matrix:
         include:
           - id: apk-mainline
-            name: 主线 APK（snapshots · aarch64）
+            name: 主线 APK（snapshots · aarch64_generic）
             kind: apk
+            target: armsr/armv8
+          - id: apk-filogic
+            name: 主线 APK（snapshots · mediatek/filogic · cortex-a53）
+            kind: apk
+            target: mediatek/filogic
           - id: ipk-24.10
             name: 24.10 IPK（opkg · aarch64）
             kind: ipk
+            target: armsr/armv8
+    env:
+      # ⚠️ 必须放在 job 级：OpenWrt 的包元数据扫描在 feeds 步骤就会跑（子 make
+      # `make -r DUMP=1`），它要看到本开关，否则会把 rust/host 记进 Build-Depends。
+      TARGET: ${{ matrix.target }}
+      MODEM_PRO_HOST_RUST: "1"
     steps:
       - name: 检出仓库
         uses: actions/checkout@v7
@@ -313,8 +326,13 @@ jobs:
 
             | 文件 | 适用于 |
             | --- | --- |
-            | `modem-pro-*.apk` | OpenWrt 主线 / snapshots（25.x，apk 包管理器） |
+            | `modem-pro-*.apk`（`apk-mainline`） | OpenWrt 主线 / snapshots，包架构 **aarch64_generic**（A53/A55/A72 等通用） |
+            | `modem-pro-*.apk`（`apk-filogic`） | OpenWrt 主线 / snapshots，包架构 **aarch64_cortex-a53**（MT7981/7986 等 filogic 设备；`apk --print-arch` 为 `aarch64_cortex-a53` 时选它） |
             | `modem-pro_*.ipk` | OpenWrt 24.10.x（opkg 包管理器） |
+
+            > 两个 APK 内容相同（同一份静态 musl 二进制、无内核模块），只是包架构标签不同。
+            > apk 会拒绝架构不匹配的包（`error: uninstallable / arch: …`），按设备
+            > `apk --print-arch` 的输出选对应文件即可。
 
             两者均为 **aarch64_generic**（Cortex-A53 及以上 64 位通用，无内核模块依赖），
             内含 modemd 守护进程、四家厂商拨号器、netifd 协议脚本与 LuCI 前端（菜单已汉化）。
