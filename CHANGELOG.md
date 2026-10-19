@@ -4,6 +4,20 @@
 
 ## [未发布]
 
+### LuCI 菜单 Tab 化 + 代理错误信息可排查（1.0.0-2）
+
+- **页内 Tab 菜单**：8 个子页面合并为单一入口「5G 终端」，页内 Tab 切换
+  （设备中心 / 拨号上网 / 基站扫描 / 锁网 / 短信 / 调试工具 / 支持模块 / 服务控制）。
+  设备固件的 ucode dispatcher 没有 `type:tabs` 渲染，因此由 `view/modemd/main.js`
+  做 Tab 骨架、**按需 `L.require` 动态加载各视图** —— 切 Tab 才加载对应 JS 与数据；
+  Tab 状态记在 `location.hash`（`#md=dial`），刷新/分享链接可复现；
+  切换时清空共享轮询的旧订阅（`store.reset()`），避免对已脱离 DOM 的节点 redraw。
+- **代理错误信息可排查**：`api.js` 先取文本、按 content-type 判断再解析。
+  此前 LuCI 会话过期（403 登录页 HTML）、端点缺失（404）或 ucode error500 时
+  直接 `res.json()`，用户只看到
+  `无法连接 LuCI 代理：Unexpected token '<', "..." is not valid JSON`；
+  现在分别给出明确提示（会话过期 / 菜单未生效 / LuCI 代理异常 + HTTP 状态）。
+
 ### CI 增加 mediatek/filogic（aarch64_cortex-a53）APK 通道
 
 实测：`apk --print-arch` 为 `aarch64_cortex-a53` 的固机装不上 armv8 打出的

@@ -3,33 +3,8 @@
 		"title": "5G 终端",
 		"order": 26,
 		"action": {
-			"type": "firstchild"
-		},
-		"depends": {
-			"acl": [
-				"luci-app-modemd"
-			]
-		}
-	},
-	"admin/modemd/overview": {
-		"title": "设备中心",
-		"order": 1,
-		"action": {
 			"type": "view",
-			"path": "modemd/overview"
-		},
-		"depends": {
-			"acl": [
-				"luci-app-modemd"
-			]
-		}
-	},
-	"admin/modemd/service": {
-		"title": "服务控制",
-		"order": 8,
-		"action": {
-			"type": "view",
-			"path": "modemd/service"
+			"path": "modemd/main"
 		},
 		"depends": {
 			"acl": [
@@ -47,84 +22,6 @@
 			"methods": [
 				"cookie:sysauth_https",
 				"cookie:sysauth_http"
-			]
-		}
-	},
-	"admin/modemd/dial": {
-		"title": "拨号上网",
-		"order": 2,
-		"action": {
-			"type": "view",
-			"path": "modemd/dial"
-		},
-		"depends": {
-			"acl": [
-				"luci-app-modemd"
-			]
-		}
-	},
-	"admin/modemd/cells": {
-		"title": "基站扫描",
-		"order": 3,
-		"action": {
-			"type": "view",
-			"path": "modemd/cells"
-		},
-		"depends": {
-			"acl": [
-				"luci-app-modemd"
-			]
-		}
-	},
-	"admin/modemd/lock": {
-		"title": "锁网",
-		"order": 4,
-		"action": {
-			"type": "view",
-			"path": "modemd/lock"
-		},
-		"depends": {
-			"acl": [
-				"luci-app-modemd"
-			]
-		}
-	},
-	"admin/modemd/sms": {
-		"title": "短信",
-		"order": 5,
-		"action": {
-			"type": "view",
-			"path": "modemd/sms"
-		},
-		"depends": {
-			"acl": [
-				"luci-app-modemd"
-			]
-		}
-	},
-	"admin/modemd/tools": {
-		"title": "调试工具",
-		"order": 6,
-		"action": {
-			"type": "view",
-			"path": "modemd/tools"
-		},
-		"depends": {
-			"acl": [
-				"luci-app-modemd"
-			]
-		}
-	},
-	"admin/modemd/modules": {
-		"title": "支持模块",
-		"order": 7,
-		"action": {
-			"type": "view",
-			"path": "modemd/modules"
-		},
-		"depends": {
-			"acl": [
-				"luci-app-modemd"
 			]
 		}
 	},

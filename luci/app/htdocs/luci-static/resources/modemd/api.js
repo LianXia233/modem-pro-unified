@@ -57,18 +57,32 @@ var Api = baseclass.extend({
 			credentials: 'same-origin'
 		}).then(function (res) {
 			if (timer) window.clearTimeout(timer);
-			if (res.status === 403) {
-				throw new ApiError(-403, '未登录或会话过期，请重新登录 LuCI');
-			}
-			return res.json();
-		}).then(function (json) {
-			if (!json || typeof json !== 'object') {
-				throw new ApiError(-1, '代理返回了非 JSON 内容');
-			}
-			if (json.code !== 0) {
-				throw new ApiError(json.code, json.msg || ('code=' + json.code));
-			}
-			return json.data;
+			/* 先取文本再解析：代理/ dispatcher 在会话过期（403 登录页）、
+			   端点缺失（404）或 ucode 异常（error500）时返回的是 **HTML**，
+			   直接 res.json() 会得到 "Unexpected token '<'" 这种没法排查的报错。 */
+			return res.text().then(function (text) {
+				if (res.status === 403)
+					throw new ApiError(-403, 'LuCI 会话过期或无权限：请刷新页面重新登录');
+				if (res.status === 404)
+					throw new ApiError(-404, '代理端点不存在（menu.d 未生效？重装插件或重启 uhttpd）');
+				var ct = String(res.headers.get('content-type') || '');
+				if (res.status >= 400 && !/json/i.test(ct))
+					throw new ApiError(-1, 'LuCI 代理异常（HTTP ' + res.status + '）：请重新登录后再试');
+				if (!/json/i.test(ct))
+					throw new ApiError(-1, '代理返回了 HTML 而不是 JSON（HTTP ' + res.status + '）：通常是 LuCI 会话过期');
+				var json;
+				try {
+					json = JSON.parse(text);
+				}
+				catch (e) {
+					throw new ApiError(-1, '代理响应不是合法 JSON（HTTP ' + res.status + '）');
+				}
+				if (!json || typeof json !== 'object')
+					throw new ApiError(-1, '代理返回了非 JSON 内容');
+				if (json.code !== 0)
+					throw new ApiError(json.code, json.msg || ('code=' + json.code));
+				return json.data;
+			});
 		}).catch(function (e) {
 			if (timer) window.clearTimeout(timer);
 			if (e instanceof ApiError) throw e;

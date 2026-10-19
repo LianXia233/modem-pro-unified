@@ -110,6 +110,13 @@ return baseclass.extend({
 		return this;
 	},
 
+	/* 清空全部订阅（Tab 切换时由 main.js 调用：旧视图的订阅随视图一起作废，
+	   否则每切一次 Tab 就多一份闭包，且会对已脱离 DOM 的节点继续 redraw） */
+	reset: function () {
+		subs.length = 0;
+		return this;
+	},
+
 	/* 切换选中模组：写 sessionStorage（跨页面记忆）并立刻重拉 */
 	select: function (modemId) {
 		state.modemId = modemId;
