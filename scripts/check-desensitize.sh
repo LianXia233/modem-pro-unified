@@ -38,7 +38,11 @@ hits=$(printf '%s\n' "$FILES" | xargs grep -nE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b'
   | grep -v 'd="M' \
   | grep -vE '5\.4\.2\.1|5\.6\.7\.8|114\.114\.114\.114|223\.5\.5\.5|1\.2\.3\.4' \
   | while IFS= read -r line; do
-      bad=$(printf '%s\n' "$line" | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | while IFS=. read -r a b c d; do
+      # 固件版本号形如 86600.1000.00.05.17.11（5~6 段点分数字），会被下面的
+      # IPv4 正则截出一段来误报。先把「5 段以上」的长串整段抹掉，再找地址 ——
+      # 同一行里真出现 IPv4 时它自己只有 4 段，抹不掉，仍会被检出。
+      clean=$(printf '%s\n' "$line" | sed -E 's/([0-9]+\.){4,}[0-9]+//g')
+      bad=$(printf '%s\n' "$clean" | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | while IFS=. read -r a b c d; do
         [ "$a" -le 255 ] 2>/dev/null && [ "$b" -le 255 ] 2>/dev/null \
           && [ "$c" -le 255 ] 2>/dev/null && [ "$d" -le 255 ] 2>/dev/null || continue
         case "$a" in

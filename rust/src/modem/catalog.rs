@@ -128,6 +128,16 @@ pub struct Entry {
     pub usb_at: Option<ModeAtSet>,
     #[serde(default, rename = "pcie_at")]
     pub pcie_at: Option<ModeAtSet>,
+    /// USB 厂商 ID（4 位小写十六进制）。
+    ///
+    /// 来自 QModem `modem_support.json` 的 `manufacturer_id` —— 同一张表里
+    /// 「型号 ↔ VID」是**上游实测登记过的对应关系**，识别时用它做交叉校验：
+    /// AT 应答说是 A 家的型号，而 USB VID 属于 B 家，说明要么型号名撞了、
+    /// 要么设备被改过，这时不能直接按 A 家的方言发私有指令。
+    ///
+    /// 空 = 上游也没登记（`simcom_sim82xx` 那几条、以及 PCIe-only 的 T99W640）。
+    #[serde(default)]
+    pub vid: String,
 }
 
 impl Entry {
@@ -243,24 +253,128 @@ pub fn flatten(model: &str) -> String {
         .collect()
 }
 
-/// 按型号查清单项（最长关键字优先；`FM350-GL` 命中 `fm350-gl` 而不是 `fm350`）。
-pub fn lookup(model: &str) -> Option<&'static Entry> {
-    let flat = flatten(model);
-    if flat.is_empty() {
+/// 按 USB VID 找厂商。
+///
+/// 同一个 VID 底下可能挂着多个厂商的型号（最典型的是 `2c7c` 移远：底下分
+/// 高通 / 展锐 / MTK 三个平台），所以取「该 VID 出现次数最多的厂商」，
+/// 并配合 [`vendor_is_exclusive`] 判断这条推断能不能当证据用。
+pub fn vendor_by_vid(vid: &str) -> Option<&'static str> {
+    let v = vid.trim().to_ascii_lowercase();
+    if v.is_empty() {
         return None;
     }
-    for key in model_keys() {
-        let k = flatten(key);
-        if k.len() < 3 {
-            continue; // `s10` 这类短名容易误伤，宁可不认
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for e in catalog().iter().filter(|e| e.vid == v) {
+        *counts.entry(e.vendor.as_str()).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(name, n)| (*n, std::cmp::Reverse(*name)))
+        .map(|(name, _)| name)
+}
+
+/// 这个 VID 在清单里是否只对应一家厂商。
+///
+/// `true` 时「VID → 厂商」可以当**确定证据**（如 `1e0e` SIMCom、`3466` 鼎桥）；
+/// `false` 时只能当提示（如 `2c7c` 同时有移远/广和通/美格的登记型号）。
+pub fn vendor_is_exclusive(vid: &str) -> bool {
+    let v = vid.trim().to_ascii_lowercase();
+    if v.is_empty() {
+        return false;
+    }
+    let mut seen: Option<&str> = None;
+    for e in catalog().iter().filter(|e| e.vid == v) {
+        match seen {
+            None => seen = Some(e.vendor.as_str()),
+            Some(x) if x == e.vendor => {}
+            Some(_) => return false,
         }
-        if flat.contains(&k) {
-            if let Some(e) = catalog().iter().find(|e| e.model == *key) {
-                return Some(e);
+    }
+    seen.is_some()
+}
+
+/// 该 VID 下登记过的全部型号（给「候选」用，不当作结论）。
+pub fn models_by_vid(vid: &str) -> Vec<&'static Entry> {
+    let v = vid.trim().to_ascii_lowercase();
+    if v.is_empty() {
+        return Vec::new();
+    }
+    catalog().iter().filter(|e| e.vid == v).collect()
+}
+
+/// 型号主干：去掉尾部 1~3 位的区域/形态后缀（`-cn` / `-gl` / `_cn`）。
+///
+/// 为什么需要：`ATI` 常常只报型号主干（`MT5700M` / `MT5710`），而清单里登记的是
+/// `mt5700m-cn` / `mt5710_cn` —— 只做「整名包含」会认不出这些型号，
+/// 结果是「设备明明在清单里，页面却显示未识别」。
+///
+/// 只剥 1~3 位、且剩余部分至少 4 位：`em05-cn` → `em05`、`mt5710_cn` → `mt5710`，
+/// 但 `s10` 这类短名不会被剥成更短的串去误伤别的型号。
+fn stem(model: &str) -> &str {
+    for sep in ['-', '_'] {
+        if let Some(i) = model.rfind(sep) {
+            let tail = &model[i + 1..];
+            if i >= 4
+                && !tail.is_empty()
+                && tail.len() <= 3
+                && tail.chars().all(|c| c.is_ascii_alphanumeric())
+            {
+                return &model[..i];
             }
         }
     }
-    None
+    model
+}
+
+/// 所有可能命中这个型号的清单项（整名优先，其次主干），按可信度排序。
+///
+/// 给识别引擎用：命中多个时说明「只认到型号族、区域版本不确定」，此时
+/// 结论仍可用（同族方言一致），但候选要一并列出来。
+pub fn candidates_for(model: &str) -> Vec<&'static Entry> {
+    let flat = flatten(model);
+    if flat.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<&'static Entry> = Vec::new();
+    // ① 整名包含（长名优先，`fm350-gl` 先于 `fm350`）
+    for key in model_keys() {
+        let k = flatten(key);
+        if k.len() < 3 {
+            continue;
+        }
+        if flat.contains(&k) {
+            if let Some(e) = catalog().iter().find(|e| e.model == *key) {
+                if !out.iter().any(|x| x.model == e.model) {
+                    out.push(e);
+                }
+            }
+        }
+    }
+    if !out.is_empty() {
+        return out;
+    }
+    // ② 主干包含：`MT5700M` → `mt5700m-cn`；主干少于 5 位不参与（太容易误伤）
+    for key in model_keys() {
+        let k = flatten(stem(key));
+        if k.len() < 5 {
+            continue;
+        }
+        if flat.contains(&k) {
+            if let Some(e) = catalog().iter().find(|e| e.model == *key) {
+                if !out.iter().any(|x| x.model == e.model) {
+                    out.push(e);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 按型号查清单项（最长关键字优先；`FM350-GL` 命中 `fm350-gl` 而不是 `fm350`）。
+///
+/// 整名不中时退回主干匹配（见 [`stem`]），因此 `MT5700M` 也能命中 `mt5700m-cn`。
+pub fn lookup(model: &str) -> Option<&'static Entry> {
+    candidates_for(model).into_iter().next()
 }
 
 /// 型号的 USB 模式；不在清单里返回 `None`（调用方**不要**猜）。
@@ -328,6 +442,27 @@ mod tests {
         // PCIe 形态只登记了「没有切换指令」的说明
         let note = &e.pcie_at.as_ref().expect("pcie_at").note;
         assert!(!note.is_empty(), "没有指令时必须写清原因");
+    }
+
+    #[test]
+    fn vid_is_migrated_and_drives_vendor_lookup() {
+        // 86/91 条登记了 VID（其余 5 条上游本来就没有）
+        let with_vid = entries().iter().filter(|e| !e.vid.is_empty()).count();
+        assert_eq!(with_vid, 86, "VID 迁移自 QModem 的 manufacturer_id");
+
+        assert_eq!(vendor_by_vid("2c7c"), Some("quectel"));
+        assert_eq!(vendor_by_vid("0e8d"), Some("fibocom"));
+        assert_eq!(vendor_by_vid("1e0e"), None, "清单里没有的 VID 不猜");
+
+        // 独占 VID 可当证据，多厂商 VID 只能当提示
+        assert!(vendor_is_exclusive("2c7c"), "2c7c 名下全是移远");
+        assert!(!vendor_is_exclusive("1782"), "1782 挂广和通/美格/合宙三家");
+        assert!(!vendor_is_exclusive(""), "空 VID 不是证据");
+
+        // 型号自带的 VID 与端口规则用的是同一口径（小写 4 位）
+        let e = lookup("FM350-GL").expect("fm350-gl");
+        assert_eq!(e.vid, "0e8d");
+        assert_eq!(e.vid.len(), 4);
     }
 
     #[test]

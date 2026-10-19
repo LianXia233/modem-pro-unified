@@ -88,8 +88,11 @@ fn is_zero(v: &i64) -> bool {
 impl Modem {
     /// 查询一次模组状态。`allow_roaming` 来自 `[net] allow_roaming`。
     pub fn modem_status(&self, allow_roaming: bool) -> Result<ModemStatus> {
+        // ICCID：合宙/泰雷兹/Telit 那一族标准写法不被认，要用 `AT+ICCID`；
+        // 有方的 N510M 是 `AT$MYCCID`。候选顺序由型号特例表给（见 modem/quirk.rs）。
+        let quirk_hint = self.quirk_hint();
         let iccid = self
-            .query_first(&["AT+CCID", "AT+QCCID", "AT^ICCID?"])
+            .query_first(&crate::modem::quirk::iccid_cmds(&quirk_hint))
             .as_deref()
             .and_then(parse_iccid);
         let imsi = self
@@ -109,7 +112,12 @@ impl Modem {
         let temps = self.query_temps();
         let temp_max = temps.iter().max_by_key(|s| s.celsius).cloned();
         let temp_key = select_key_temps(&temps);
-        let supply_voltage = self.query_first(&["AT+CBC"]).as_deref().and_then(parse_cbc);
+        // 供电电压：标准写法是 `AT+CBC`，但 Sierra/富士康 走 `AT!PCVOLT?`，
+        // 且同厂只有部分型号支持 —— 按型号特例给候选，标准的仍留在最后兜底。
+        let supply_voltage = self
+            .query_first(&crate::modem::quirk::voltage_cmds(&quirk_hint))
+            .as_deref()
+            .and_then(parse_cbc);
         let (module_time, module_unix, clock_skew_s) = self.query_cclk();
 
         let net_select = self
@@ -181,11 +189,23 @@ impl Modem {
     fn query_temps(&self) -> Vec<Sensor> {
         // 指令表在 `modem/vendor/<厂商>.rs`（MTK 平台的广和通用带参数的写形式，
         // 读形式 `AT+GTSENRDTEMP?` 在本模组上返回 `+CME ERROR: phone failure`）。
-        let cmds = self.vendor().spec().temperature_cmds(self.is_fibocom_mtk());
+        //
+        // 型号特例优先：同一家只有个别型号的温度走别的指令（FM160 是 `AT+GTLADC`，
+        // `AT+QTEMP` 回 ERROR）。特例只**插到最前**，失败仍退回厂商候选。
+        let hint = self.quirk_hint();
+        let mut cmds: Vec<&str> = self
+            .vendor()
+            .spec()
+            .temperature_cmds(self.is_fibocom_mtk())
+            .to_vec();
+        if let Some(q) = crate::modem::quirk::temp_cmd(&hint) {
+            cmds.retain(|c| *c != q);
+            cmds.insert(0, q);
+        }
         if cmds.is_empty() {
             return Vec::new();
         }
-        let Some(resp) = self.query_first(cmds) else {
+        let Some(resp) = self.query_first(&cmds) else {
             return Vec::new();
         };
         // 解析仍按厂商：字段布局完全不同，不能一套正则硬套
@@ -254,7 +274,19 @@ pub fn parse_cnum(resp: &str) -> Option<String> {
 /// `+CBC: <bcs>,<bcl>,<mV>` → `"3.858 V"`。
 pub fn parse_cbc(resp: &str) -> Option<String> {
     let field = extract_field(resp, "+CBC")?;
-    let mv = csv(&field).get(2)?.parse::<i32>().ok()?;
+    let parts = csv(&field);
+    // `AT+CBC` 有两种固件写法（上游怪癖表里两代机型各占一种，都实测过）：
+    //
+    //   三字段 `+CBC: 0,71,3861`  → <bcs>,<bcl%>,<mV>   （RM520N / EM05）
+    //   两字段 `+CBC: 0,4130`     → <bcs>,<mV>         （FM160 / FM350-GL）
+    //
+    // 原来只认第三段，两字段的固件（本机 FM350 就是）永远解析出 None，
+    // 页面「供电电压」一直显示 `-`，而实机 `AT+CBC` 明明回了 3971 mV。
+    let mv = match parts.len() {
+        2 => parts.get(1)?.parse::<i32>().ok()?,
+        n if n >= 3 => parts.get(2)?.parse::<i32>().ok()?,
+        _ => return None,
+    };
     if mv <= 0 {
         return None;
     }
@@ -616,6 +648,17 @@ mod tests {
             Some("3.858 V")
         );
         assert_eq!(parse_cbc("+CBC: 0,0,0\r\nOK"), None);
+        // 两字段写法（FM160 / FM350-GL 实测）：第二个就是 mV，没有电量百分比
+        assert_eq!(
+            parse_cbc("+CBC: 0,3971\r\nOK").as_deref(),
+            Some("3.971 V"),
+            "两字段固件必须能解析，否则电压恒为 -"
+        );
+        assert_eq!(parse_cbc("+CBC: 0,4130\r\nOK").as_deref(), Some("4.130 V"));
+        // 只有一段 / 空值：不猜
+        assert_eq!(parse_cbc("+CBC: 0\r\nOK"), None);
+        assert_eq!(parse_cbc("+CBC: 0,0\r\nOK"), None);
+        assert_eq!(parse_cbc("ERROR"), None);
     }
 
     #[test]

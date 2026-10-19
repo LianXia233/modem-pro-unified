@@ -36,6 +36,11 @@ pub struct Modem {
     model: Mutex<Option<String>>,
     /// 识别时的原始应答（ATI 原文；排查问题用）
     model_raw: Mutex<Option<String>>,
+    /// 最近一次识别的完整结论（证据 / 候选 / 冲突 / USB 身份）。
+    ///
+    /// 与 `vendor` / `model` 分开存：那两个是「结论」，这里是「为什么」。
+    /// 页面要显示识别依据、排障要看冲突原因，都得从这里取。
+    ident: Mutex<Option<crate::modem::detect::Identify>>,
     /// 这台模组的 AT 命令口是用户手动指定的（界面标「手动」；见 http/at_port.rs）
     at_port_manual: AtomicBool,
     /// 惰性打开的 AT 口（首次查询时打开）
@@ -141,6 +146,7 @@ impl Modem {
             vendor: Mutex::new(vendor),
             model: Mutex::new(None),
             model_raw: Mutex::new(None),
+            ident: Mutex::new(None),
             at_port_manual: AtomicBool::new(false),
             at: Mutex::new(None),
             at_cooldown: super::super::at::OpenCooldown::default(),
@@ -383,6 +389,21 @@ impl Modem {
             .store(manual, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// 型号特例表的匹配串（`ATI` 原文 + 清单型号）。
+    ///
+    /// 特例表用型号子串匹配（`RM520` / `FM350`），ATI 原文最完整；
+    /// 清单型号是兜底（有些固件 ATI 只回一句型号，识别后 model 更规范）。
+    pub(crate) fn quirk_hint(&self) -> String {
+        let raw = self.model_raw().unwrap_or_default();
+        let model = self.model().unwrap_or_default();
+        format!("{raw} {model}")
+    }
+
+    /// 最近一次识别的完整结论（没有识别过就 `None`）。
+    pub fn identify_info(&self) -> Option<crate::modem::detect::Identify> {
+        self.ident.lock().unwrap().clone()
+    }
+
     pub fn view(&self) -> ModemView {
         let port = self.port();
         ModemView {
@@ -396,6 +417,7 @@ impl Modem {
             at_port_manual: self.at_port_manual(),
             running: self.at.lock().unwrap().is_some(),
             cell_scan_at: self.cell_scan_at(),
+            identify: self.identify_info(),
         }
     }
 
@@ -527,34 +549,39 @@ impl Modem {
             .with_at_prio(Prio::Data, |p| p.command("ATI", self.cmd_timeout))
             .unwrap_or_default();
         let lines = split_at_lines(&ati);
-        let mut vendor = Vendor::detect(&lines);
-        let mut raw = lines.join(" | ");
-        if vendor == Vendor::Unknown && at_resp_is_error(&lines) {
-            for alt in ["AT+CGMR", "AT+CGMM"] {
+        // 识别用「设备自报 + USB 身份」两路取证，见 `modem::detect` 的优先级表。
+        // 注意：这里**只发只读指令**，且失败时退回 AT+CGMR / AT+CGMM（部分展锐固件 ATI 回 ERROR）。
+        let mut evidence_lines = lines.clone();
+        if lines.is_empty() || at_resp_is_error(&lines) {
+            for alt in ["AT+CGMM", "AT+CGMR"] {
                 let resp = self
                     .with_at_prio(Prio::Data, |p| p.command(alt, self.cmd_timeout))
                     .unwrap_or_default();
                 let alt_lines = split_at_lines(&resp);
-                if alt_lines.is_empty() {
+                if alt_lines.is_empty() || at_resp_is_error(&alt_lines) {
                     continue;
                 }
-                let v = Vendor::detect(&alt_lines);
-                if v != Vendor::Unknown {
-                    vendor = v;
-                    raw = alt_lines.join(" | ");
-                    break;
-                }
-                if raw.is_empty() || at_resp_is_error(&split_at_lines(&raw)) {
-                    raw = alt_lines.join(" | ");
-                }
+                evidence_lines.extend(alt_lines);
             }
         }
-        let model = short_model_name(&raw);
+
+        let usb = crate::modem::usbdev::identity_for_tty(&self.port());
+        let ident = crate::modem::detect::identify(usb.as_ref(), &evidence_lines);
+        let vendor = Vendor::from_key(ident.vendor).unwrap_or(Vendor::Unknown);
+        let raw = ident.model_raw.clone();
+        let model = if ident.model.is_some() {
+            ident.model.clone().unwrap_or_default()
+        } else {
+            // 清单里没有这个型号（或型号名与 ATI 差别大）：保留短名给界面显示，
+            // 但结论仍标「未识别」——不因为猜了个名字就当成已确认。
+            short_model_name(&raw)
+        };
         *self.vendor.lock().unwrap() = vendor;
-        *self.model_raw.lock().unwrap() = Some(raw);
+        *self.model_raw.lock().unwrap() = if raw.is_empty() { None } else { Some(raw) };
         if !model.is_empty() {
-            *self.model.lock().unwrap() = Some(model);
+            *self.model.lock().unwrap() = Some(model.clone());
         }
+        *self.ident.lock().unwrap() = Some(ident);
         // 厂商/型号可能变了：厂商方言相关的缓存全部作废重探
         *self.lock_dialect_slot.lock().unwrap() = None;
         *self.lock_status_slot.lock().unwrap() = None;

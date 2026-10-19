@@ -685,6 +685,18 @@ return view.extend({
 			modKv.innerHTML = '';
 			modKv.appendChild(kvItem('模组型号', curModem.model || '-'));
 			modKv.appendChild(kvItem('设备厂商', curModem.vendor_name || curModem.vendor || '-'));
+			/* 识别依据：结论背后的证据（见后端 modem::detect）。
+			   早先只有型号/厂商两个字段，认错时看不出为什么 —— 现在把
+			   「靠什么认的、置信度多少、USB 是哪台」一起显示出来。 */
+			var ident = curModem.identify || {};
+			if (ident.matched_by) {
+				var conf = (ident.confidence != null) ? (' · 置信度 ' + ident.confidence + '%') : '';
+				var usbTxt = (ident.usb && ident.usb.vid) ? ('USB ' + ident.usb.vid + ':' + ident.usb.pid) : '';
+				modKv.appendChild(kvItem('识别依据', (ident.matched_by_text || ident.matched_by) + conf, usbTxt));
+			}
+			if (ident.conflicts && ident.conflicts.length) {
+				modKv.appendChild(kvItem('识别冲突', ident.conflicts.join('；')));
+			}
 			modKv.appendChild(kvItem('IMEI 设备序列号', mdm.imei || '-'));
 			modKv.appendChild(kvItem('当前 AT 命令端口', curModem.at_port || '-', curModem.at_port_manual ? '(已手动锁定)' : '(自动探测)'));
 			/* temp_max 是 Sensor {name, celsius}，celsius 已是摄氏度整数（不是毫度）；

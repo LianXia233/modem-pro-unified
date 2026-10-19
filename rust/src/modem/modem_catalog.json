@@ -13,7 +13,8 @@
         "ecm": "AT+SETUSB=2",
         "rndis": "AT+SETUSB=1"
       }
-    }
+    },
+    "vid": "1782"
   },
   {
     "vendor": "huawei",
@@ -25,7 +26,8 @@
     "usb_at": {
       "query": "AT^SETMODE?",
       "note": "Modem-Pro 只给 ecm/ncm 两个参数；rndis(6)/mbim(7) 只在 get_mode 里能认出来；Modem-Pro 只给了 ecm/ncm 的参数，该型号 usb 列表用不到 ⇒ 只给查询指令"
-    }
+    },
+    "vid": "12dc"
   },
   {
     "vendor": "huawei",
@@ -42,7 +44,8 @@
         "ncm": "AT^SETMODE=4"
       },
       "note": "Modem-Pro 只给 ecm/ncm 两个参数；rndis(6)/mbim(7) 只在 get_mode 里能认出来"
-    }
+    },
+    "vid": "3466"
   },
   {
     "vendor": "huawei",
@@ -59,7 +62,8 @@
         "ncm": "AT^SETMODE=4"
       },
       "note": "Modem-Pro 只给 ecm/ncm 两个参数；rndis(6)/mbim(7) 只在 get_mode 里能认出来"
-    }
+    },
+    "vid": "3466"
   },
   {
     "vendor": "huawei",
@@ -76,7 +80,8 @@
         "ncm": "AT^SETMODE=4"
       },
       "note": "Modem-Pro 只给 ecm/ncm 两个参数；rndis(6)/mbim(7) 只在 get_mode 里能认出来"
-    }
+    },
+    "vid": "12d1"
   },
   {
     "vendor": "huawei",
@@ -94,7 +99,8 @@
         "ncm": "AT^SETMODE=2",
         "rndis": "AT^SETMODE=0"
       }
-    }
+    },
+    "vid": "12d1"
   },
   {
     "vendor": "huawei",
@@ -112,7 +118,8 @@
         "ncm": "AT^SETMODE=2",
         "rndis": "AT^SETMODE=0"
       }
-    }
+    },
+    "vid": "12d1"
   },
   {
     "vendor": "quectel",
@@ -132,7 +139,8 @@
         "qmi": "AT+QCFG=\"usbnet\",0",
         "rndis": "AT+QCFG=\"usbnet\",3"
       }
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -152,7 +160,8 @@
         "qmi": "AT+QCFG=\"usbnet\",0",
         "rndis": "AT+QCFG=\"usbnet\",3"
       }
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -172,7 +181,8 @@
         "qmi": "AT+QCFG=\"usbnet\",0",
         "rndis": "AT+QCFG=\"usbnet\",3"
       }
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -192,7 +202,8 @@
         "qmi": "AT+QCFG=\"usbnet\",0",
         "rndis": "AT+QCFG=\"usbnet\",3"
       }
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -212,7 +223,8 @@
         "qmi": "AT+QCFG=\"usbnet\",0",
         "rndis": "AT+QCFG=\"usbnet\",3"
       }
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -232,7 +244,8 @@
         "qmi": "AT+QCFG=\"usbnet\",0",
         "rndis": "AT+QCFG=\"usbnet\",3"
       }
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -255,7 +268,8 @@
         "qmi": "AT+QCFG=\"usbnet\",0",
         "rndis": "AT+QCFG=\"usbnet\",3"
       }
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -275,7 +289,8 @@
         "ncm": "AT+QCFG=\"usbnet\",5",
         "rndis": "AT+QCFG=\"usbnet\",3"
       }
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -289,7 +304,8 @@
     "usb_at": {
       "query": "AT+QCFG=\"usbnet\"",
       "note": "Modem-Pro 的 set_mode() 没有 hisilicon 分支（会落到默认 0），参数值未取证 ⇒ 只给查询指令"
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -309,7 +325,8 @@
         "ncm": "AT+QCFG=\"usbnet\",5",
         "rndis": "AT+QCFG=\"usbnet\",3"
       }
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -329,7 +346,8 @@
         "ncm": "AT+QCFG=\"usbnet\",5",
         "rndis": "AT+QCFG=\"usbnet\",3"
       }
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -349,7 +367,8 @@
         "ncm": "AT+QCFG=\"usbnet\",5",
         "rndis": "AT+QCFG=\"usbnet\",3"
       }
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -380,7 +399,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供 Quectel 的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -403,7 +423,8 @@
         "qmi": "AT+QCFG=\"usbnet\",0",
         "rndis": "AT+QCFG=\"usbnet\",3"
       }
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -434,7 +455,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供 Quectel 的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -465,7 +487,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供 Quectel 的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -496,7 +519,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供 Quectel 的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -527,7 +551,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供 Quectel 的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -550,7 +575,8 @@
         "qmi": "AT+QCFG=\"usbnet\",0",
         "rndis": "AT+QCFG=\"usbnet\",3"
       }
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -581,7 +607,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供 Quectel 的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -604,7 +631,8 @@
         "qmi": "AT+QCFG=\"usbnet\",0",
         "rndis": "AT+QCFG=\"usbnet\",3"
       }
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -635,7 +663,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供 Quectel 的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -658,7 +687,8 @@
         "qmi": "AT+QCFG=\"usbnet\",0",
         "rndis": "AT+QCFG=\"usbnet\",3"
       }
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -689,7 +719,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供 Quectel 的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -720,7 +751,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供 Quectel 的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -751,7 +783,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供 Quectel 的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -782,7 +815,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供 Quectel 的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -813,7 +847,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供 Quectel 的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -844,7 +879,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供 Quectel 的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -875,7 +911,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供 Quectel 的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -906,7 +943,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供 Quectel 的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -937,7 +975,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供 Quectel 的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -968,7 +1007,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供 Quectel 的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -999,7 +1039,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供 Quectel 的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -1030,7 +1071,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供 Quectel 的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -1061,7 +1103,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供 Quectel 的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -1092,7 +1135,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供 Quectel 的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -1123,7 +1167,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供 Quectel 的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -1154,7 +1199,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供 Quectel 的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -1177,7 +1223,8 @@
         "qmi": "AT+QCFG=\"usbnet\",0",
         "rndis": "AT+QCFG=\"usbnet\",3"
       }
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -1200,7 +1247,8 @@
         "qmi": "AT+QCFG=\"usbnet\",0",
         "rndis": "AT+QCFG=\"usbnet\",3"
       }
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -1223,7 +1271,8 @@
         "qmi": "AT+QCFG=\"usbnet\",0",
         "rndis": "AT+QCFG=\"usbnet\",3"
       }
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -1246,7 +1295,8 @@
         "qmi": "AT+QCFG=\"usbnet\",0",
         "rndis": "AT+QCFG=\"usbnet\",3"
       }
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "quectel",
@@ -1266,7 +1316,8 @@
         "ncm": "AT+QCFG=\"usbnet\",5",
         "rndis": "AT+QCFG=\"usbnet\",3"
       }
-    }
+    },
+    "vid": "2c7c"
   },
   {
     "vendor": "fibocom",
@@ -1286,7 +1337,8 @@
         "ncm": "AT+GTUSBMODE=36",
         "rndis": "AT+GTUSBMODE=38"
       }
-    }
+    },
+    "vid": "2cb7"
   },
   {
     "vendor": "fibocom",
@@ -1307,7 +1359,8 @@
     },
     "pcie_at": {
       "note": "MTK 平台 PCIe 走驱动（Modem-Pro 里是 mtk_pcie），没有 AT 切换指令"
-    }
+    },
+    "vid": "0e8d"
   },
   {
     "vendor": "fibocom",
@@ -1322,7 +1375,8 @@
         "rndis": "AT+GTUSBMODE=41"
       },
       "note": "Modem-Pro 只给了 rndis=41（mbim 那行是注释掉的）"
-    }
+    },
+    "vid": "0e8d"
   },
   {
     "vendor": "fibocom",
@@ -1343,7 +1397,8 @@
     },
     "pcie_at": {
       "note": "MTK 平台 PCIe 走驱动（Modem-Pro 里是 mtk_pcie），没有 AT 切换指令"
-    }
+    },
+    "vid": "0e8d"
   },
   {
     "vendor": "fibocom",
@@ -1364,7 +1419,8 @@
     },
     "pcie_at": {
       "note": "MTK 平台 PCIe 走驱动（Modem-Pro 里是 mtk_pcie），没有 AT 切换指令"
-    }
+    },
+    "vid": "0e8d"
   },
   {
     "vendor": "fibocom",
@@ -1394,7 +1450,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供该厂商的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2cb7"
   },
   {
     "vendor": "fibocom",
@@ -1424,7 +1481,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供该厂商的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2cb7"
   },
   {
     "vendor": "fibocom",
@@ -1454,7 +1512,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供该厂商的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2cb7"
   },
   {
     "vendor": "fibocom",
@@ -1484,7 +1543,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供该厂商的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2cb7"
   },
   {
     "vendor": "fibocom",
@@ -1513,7 +1573,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供该厂商的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2cb7"
   },
   {
     "vendor": "fibocom",
@@ -1542,7 +1603,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供该厂商的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "2cb7"
   },
   {
     "vendor": "fibocom",
@@ -1560,7 +1622,8 @@
         "ncm": "AT+GTUSBMODE=36",
         "rndis": "AT+GTUSBMODE=38"
       }
-    }
+    },
+    "vid": "1782"
   },
   {
     "vendor": "fibocom",
@@ -1578,7 +1641,8 @@
         "ncm": "AT+GTUSBMODE=18",
         "rndis": "AT+GTUSBMODE=24"
       }
-    }
+    },
+    "vid": "1508"
   },
   {
     "vendor": "fibocom",
@@ -1596,7 +1660,8 @@
         "qmi": "AT+GTUSBMODE=17",
         "rndis": "AT+GTUSBMODE=24"
       }
-    }
+    },
+    "vid": "2cb7"
   },
   {
     "vendor": "meig",
@@ -1614,7 +1679,8 @@
         "ncm": "AT+SER=2,1",
         "rndis": "AT+SER=3,1"
       }
-    }
+    },
+    "vid": "2dee"
   },
   {
     "vendor": "meig",
@@ -1632,7 +1698,8 @@
         "ncm": "AT+SER=2,1",
         "rndis": "AT+SER=3,1"
       }
-    }
+    },
+    "vid": "2dee"
   },
   {
     "vendor": "meig",
@@ -1650,7 +1717,8 @@
         "ncm": "AT+SER=2,1",
         "rndis": "AT+SER=3,1"
       }
-    }
+    },
+    "vid": "2dee"
   },
   {
     "vendor": "meig",
@@ -1668,7 +1736,8 @@
         "ncm": "AT+SER=1,1",
         "rndis": "AT+SER=3,1"
       }
-    }
+    },
+    "vid": "1782"
   },
   {
     "vendor": "sierra",
@@ -1691,7 +1760,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供该厂商的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "1199"
   },
   {
     "vendor": "sierra",
@@ -1714,7 +1784,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供该厂商的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "1199"
   },
   {
     "vendor": "sierra",
@@ -1726,7 +1797,8 @@
     "usb_at": {
       "query": "AT!USBCOMP?",
       "note": "Modem-Pro 只给了 mbim/rmnet 的参数，该型号 usb 列表用不到 ⇒ 只给查询指令"
-    }
+    },
+    "vid": "1199"
   },
   {
     "vendor": "sierra",
@@ -1738,7 +1810,8 @@
     "usb_at": {
       "query": "AT!USBCOMP?",
       "note": "Modem-Pro 只给了 mbim/rmnet 的参数，该型号 usb 列表用不到 ⇒ 只给查询指令"
-    }
+    },
+    "vid": "1199"
   },
   {
     "vendor": "telit",
@@ -1765,7 +1838,8 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供该厂商的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "1bc7"
   },
   {
     "vendor": "simcom",
@@ -1777,7 +1851,8 @@
     ],
     "usb_at": {
       "note": "Modem-Pro 的 set_mode() 没有 asrmicro 分支 ⇒ 参数未取证，不下发"
-    }
+    },
+    "vid": "1a0e"
   },
   {
     "vendor": "simcom",
@@ -1789,7 +1864,8 @@
     ],
     "usb_at": {
       "note": "Modem-Pro 的 set_mode() 没有 asrmicro 分支 ⇒ 参数未取证，不下发"
-    }
+    },
+    "vid": "1a0e"
   },
   {
     "vendor": "simcom",
@@ -1807,7 +1883,8 @@
         "ecm": "AT$MYCONFIG=\"USBNETMODE\",1,1",
         "rndis": "AT$MYCONFIG=\"USBNETMODE\",0,1"
       }
-    }
+    },
+    "vid": "1a0e"
   },
   {
     "vendor": "simcom",
@@ -1824,7 +1901,8 @@
         "rndis": "AT+CUSBCFG=usbid,1e0e,9011"
       },
       "note": "Modem-Pro 用 USBID 切换：qmi=0x9001、rndis=0x9011"
-    }
+    },
+    "vid": "1a0e"
   },
   {
     "vendor": "simcom",
@@ -1898,7 +1976,8 @@
       "modes": {
         "mbim": "AT^USBSWITCH=90d5"
       }
-    }
+    },
+    "vid": "413c"
   },
   {
     "vendor": "foxconn",
@@ -1921,7 +2000,8 @@
     "pcie_at": {
       "query": "AT^PCIEMODE?",
       "note": "Modem-Pro 只用它判断\"当前是否 PCIe 形态\"；切换不支持（会 disable 模式按钮）"
-    }
+    },
+    "vid": "05c6"
   },
   {
     "vendor": "foxconn",
@@ -1944,7 +2024,8 @@
     "pcie_at": {
       "query": "AT^PCIEMODE?",
       "note": "Modem-Pro 只用它判断\"当前是否 PCIe 形态\"；切换不支持（会 disable 模式按钮）"
-    }
+    },
+    "vid": "05c6"
   },
   {
     "vendor": "foxconn",
@@ -1967,7 +2048,8 @@
     "pcie_at": {
       "query": "AT+PCIEMODE?",
       "note": "Modem-Pro 只用它判断\"当前是否 PCIe 形态\"；切换不支持（会 disable 模式按钮）"
-    }
+    },
+    "vid": "05c6"
   },
   {
     "vendor": "foxconn",
@@ -1993,7 +2075,8 @@
       "modes": {
         "mbim": "AT+SETCONFIG=0"
       }
-    }
+    },
+    "vid": "1e2d"
   },
   {
     "vendor": "thales",
@@ -2009,7 +2092,8 @@
         "mbim": "AT+SETCONFIG=0",
         "rmnet": "AT+SETCONFIG=1"
       }
-    }
+    },
+    "vid": "1e2d"
   },
   {
     "vendor": "neoway",
@@ -2020,7 +2104,8 @@
     ],
     "usb_at": {
       "note": "Modem-Pro 没有提供 USB 拨号模式切换指令（该型号是固定 ECM 形态）"
-    }
+    },
+    "vid": "3763"
   },
   {
     "vendor": "gosuncn",
@@ -2060,6 +2145,7 @@
     },
     "pcie_at": {
       "note": "Modem-Pro 没有提供该厂商的 PCIe 形态切换指令"
-    }
+    },
+    "vid": "305a"
   }
 ]

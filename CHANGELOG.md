@@ -4,6 +4,75 @@
 
 ## [未发布]
 
+### 1.0.0-8：多维度模组识别 + USB 端口规则 + 逐型号怪癖
+
+对齐两个上游（QModem `2ef9227`、Go 版 `397e014`）的模组知识，并把「认模组」
+从单线索改成多维度取证。审计明细见 [`docs/UPSTREAM_AUDIT.md`](docs/UPSTREAM_AUDIT.md)。
+
+#### 🟢 识别体系（`modem/detect.rs`，新增 481 行）
+
+原来只有一条线索：`ATI` → 厂商关键字 → 短名。三个后果：ATI 回 ERROR 的固件
+（部分展锐）识别落空；型号撞车无法校验；认错了页面上看不出来。
+
+现在按**证据可信度**取结论，每条证据都可追溯：
+
+| 依据 | 置信度 | 条件 |
+| --- | --- | --- |
+| `port_rule`（`VID:PID` 精确登记 + AT 型号一致） | 90 | 最强 |
+| `catalog_model`（AT 型号命中清单） | 85 | 设备自报 |
+| `port_rule`（AT 回 ERROR 时） | 80 | 仍能定型号 |
+| `vendor_keyword`（只认到厂商） | 55 | — |
+| `usb_vid`（清单里该 VID 唯一厂商） | 45 | 仅独占 VID |
+| `no_match` | 0 | 未知设备不猜 |
+
+- USB 身份从 sysfs 取（`usbdev::identity_for_tty`：VID/PID + 接口号 + 拓扑）；
+- AT 只发**只读**指令：`ATI`，失败退回 `AT+CGMM` / `AT+CGMR`；
+- 冲突不猜：设备自报优先，厂商按清单归属纠正，置信度 −15，冲突原文进 `conflicts[]`；
+  `huawei` / `tdtech` 视为同族（`MT5700M` 共线）不报冲突；
+- 型号匹配补「主干」退路：`ATI` 只报 `MT5700M` 时也能命中清单里的 `mt5700m-cn`
+  （原来整名包含失败，显示未识别）。
+
+#### 🟢 USB 端口规则（`modem/ports.rs` + `modem_ports.json`）
+
+迁入 QModem `modem_port_rule.json` 的 18 条 `VID:PID` 规则：AT 接口白名单
+（`1.2`/`1.3`/`1.4`…）、语音 PCM 口、是否需要绑 option 驱动。
+作用是「别把 diag 口当 AT 口」——选错口的典型症状是能打开、发 AT 全超时。
+
+#### 🟢 逐型号怪癖（`modem/quirk.rs` + `modem_quirks.json`）
+
+迁入 Go 上游 `module/modelquirk/table.go` 的 19 条实测特例，每条保留原有
+证据（固件版本 + 原始应答）。**只接入能验证的三个字段**：
+
+| 字段 | 效果 |
+| --- | --- |
+| `voltage_cmd` | Sierra/富士康走 `AT!PCVOLT?`，`AT+CBC` 兜底 |
+| `iccid_cmd` | 合宙/Telit 走 `AT+ICCID`，有方 N510M 走 `AT$MYCCID` |
+| `temp_cmd` | FM160 的 `AT+GTLADC` 插到厂商候选最前 |
+
+`ignore_cclk_tz` **未接入**：上游语义是「后缀不可信、不要换算」，而本仓库的
+`parse_cclk` 从一开始就忽略后缀（等于对所有型号都 ignore）。直接接会让未登记
+型号的时钟偏差从 0 变成 −8h，需实机核对后再动。
+
+#### 🟢 前端（LuCI + WebUI 同源）
+
+`ModemView` 新增 `identify` 字段（证据 / 候选 / 冲突 / USB 身份 / 置信度）。
+LuCI 概览页「模组硬件」与 WebUI「身份」卡片各加一行**识别依据**，
+有冲突时再多一行**识别冲突** —— 两端读同一份 JSON 的同名字段。
+
+#### 验证
+
+- `cargo test`：**678 passed / 0 failed**（新增 31 个）；
+- 交叉编译 aarch64-musl 通过；
+- 实机 FM350-GL：`matched_by=catalog_model`、`confidence=85`、
+  `usb=0e8d:7127`、`conflicts=[]`，与 `ATI` 原文一致。
+
+#### 仍未验证
+
+端口规则命中、冲突降级两条路径只有单测（本机 PID 不在 18 条规则里）；
+华为/SIMCom/高新兴 的温度电压指令无设备可验。
+
+---
+
 ### 1.0.0-7：实时速率与曲线 + 拨号链路状态 + 时区下拉 + AT 串口三层保护
 
 本版两块工作：**A. 让页面上的数字来自真实网卡**（速率/流量/曲线/拨号状态/时区），

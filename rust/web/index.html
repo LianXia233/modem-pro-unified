@@ -3060,9 +3060,20 @@ function renderOverview() {
   // 型号显示「解析出的短名」（如 MT5700M-CN），鼠标悬停能看 ATI 原文
   const modelRaw = m.model_raw || '';
   const modelCell = `<div class="kv kv-wide"><b>型号</b><span${vTxt(m.model)}${modelRaw ? ` title="${esc(modelRaw)}"` : ''}>${esc(dash(m.model))}</span></div>`;
+  // 识别依据：结论背后的证据（后端 modem::detect 给 matched_by / confidence / usb / conflicts）。
+  // 与 LuCI 概览页同一份数据、同一套字段名，避免两端说法不一致。
+  const ident = m.identify || {};
+  const identRow = ident.matched_by
+    ? kv('识别依据', (ident.matched_by_text || ident.matched_by) +
+         (ident.confidence != null ? ' · 置信度 ' + ident.confidence + '%' : '') +
+         (ident.usb && ident.usb.vid ? ' · USB ' + ident.usb.vid + ':' + ident.usb.pid : ''), 'kv-wide')
+    : '';
+  const conflictRow = (ident.conflicts && ident.conflicts.length)
+    ? kv('识别冲突', ident.conflicts.join('；'), 'kv-wide')
+    : '';
   $('#identity').innerHTML =
     kv('ID', String(m.id)) + kv('厂商', m.vendor_name || m.vendor) + kv('AT 口', m.at_port) +
-    modelCell + imeiRow(m.imei) + kv('固件', m.firmware) +
+    modelCell + identRow + conflictRow + imeiRow(m.imei) + kv('固件', m.firmware) +
     kv('串口分组', (m.tty_list || []).join(', ')) +
     kv('最近扫描', dash(fmtTime(m.cell_scan_at))) +
     // 模组指令是一串命令，很长：独占整行且不折行（见 .kv-wide）

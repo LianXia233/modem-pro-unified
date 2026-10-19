@@ -432,6 +432,56 @@ pub fn list_modem_usb_devices() -> Vec<ModemUsbDevice> {
     Vec::new()
 }
 
+/// 从 AT 口反查它所属 USB 设备的身份（识别引擎的输入之一）。
+///
+/// 走的是 sysfs 同一套链路：`/sys/class/tty/<tty>/device` 一路向上找到
+/// USB 设备目录，读 `idVendor` / `idProduct` / `product`，再把该目录下的
+/// 接口号（`1-1:1.2` → `1.2`）收集起来 —— 与 QModem 端口规则的 `include`
+/// 同一口径，后续判断「这个口能不能当 AT 口」直接用得上。
+///
+/// 取不到（PCIe 模组、Windows、纯串口设备）返回 `None`，识别引擎会退回
+/// 只靠 AT 应答判断，不影响功能。
+#[cfg(unix)]
+pub fn identity_for_tty(tty: &str) -> Option<crate::modem::detect::UsbIdentity> {
+    let dir = usb_device_dir(tty)?;
+    let vid = read_sysfs_id(&dir.join("idVendor"));
+    let pid = read_sysfs_id(&dir.join("idProduct"));
+    if vid.is_empty() || pid.is_empty() {
+        return None;
+    }
+    let mut interfaces: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            // 接口目录形如 `1-1:1.2`；设备目录本身（`1-1`）不含冒号
+            if let Some(idx) = name.rfind(':') {
+                let tail = &name[idx + 1..];
+                if tail.contains('.') {
+                    interfaces.push(tail.to_string());
+                }
+            }
+        }
+    }
+    interfaces.sort();
+    interfaces.dedup();
+    Some(crate::modem::detect::UsbIdentity {
+        vid,
+        pid,
+        product: read_sysfs_line(&dir.join("product")),
+        bus_path: dir
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        interfaces,
+    })
+}
+
+/// Windows：没有 sysfs，识别只靠 AT 应答。
+#[cfg(not(unix))]
+pub fn identity_for_tty(_tty: &str) -> Option<crate::modem::detect::UsbIdentity> {
+    None
+}
+
 /// 给一个「插上了但没有串口」的模组补上 usb-serial 驱动。
 ///
 /// 返回一句给人看的结果说明（成功/失败都会写进 USB 事件）。内核枚举 tty 要几十到几百毫秒。

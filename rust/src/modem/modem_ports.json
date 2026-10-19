@@ -1,0 +1,203 @@
+[
+ {
+  "vid": "05c6",
+  "pid": "90d5",
+  "model": "t99w368",
+  "mode": "mbim",
+  "option_driver": true,
+  "at_interfaces": [
+   "1.2",
+   "1.3",
+   "1.5"
+  ],
+  "voice_pcm_interface": ""
+ },
+ {
+  "vid": "1782",
+  "pid": "4038",
+  "model": "nu313-m2",
+  "mode": "rndis",
+  "option_driver": true,
+  "at_interfaces": [
+   "1.2"
+  ],
+  "voice_pcm_interface": ""
+ },
+ {
+  "vid": "1782",
+  "pid": "4039",
+  "model": "nu313-m2",
+  "mode": "ecm",
+  "option_driver": true,
+  "at_interfaces": [
+   "1.2"
+  ],
+  "voice_pcm_interface": ""
+ },
+ {
+  "vid": "1782",
+  "pid": "4040",
+  "model": "nu313-m2",
+  "mode": "ncm",
+  "option_driver": true,
+  "at_interfaces": [
+   "1.2"
+  ],
+  "voice_pcm_interface": ""
+ },
+ {
+  "vid": "1782",
+  "pid": "4056",
+  "model": "TDTECH MH5000-82M",
+  "mode": "rndis",
+  "option_driver": true,
+  "at_interfaces": [
+   "1.2"
+  ],
+  "voice_pcm_interface": ""
+ },
+ {
+  "vid": "1782",
+  "pid": "4057",
+  "model": "TDTECH MH5000-82M",
+  "mode": "ecm",
+  "option_driver": true,
+  "at_interfaces": [
+   "1.2"
+  ],
+  "voice_pcm_interface": ""
+ },
+ {
+  "vid": "1782",
+  "pid": "4058",
+  "model": "TDTECH MH5000-82M",
+  "mode": "ncm",
+  "option_driver": true,
+  "at_interfaces": [
+   "1.2"
+  ],
+  "voice_pcm_interface": ""
+ },
+ {
+  "vid": "1782",
+  "pid": "4e00",
+  "model": "Air724UG",
+  "mode": "",
+  "option_driver": false,
+  "at_interfaces": [
+   "1.0",
+   "1.3"
+  ],
+  "voice_pcm_interface": ""
+ },
+ {
+  "vid": "1e0e",
+  "pid": "9011",
+  "model": "simcom_a8200_serias",
+  "mode": "rndis",
+  "option_driver": false,
+  "at_interfaces": [
+   "1.4",
+   "1.5"
+  ],
+  "voice_pcm_interface": ""
+ },
+ {
+  "vid": "2c7c",
+  "pid": "0457",
+  "model": "AG598E-EU",
+  "mode": "qmi",
+  "option_driver": true,
+  "at_interfaces": [
+   "1.2",
+   "1.7"
+  ],
+  "voice_pcm_interface": ""
+ },
+ {
+  "vid": "2c7c",
+  "pid": "0801",
+  "model": "rm520n-gl",
+  "mode": "",
+  "option_driver": false,
+  "at_interfaces": [
+   "1.2",
+   "1.3",
+   "1.4"
+  ],
+  "voice_pcm_interface": "1.1"
+ },
+ {
+  "vid": "2c7c",
+  "pid": "8101",
+  "model": "rg801",
+  "mode": "",
+  "option_driver": true,
+  "at_interfaces": [],
+  "voice_pcm_interface": ""
+ },
+ {
+  "vid": "2dee",
+  "pid": "4d23",
+  "model": "srm825xeu",
+  "mode": "ecm",
+  "option_driver": true,
+  "at_interfaces": [
+   "1.1"
+  ],
+  "voice_pcm_interface": ""
+ },
+ {
+  "vid": "2dee",
+  "pid": "4d38",
+  "model": "srm825xeu",
+  "mode": "rndis",
+  "option_driver": true,
+  "at_interfaces": [
+   "1.3"
+  ],
+  "voice_pcm_interface": ""
+ },
+ {
+  "vid": "305a",
+  "pid": "1404",
+  "model": "gm800",
+  "mode": "rndis",
+  "option_driver": false,
+  "at_interfaces": [
+   "1.1"
+  ],
+  "voice_pcm_interface": ""
+ },
+ {
+  "vid": "305a",
+  "pid": "1421",
+  "model": "gm800",
+  "mode": "qmi",
+  "option_driver": true,
+  "at_interfaces": [
+   "1.1"
+  ],
+  "voice_pcm_interface": ""
+ },
+ {
+  "vid": "3466",
+  "pid": "3301",
+  "model": "mt5700m-cn",
+  "mode": "",
+  "option_driver": true,
+  "at_interfaces": [],
+  "voice_pcm_interface": ""
+ },
+ {
+  "vid": "3763",
+  "pid": "3c93",
+  "model": "nari-m601",
+  "mode": "ecm",
+  "option_driver": true,
+  "at_interfaces": [
+   "1.1"
+  ],
+  "voice_pcm_interface": ""
+ }
+]

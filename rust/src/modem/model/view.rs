@@ -23,4 +23,10 @@ pub struct ModemView {
     /// 最近一次基站扫描的时间（没扫过就没有这个字段；见 `GET /api/cells`）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cell_scan_at: Option<String>,
+    /// 识别依据（证据 / 候选 / 冲突 / USB 身份），见 `modem::detect`。
+    ///
+    /// 前端用它显示「为什么认成这个型号」，也让「认错了」这件事**可见**——
+    /// 早先只有 `vendor` + `model` 两个字段，认错时没有任何线索。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identify: Option<crate::modem::detect::Identify>,
 }
