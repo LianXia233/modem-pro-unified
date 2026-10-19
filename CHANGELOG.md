@@ -4,6 +4,33 @@
 
 ## [未发布]
 
+### 修复：主线 APK 通道编 fibocom-dial 报「隐式声明 / 裸 return」
+
+上一轮 CI 24.10 IPK 通道已绿（产出 `modem-pro_1.0.0-r1_aarch64_generic.ipk`），
+只剩**主线 APK（snapshots）** 通道挂在编 `fibocom-dial`：
+
+```
+third_party/fibocom-dial/src/main.c:927:  error: 'return' with no value, in function returning non-void [-Wreturn-mismatch]
+third_party/fibocom-dial/src/main.c:1447: error: implicit declaration of function 'requestGetSIMCardNumber'
+third_party/fibocom-dial/src/main.c:1449/1450: error: implicit declaration of function 'requestSimBindSubscription_*'
+third_party/fibocom-dial/src/QMIThread.c:2344: error: implicit declaration of function 'get_private_gateway'
+```
+
+- **根因**：这份广和通老代码**先调用后定义**（无函数声明）**且**有非 void 函数里的裸
+  `return ;`。老 gcc（24.10 通道的 gcc-13）只当警告，但 **主线 snapshots 的 gcc-14 已把
+  `implicit-function-declaration` 与 `return-mismatch` 默认当错误**（GCC 14 的 C99+ 模式
+  默认报错变更），于是挂了。
+- **修复**：顶层 `Makefile` 给 fibocom-dial 的额外 CFLAGS 加 `-std=gnu89`——gnu89 模式下这
+  两类都不再是错误，**一个开关同时解决两类**。该开关**只能单给 fibocom**：quectel 用了
+  C99 的 for 内声明，加 gnu89 反而报错；meig / simcom 在 gcc-14 语义下无需。
+- **为何不加 `-Wno-error=return-mismatch`**：gcc-14 把该诊断拆成了 `-Wreturn-mismatch`，这个
+  选项名在 gcc-13（24.10）里**不存在**，传进去会被 gcc-13 判为参数错误、反而把已绿的
+  24.10 通道编挂。
+- **本地验证**：装 gcc-14 复现并确认 `-std=gnu89` 单独即可编过；再用 SDK 的 gcc-13 强制
+  开启 gcc-14 那套默认报错逐家核对四拨号器——仅 fibocom 需要该开关，且 fibocom 加 gnu89 后
+  在 gcc-13 上完整编译并链接成 aarch64 静态二进制，24.10 通道不回归。
+- **文档**：`third_party/fibocom-dial/SOURCE.md` 按上述实测修正「要加的开关」表。
+
 ### 修复：云编译把 luci-base 当构建依赖，连带去编 luci 组件而缺头文件
 
 上一轮 CI 两个通道都挂在「编译 modem-pro」：日志里先编 `feeds/luci/modules/luci-base`

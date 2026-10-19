@@ -23,14 +23,19 @@ libmnl/{ifutils,attr,callback,nlmsg,socket}.c
 
 （`src/libmnl/dhcp/*.c` 三个目标都不编，是上游留的冗余源码；保留它是为了与上游目录一致。）
 
-## 交叉编译要加的开关（原样 gcc 编不过 clang 18）
+## 交叉编译要加的开关（原样 gcc / clang 编不过）
 
 | 开关 | 为什么 |
 | --- | --- |
 | `-DGHT_FEATURE_PCIE_AUTO` | `src/Makefile` 里的必需宏（CFLAGS += …） |
-| `-std=gnu89` | `QMIThread.c:2344 get_private_gateway`、`main.c:1447 requestGetSIMCardNumber`、`1449/1450 requestSimBindSubscription_*` 都是**先调用后定义**（无函数声明）。gcc 只当警告，clang 18 直接 `error: call to undeclared function`。gnu89 允许隐式声明 |
-| `-Wno-error=return-type` | `main.c:927` 的 `thread_socket_server` 里有裸 `return ;`（非 void 函数） |
+| `-std=gnu89` | 这份代码**先调用后定义**（`QMIThread.c:2344 get_private_gateway`、`main.c:1447 requestGetSIMCardNumber`、`1449/1450 requestSimBindSubscription_*`，均无函数声明）**且**有非 void 函数里的裸 `return ;`（`main.c:927 thread_socket_server`）。老 gcc / `clang` 只当警告，但 **gcc-14（主线 snapshots）已把 `implicit-function-declaration` 与 `return-mismatch` 默认当错误**（`clang 18` 也报 `error: call to undeclared function`）。`gnu89` 下这两类都不再是错误，**一个开关同时解决两类** |
 | `-static` | 不依赖设备上的 libc 版本（zig 带 musl），换固件也能跑 |
+
+> 注意**不要**用 `-Wno-error=return-type` / `-Wno-error=return-mismatch`：裸 `return;` 已由
+> `-std=gnu89` 一并覆盖；且 gcc-14 把该诊断拆成 `-Wreturn-mismatch`，这个选项名在 gcc-13
+> （24.10 通道）里**不存在**，传 `-Wno-error=return-mismatch` 会被 gcc-13 直接判为参数错误、
+> 编不过。故顶层 `Makefile` 只给 fibocom 加 `-std=gnu89`（**只能单给**：quectel 用了 C99 的
+> for 内声明，加 gnu89 反而报错；meig / simcom 在 gcc-14 语义下无需该开关）。
 
 产物（剥离符号后，静态 musl）：**aarch64 132 KB / armv7 131 KB / mipsel 180 KB**。
 

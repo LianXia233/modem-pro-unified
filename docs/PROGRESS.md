@@ -7,8 +7,10 @@
 > - [`API.md`](./API.md)：对外接口契约。`INTEGRATION.md` / `BUILD.md`：整合方案与编译。
 >
 > 快照时间：2026-10-19 ｜ 分支 `main` ｜ 远端 `https://github.com/LianXia233/modem-pro-unified`
-> 最近提交：云编译修复第二处——luci-base 改用 stub，不再连带编 luci 组件（见 §39）；
-> 此前：云编译**真正**跳过 rust host（根因修复，见 §38）、`96a06a8`（docs：致谢补充
+> 最近提交：云编译修复第三处——fibocom-dial 加 `-std=gnu89`，主线 APK 通道不再报
+> 隐式声明 / 裸 return（见 §40）；24.10 IPK 通道已绿
+> 此前：云编译修复第二处——luci-base 改用 stub，不再连带编 luci 组件（见 §39）、
+> 云编译**真正**跳过 rust host（根因修复，见 §38）、`96a06a8`（docs：致谢补充
 > 350 系列参考工程 luci-app-fm350）
 > 工作区：广和通 FM350 / RW350 系列对齐 **P0-1（IPv6 归一化接进网络链路）、
 > P0-2（频段锁定写）均已完成、实机验证通过**（见 §16 / §17）；
@@ -2364,6 +2366,49 @@ make[2]: Entering directory '.../sdk/feeds/luci/contrib/package/ucode-mod-html'
 编译顺序只有 toolchain（SDK 自带）→ 两个 stub（no-op）→ modem-pro；
 **未再出现任何 luci 组件**；产物 `modem-pro_1.0.0-r1_aarch64_generic.ipk`，
 control 为 `Depends: libc, luci-base, odhcp6c`，rust 编译 51s、整包打包 65s。
+
+---
+
+## 40. 云编译修复第三处：主线 APK 编 fibocom-dial 报隐式声明 / 裸 return（2026-10-19）
+
+**背景**：§39 修好后新 run（`39194493382`）**24.10 IPK 通道已绿**（产出 `ipk-24.10`
+artifact），只剩**主线 APK（snapshots · gcc-14.4.0）**通道挂在「编译 modem-pro」。
+
+**根因**：广和通 `fibocom-dial` 是老代码，**先调用后定义**（无函数声明）**且**有非 void
+函数里的裸 `return ;`。gcc-13（24.10 通道）只当警告，但 **gcc-14 已把
+`implicit-function-declaration` 与 `return-mismatch` 默认当错误**（GCC 14 对 C99+ 模式
+的默认报错变更，与 `-Werror` 无关）。日志实证：
+
+```
+main.c:927:  error: 'return' with no value, in function returning non-void [-Wreturn-mismatch]
+main.c:1447: error: implicit declaration of function 'requestGetSIMCardNumber'
+main.c:1449: error: implicit declaration of function 'requestSimBindSubscription_NAS_WMS'
+main.c:1450: error: implicit declaration of function 'requestSimBindSubscription_WDS_DMS_QOS'
+QMIThread.c:2344: error: implicit declaration of function 'get_private_gateway'
+```
+
+**修复（顶层 `Makefile`）**：给 fibocom-dial 的额外 CFLAGS 加 **`-std=gnu89`**——
+gnu89 模式下上述两类都不再是错误，**一个开关同时解决两类**。
+
+**为何不给四家统一加、也不加 `-Wno-error=return-mismatch`**：
+
+- `-std=gnu89` **只能单给 fibocom**：quectel 用了 C99 的 for 内声明
+  （`QMIThread.c:997`），加 gnu89 反而报 `'for' loop initial declarations are only
+  allowed in C99 or C11 mode`；meig / simcom 在 gcc-14 语义下无需该开关。
+- gcc-14 把裸 `return;` 的诊断拆成了 `-Wreturn-mismatch`（老名 `-Wreturn-type`）；
+  传 `-Wno-error=return-mismatch` 会被 **gcc-13** 判为参数错误（`no option '-Wreturn-mismatch'`），
+  反而把已绿的 24.10 通道编挂。故只用与版本无关的 `-std=gnu89`。
+
+**验证**：
+
+1. 本机装 `gcc-14.2.0` 复现：默认模式下两类都报 error，`-std=gnu89` 下均消失（单独一个开关足够）。
+2. 用 SDK 的 gcc-13 **强制开启 gcc-14 那套默认报错**（`-Werror=implicit-function-declaration`
+   `-Werror=implicit-int` `-Werror=int-conversion` `-Werror=incompatible-pointer-types`
+   `-Werror=return-type`）逐家核对四拨号器：只有 fibocom 报错，quectel / meig / simcom 全过。
+3. fibocom 加 `-std=gnu89` 后在 gcc-13 上**完整编译并链接**成 aarch64 musl 二进制（退出码 0），
+   24.10 通道不回归。
+
+**文档**：`third_party/fibocom-dial/SOURCE.md` 的「要加的开关」表按上述实测修正。
 
 ---
 

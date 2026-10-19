@@ -161,9 +161,14 @@ define Build/Compile
 	# Rust 守护进程：注入统一版本号（单一来源 VERSION）
 	$(call MODEMD/Compile)
 	# 厂商拨号器
+	# 广和通 fibocom-dial 是老代码（先调用后定义、非 void 函数里裸 return）：
+	# gcc-14（主线 snapshots）把 implicit-function-declaration / return-mismatch 默认当错误，
+	# 需 -std=gnu89 才编得过（gnu89 下这两类都不再是错误）。该开关**只能单给 fibocom**：
+	# quectel 用了 C99 的 for 内声明，加 gnu89 反而报错；meig/simcom 在 gcc-14 语义下无需。
+	# 详见 third_party/fibocom-dial/SOURCE.md。
 	$(INSTALL_DIR) $(DL_OUT)
 	$(if $(CONFIG_MODEM_PRO_QUECTEL),$(call cc_dialer,$(TP)/quectel-cm,$(QUECTEL_SRC),$(DL_OUT)/quectel-CM,-lpthread -ldl -lrt,))
-	$(if $(CONFIG_MODEM_PRO_FIBOCOM),$(call cc_dialer,$(TP)/fibocom-dial/src,$(FIBOCOM_SRC),$(DL_OUT)/fibocom-dial,-lpthread -ldl,-DGHT_FEATURE_PCIE_AUTO))
+	$(if $(CONFIG_MODEM_PRO_FIBOCOM),$(call cc_dialer,$(TP)/fibocom-dial/src,$(FIBOCOM_SRC),$(DL_OUT)/fibocom-dial,-lpthread -ldl,-DGHT_FEATURE_PCIE_AUTO -std=gnu89))
 	$(if $(CONFIG_MODEM_PRO_MEIG),$(call cc_dialer,$(TP)/meig-cm/src,$(MEIG_SRC),$(DL_OUT)/meig-cm,-lpthread -ldl,))
 	$(if $(CONFIG_MODEM_PRO_SIMCOM),$(call cc_dialer,$(TP)/simcom-cm/src,$(SIMCOM_SRC),$(DL_OUT)/simcom-cm,-lpthread,))
 endef
