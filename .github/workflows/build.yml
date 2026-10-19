@@ -8,12 +8,17 @@
 #   · 推送 v* 标签 → 编译 + 自动创建/更新同名 Release 并上传产物
 #   · 手动 workflow_dispatch → 只编译（产物存 artifact）
 #
-# 流程细分：每个阶段一个 step（依赖 → SDK → feeds → stub → 配置 → 缓存 → 编译 → 收集），
+# 流程细分：每个阶段一个 step（依赖 → Rust 工具链 → stub → SDK → 缓存 → feeds → 配置 → 编译 → 收集），
 # 编译用 V=s 输出细粒度日志，失败可直接定位到具体命令。
 #
 # 维护提示：
-#   · rust host 工具链（feeds/packages lang/rust）是源码编译，首跑约 1~2 小时；
-#     缓存 key 绑定 workflow 文件哈希，feeds 升级导致 rustc 版本变化时缓存自然失效重建；
+#   · Rust 后端**不再**走 feeds/packages 的 rust/host —— 那条路是 OpenWrt 从源码编译
+#     rustc + LLVM，冷启动 1~2 小时。这里改用宿主 rustup 工具链 + 官方
+#     aarch64-unknown-linux-musl target，链接交给工具链自带的 rust-lld 自包含链接
+#     （MODEM_PRO_HOST_RUST=1，见顶层 Makefile），产出静态 musl 二进制：
+#     无运行时 libc 依赖，任意同架构固件可装；feeds 里也不再需要 lang/rust。
+#   · 版本号仍是单一来源 VERSION，由 Makefile 以 MODEMD_VERSION 传给 cargo。
+#   · cargo 依赖与编译产物走缓存（见「缓存 cargo」步骤），二次起只需几分钟。
 #   · SDK 不带 base 包源码，DEPENDS 里的 +odhcp6c 用本地 stub feed 满足（见 ci-stub），
 #     真机上的 odhcp6c 由固件自带，stub 包不会被发布。
 
@@ -36,12 +41,14 @@ env:
   # 无内核模块依赖，任何 aarch64 固件可装）
   TARGET: armsr/armv8
   PKG: modem-pro
+  # 宿主 Rust 工具链（需与 rust/Cargo.toml 的 rust-version 兼容；升级时只改这里）
+  RUST_TOOLCHAIN: "1.92.0"
 
 jobs:
   build:
     name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 240
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -72,8 +79,17 @@ jobs:
             zstd xz-utils \
             python3 python3-setuptools swig patch pkg-config \
             ca-certificates tar perl bash
-          # 清掉 apt 缓存给 rust host 编译腾磁盘（rustc 源码编译峰值 ~20GB）
-          sudo rm -rf /var/lib/apt/lists/* /usr/local/lib/android /opt/ghc
+
+      - name: 安装宿主 Rust 工具链（rustup + musl target）
+        run: |
+          # 只用于交叉编译 modemd：宿主 rustc + 官方 aarch64-unknown-linux-musl
+          # target（minimal profile 已含交叉链接用的 rust-lld）。
+          command -v rustup >/dev/null || { echo "runner 未预装 rustup，无法继续"; exit 1; }
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal \
+            --no-self-update --target aarch64-unknown-linux-musl
+          rustup default "$RUST_TOOLCHAIN"
+          rustc -vV
+          rustup target list --installed
 
       - name: 生成 odhcp6c stub（满足 SDK 构建依赖，不发布）
         run: |
@@ -121,15 +137,17 @@ jobs:
             *)         curl -fsSL "$BASE/$SDK" | tar -xJ    --strip-components=1 -C sdk ;;
           esac
 
-      - name: 恢复缓存（下载缓存 + rust host 工具链）
+      - name: 缓存 cargo 依赖与编译产物
         uses: actions/cache@v6
         with:
           path: |
-            sdk/dl
-            sdk/staging_dir/host
-            sdk/staging_dir/hostpkg
-          key: sdk-${{ matrix.id }}-v1
-          restore-keys: sdk-${{ matrix.id }}-
+            ~/.cargo/registry
+            ~/.cargo/git
+            .cargo-target
+          # Cargo.lock / Makefile / 本文件变化时自然失效重建；命中旧键也有 restore-keys 兜底
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock', 'Makefile', '.github/workflows/build.yml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
 
       - name: 更新并安装 feeds
         working-directory: sdk
@@ -156,9 +174,9 @@ jobs:
           find "$PKG_DIR" -name target -type d -prune -exec rm -rf {} + 2>/dev/null
           echo "src-link modem_pro $FEED_DIR" >> feeds.conf.default
           echo "src-link ci_stub $GITHUB_WORKSPACE/.ci-stub" >> feeds.conf.default
-          ./scripts/feeds update -a
-          # 精确安装所需包（不 install -a，避免把 third_party/kmods 内核模块也拉进 feeds）
-          ./scripts/feeds install -p packages rust
+          ./scripts/feeds update packages luci
+          # 精确安装所需包（不 install -a，避免把 third_party/kmods 内核模块也拉进 feeds）。
+          # 注意：Rust 走宿主工具链直编（见 build 顶部说明），已不再安装 feeds 的 lang/rust。
           ./scripts/feeds install -p luci luci-base
           ./scripts/feeds install -p ci_stub odhcp6c
           ./scripts/feeds install -p modem_pro modem-pro
@@ -182,7 +200,12 @@ jobs:
         working-directory: sdk
         run: |
           set -o pipefail
-          make package/modem-pro/compile V=s -j"$(nproc)" 2>&1 | tee build.log
+          # MODEM_PRO_HOST_RUST=1              —— 宿主 rustup 工具链直编，跳过 feeds 的 rust 源码编译
+          # MODEM_PRO_CARGO_TARGET_DIR         —— 固定到工作区，给上面的 cargo 缓存复用编译产物
+          make package/modem-pro/compile V=s -j"$(nproc)" \
+            MODEM_PRO_HOST_RUST=1 \
+            MODEM_PRO_CARGO_TARGET_DIR="$GITHUB_WORKSPACE/.cargo-target" \
+            2>&1 | tee build.log
 
       - name: 收集产物 + 校验和
         working-directory: sdk

@@ -8,8 +8,16 @@
 ## 0. 前置条件
 
 - 官方 SDK 或完整源码树（`openwrt-25.x`，与目标固件**同版本、同 target**）。
-- **必须启用 `feeds/packages`**（提供 `lang/rust` 工具链）。
 - 主机侧需要联网拉取 crates（`rust/Cargo.lock` 已锁定版本）。
+
+Rust 守护进程有两种编译方式，按 `MODEM_PRO_HOST_RUST` 切换：
+
+| 方式 | 开关 | 依赖 | 说明 |
+| --- | --- | --- | --- |
+| feeds 工具链（默认） | `MODEM_PRO_HOST_RUST=0` | `feeds/packages` 的 `lang/rust` | OpenWrt 从源码编译 rustc + LLVM，**冷启动 1~2 小时**；产物随构建树 |
+| 宿主直编 | `MODEM_PRO_HOST_RUST=1` | 宿主 `rustup` + `aarch64-unknown-linux-musl` target | 跳过 rust 源码编译，几分钟级；产出静态 musl 二进制；CI 走这条 |
+
+**默认（feeds）方式**需启用 `feeds/packages`（提供 `lang/rust` 工具链）：
 
 ```sh
 # 官方 SDK 里通常已带 feeds，确认存在 lang/rust：
@@ -21,6 +29,12 @@ ls feeds/packages/lang/rust/rust-package.mk
 ```sh
 ./scripts/feeds update packages
 ./scripts/feeds install -a -p packages
+```
+
+**宿主直编方式**只需宿主 Rust 工具链（CI 与本地开发都推荐）：
+
+```sh
+rustup toolchain install stable --profile minimal --target aarch64-unknown-linux-musl
 ```
 
 ---
@@ -74,6 +88,15 @@ make package/feeds/modem-pro/modem-pro/compile V=s
 # 或者
 make package/modem-pro/{clean,compile} V=s
 ```
+
+宿主直编（跳过 feeds 的 rust 源码编译，推荐）：
+
+```sh
+make package/modem-pro/compile V=s MODEM_PRO_HOST_RUST=1
+```
+
+> `MODEM_PRO_CARGO_TARGET_DIR` 可指向一个稳定目录（默认 `$(PKG_BUILD_DIR)/rust/target`），
+> 让 cargo 复用上次的编译产物。示例：`MODEM_PRO_CARGO_TARGET_DIR=$PWD/.cargo-target`。
 
 产物：
 
@@ -168,13 +191,16 @@ cargo run -- -config ../docs/example-config.toml
 | 24.10 IPK | 最新 24.10.x | `modem-pro_*.ipk` |
 
 流程细分（每步一个 Action step，失败直接定位）：
-安装依赖 → 生成 odhcp6c stub → 下载 SDK → 恢复缓存 → feeds → 选包配置 →
-编译（V=s）→ 收集产物 + SHA256 → 上传 artifact。
+安装依赖 → **安装宿主 Rust 工具链** → 生成 odhcp6c stub → 下载 SDK → 缓存 cargo →
+feeds → 选包配置 → 编译（V=s）→ 收集产物 + SHA256 → 上传 artifact。
 
 要点：
 - **触发**：推 `v*` 标签（编译 + 自动建 Release 上传产物）或手动 `workflow_dispatch`（只编译）；
-- **缓存**：`dl/` 与 `staging_dir/host*`（含 rust host 工具链）。rust host 是**源码
-  编译**（首跑 1~2 小时），二次起走缓存只需几分钟；
+- **Rust 走宿主工具链**：`MODEM_PRO_HOST_RUST=1`，宿主 `rustup` + 官方
+  `aarch64-unknown-linux-musl` target 交叉编译，**不再**从源码编译 rust host 工具链
+  （原路冷启动 1~2 小时），也不再安装 feeds 的 `lang/rust`；
+- **缓存**：`~/.cargo/registry` + `~/.cargo/git` + `.cargo-target`（cargo 依赖与编译产物），
+  key 绑定 `rust/Cargo.lock` / `Makefile` / workflow 文件哈希，二次起只需几分钟；
 - **odhcp6c stub**：SDK 不带 base 包源码，`DEPENDS:+odhcp6c` 由本地 stub feed
   满足；stub 不发布，真机由固件自带；
 - **发布**：`v1.0.0` 起 Release 附 APK/IPK 与 SHA256SUMS。

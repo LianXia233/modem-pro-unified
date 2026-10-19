@@ -62,9 +62,15 @@ modem-pro-unified/
 
 一个 `Makefile` 产出一个包 `modem-pro`。要点：
 
-- **Rust**：`MAKE_PATH:=rust` + `include $(TOPDIR)/feeds/packages/lang/rust/rust-package.mk`，
-  用其 `Build/Compile/Cargo`（`cargo install --root $(PKG_INSTALL_DIR) --path $(PKG_BUILD_DIR)/rust`）。
-  `PKG_BUILD_DEPENDS:=rust/host`。缺 rust feed 时编译期给出明确报错。
+- **Rust**：两条路径，由 `MODEM_PRO_HOST_RUST` 选择。
+  - 默认（`MODEM_PRO_HOST_RUST=0`）：`MAKE_PATH:=rust` +
+    `include $(TOPDIR)/feeds/packages/lang/rust/rust-package.mk`，用其
+    `Build/Compile/Cargo`（`cargo install --root $(PKG_INSTALL_DIR) --path $(PKG_BUILD_DIR)/rust`）。
+    `PKG_BUILD_DEPENDS:=rust/host`。缺 rust feed 时编译期给出明确报错。
+  - 宿主直编（`MODEM_PRO_HOST_RUST=1`）：用宿主 rustup 工具链 + 官方
+    `aarch64-unknown-linux-musl` target 交叉编译（链接交给工具链自带 `rust-lld`），
+    产出静态 musl 二进制。**不**依赖 `feeds/packages/lang/rust`，跳过 OpenWrt 从源码
+    编译 rustc + LLVM（冷启动 1~2 小时）。CI 走这条，见 `.github/workflows/build.yml`。
 - **C 拨号器**：不使用各家自带 Makefile 的 `-Werror`，用 `TARGET_CC` 按显式源文件清单编译
   （清单与各家 Makefile 一致），输出到 `/usr/lib/modemd/`。用 `Config.in` 的
   `MODEM_PRO_{QUECTEL,FIBOCOM,MEIG,SIMCOM}` 裁剪。

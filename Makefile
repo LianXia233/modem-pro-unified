@@ -25,9 +25,28 @@ PKG_LICENSE_FILES:=LICENSE
 PKG_BUILD_PARALLEL:=1
 PKG_USE_MIPS16:=0
 
+# ── Rust 守护进程的两种构建方式 ────────────────────────────────────────────────
+# 默认（MODEM_PRO_HOST_RUST=0）走 feeds/packages 的 rust/host，行为不变：
+#   · OpenWrt 从源码编译 rustc + LLVM，冷启动 1~2 小时；构建树与本地适用。
+# 直编（MODEM_PRO_HOST_RUST=1）用【宿主 rustup 工具链】直接交叉编译：
+#   · 宿主 rustc + 官方 aarch64-unknown-linux-musl target + 工具链自带 rust-lld
+#     自包含链接，产出静态 musl 二进制（无运行时 libc 依赖，同架构固件通用）；
+#   · 完全跳过 feeds 的 rust 源码编译，不再需要 rust/host 构建依赖 —— CI 走这条
+#     （见 .github/workflows/build.yml）；
+#   · 前置：宿主已 `rustup target add aarch64-unknown-linux-musl`；
+#   · MODEM_PRO_CARGO_TARGET_DIR 可指向仓库外的稳定目录（如 CI 的 .cargo-target），
+#     让 cargo 复用上次的编译产物。
+MODEM_PRO_HOST_RUST ?= 0
+MODEM_PRO_RUST_TARGET:=aarch64-unknown-linux-musl
+MODEM_PRO_CARGO_TARGET_DIR ?= $(PKG_BUILD_DIR)/rust/target
+
 # Rust 支持来自 feeds/packages（lang/rust）。缺失时在编译期给出明确提示。
 RUST_PACKAGE_MK:=$(TOPDIR)/feeds/packages/lang/rust/rust-package.mk
-HAVE_RUST:=$(if $(wildcard $(RUST_PACKAGE_MK)),1,0)
+ifeq ($(MODEM_PRO_HOST_RUST),1)
+  HAVE_RUST:=0
+else
+  HAVE_RUST:=$(if $(wildcard $(RUST_PACKAGE_MK)),1,0)
+endif
 
 ifeq ($(HAVE_RUST),1)
   PKG_BUILD_DEPENDS:=rust/host
@@ -44,9 +63,30 @@ include $(INCLUDE_DIR)/package.mk
 ifeq ($(HAVE_RUST),1)
   MAKE_PATH:=rust
   include $(RUST_PACKAGE_MK)
+  # 版本号注入走 CARGO_PKG_VARS：上游 Build/Compile/Cargo 的配方自带行首 `+`，
+  # 外面不能再叠一层 `MODEMD_VERSION=... $(call ...)` —— 展开后会多出一个
+  # 行首之外的 `+VAR=...`，shell 会把它当命令执行（not found）。
+  CARGO_PKG_VARS+= MODEMD_VERSION="$(PKG_VERSION)-$(PKG_RELEASE)"
+  define MODEMD/Compile
+	$(call Build/Compile/Cargo)
+  endef
+else ifeq ($(MODEM_PRO_HOST_RUST),1)
+  # 宿主工具链直编：cargo 交叉编译到 $(MODEM_PRO_RUST_TARGET)，
+  # 链接交给工具链自带的 rust-lld（宿主 cc/ld 处理不了 aarch64 目标文件）。
+  # 产物是静态 musl 二进制；拷进 PKG_INSTALL_DIR/bin，与 feeds 路径的安装步骤对齐。
+  define MODEMD/Compile
+	+cd $(PKG_BUILD_DIR)/rust && \
+		CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
+		MODEMD_VERSION="$(PKG_VERSION)-$(PKG_RELEASE)" \
+		cargo build --release --locked \
+			--target $(MODEM_PRO_RUST_TARGET) \
+			--target-dir $(MODEM_PRO_CARGO_TARGET_DIR) && \
+		$(INSTALL_DIR) $(PKG_INSTALL_DIR)/bin && \
+		$(INSTALL_BIN) $(MODEM_PRO_CARGO_TARGET_DIR)/$(MODEM_PRO_RUST_TARGET)/release/modemd $(PKG_INSTALL_DIR)/bin/modemd
+  endef
 else
-  define Build/Compile/Cargo
-	$(error 未找到 rust 包支持：请先启用 feeds/packages（lang/rust）。详见 docs/BUILD.md)
+  define MODEMD/Compile
+	$(error 未找到 rust 包支持：请先启用 feeds/packages（lang/rust），或设 MODEM_PRO_HOST_RUST=1 用宿主工具链直编。详见 docs/BUILD.md)
   endef
 endif
 
@@ -105,7 +145,7 @@ endef
 
 define Build/Compile
 	# Rust 守护进程：注入统一版本号（单一来源 VERSION）
-	+MODEMD_VERSION="$(PKG_VERSION)-$(PKG_RELEASE)" $(call Build/Compile/Cargo)
+	$(call MODEMD/Compile)
 	# 厂商拨号器
 	$(INSTALL_DIR) $(DL_OUT)
 	$(if $(CONFIG_MODEM_PRO_QUECTEL),$(call cc_dialer,$(TP)/quectel-cm,$(QUECTEL_SRC),$(DL_OUT)/quectel-CM,-lpthread -ldl -lrt,))

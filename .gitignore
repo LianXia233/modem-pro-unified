@@ -1,5 +1,6 @@
 # Rust
 /rust/target/
+/.cargo-target/
 **/*.rs.bk
 
 # 本地迁移参考副本（仅本机对照，不纳入版本控制）

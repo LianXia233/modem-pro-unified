@@ -4,6 +4,30 @@
 
 ## [未发布]
 
+### 编译提速：Rust 后端改宿主工具链直编（跳过 rust 源码编译）
+
+原云编译最大耗时是 OpenWrt 从源码编译 `feeds/packages` 的 rust/host 工具链
+（rustc + LLVM，冷启动 1~2 小时）。现改为**宿主 rustup 工具链直接交叉编译**：
+
+- **顶层 Makefile**：新增 `MODEM_PRO_HOST_RUST` 开关（默认 `0` 保持原行为）。
+  - `0`：走 `feeds/packages/lang/rust/rust-package.mk` 的 `Build/Compile/Cargo`（本地适用，不变）；
+  - `1`：宿主 `cargo build --release --locked --target aarch64-unknown-linux-musl`，
+    链接交给工具链自带 `rust-lld`（宿主 cc/ld 处理不了 aarch64 目标文件），
+    产出**静态 musl 二进制**（无运行时 libc 依赖，同架构固件通用），完全不依赖
+    `feeds/packages/lang/rust`；
+  - 版本号注入改走 `CARGO_PKG_VARS`（上游配方自带行首 `+`，外层再叠会展开出
+    多余的 `+VAR=...` 被 shell 当命令执行）；
+  - 新增 `MODEM_PRO_CARGO_TARGET_DIR`，可指向稳定目录以复用编译产物。
+- **云编译流水线**（`.github/workflows/build.yml`）：
+  - 新增「安装宿主 Rust 工具链」步骤（`rustup` minimal profile +
+    `aarch64-unknown-linux-musl` target，版本由 `RUST_TOOLCHAIN` 固定）；
+  - 缓存由 `dl/` + `staging_dir/host*` 改为 `~/.cargo/registry` + `~/.cargo/git` +
+    `.cargo-target`，key 绑定 `rust/Cargo.lock` / `Makefile` / 本文件哈希；
+  - feeds 更新只拉 `packages`/`luci`，不再安装 `lang/rust`；
+  - 编译传入 `MODEM_PRO_HOST_RUST=1` 与 `MODEM_PRO_CARGO_TARGET_DIR`；
+  - 超时由 240 分钟下调到 60 分钟。
+- **文档**：`docs/BUILD.md`、`docs/INTEGRATION.md` 补充两种构建方式与切换方法。
+
 ### 云编译流水线 + LuCI 菜单汉化
 
 - **LuCI 菜单硬编码中文**（`menu.d/luci-app-modemd.json`）：`5G 终端` /
@@ -13,8 +37,7 @@
   - 主线 APK（snapshots，25.x）与 24.10 IPK（opkg）两档矩阵并行；
   - 流程细分：依赖 → stub → SDK → 缓存 → feeds → 选包 → 编译（V=s）→
     产物 + SHA256 → artifact；失败按 step 定位；
-  - rust host 工具链源码编译首跑 1~2 小时，`dl/` 与 `staging_dir/host*`
-    全缓存，二次起几分钟；
+  - Rust 后端构建方式见上方「编译提速」条目（已改宿主工具链直编）；
   - SDK 无 base 包源码，`DEPENDS:+odhcp6c` 用本地 stub feed 满足（不发布）；
   - 推 `v*` 标签自动创建 Release 并上传两档产物与校验和。
 
