@@ -305,6 +305,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
+      # body_path 要读仓库根的 RELEASE_NOTES.md —— 这个 job 不 checkout 就没有
+      # 任何文件，softprops 会静默忽略 body_path，Release 只剩自动生成的一行。
+      - name: 检出仓库（读产物日志）
+        uses: actions/checkout@v4
+
       - name: 汇总全部产物
         uses: actions/download-artifact@v8
         with:
