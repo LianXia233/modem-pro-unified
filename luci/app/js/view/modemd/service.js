@@ -126,7 +126,7 @@ return view.extend({
 		}
 
 		/* NTP 时间同步 Card Grid */
-		var ntpGrid = E('div', { 'class': 'mp-grid', 'style': 'grid-template-columns:repeat(auto-fit, minmax(220px, 1fr));gap:12px;margin-bottom:12px;' });
+		var ntpGrid = E('div', { 'class': 'mp-grid', 'style': 'grid-template-columns:repeat(auto-fit, minmax(min(220px, 100%), 1fr));gap:12px;margin-bottom:12px;' });
 		this.renderNtpBoxes(ntpData, ntpGrid);
 
 		/* 状态轮询更新 */
@@ -163,7 +163,7 @@ return view.extend({
 			E('div', { 'class': 'mp-card-title', 'style': 'display:flex;align-items:center;gap:8px;' }, [
 				icons.get('modem', 18), ' 后台守护进程控制 (modemd procd)'
 			]),
-			E('div', { 'class': 'mp-grid', 'style': 'grid-template-columns:repeat(auto-fit, minmax(220px, 1fr));gap:12px;margin-bottom:14px;' }, [
+			E('div', { 'class': 'mp-grid', 'style': 'grid-template-columns:repeat(auto-fit, minmax(min(220px, 100%), 1fr));gap:12px;margin-bottom:14px;' }, [
 				E('div', { 'class': 'mp-metric-box' }, [
 					E('div', { 'class': 'mp-metric-label' }, '服务状态 / 开机自启'),
 					E('div', { 'class': 'mp-metric-value', 'style': 'display:flex;align-items:center;' }, [ srvPill, bootPill ])

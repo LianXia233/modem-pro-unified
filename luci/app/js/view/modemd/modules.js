@@ -251,7 +251,7 @@ return view.extend({
 			])
 		]);
 
-		var grid = E('div', { 'class': 'mp-grid', 'style': 'grid-template-columns:repeat(auto-fit, minmax(220px, 1fr));gap:12px;margin-bottom:16px;' });
+		var grid = E('div', { 'class': 'mp-grid', 'style': 'grid-template-columns:repeat(auto-fit, minmax(min(220px, 100%), 1fr));gap:12px;margin-bottom:16px;' });
 
 		function addBox(k, v, isWide) {
 			var box = E('div', {

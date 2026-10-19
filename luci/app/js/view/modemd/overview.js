@@ -290,15 +290,7 @@ return view.extend({
 						icons.get('gauge', 18),
 						'实时速率与流量'
 					]),
-					E('div', { 'class': 'mp-card-actions' }, [
-						E('span', { 'class': 'mp-legend-item' }, [
-							E('span', { 'class': 'mp-legend-dot', 'style': 'background:#f59e0b' }),
-							'上行'
-						]),
-						E('span', { 'class': 'mp-legend-item' }, [
-							E('span', { 'class': 'mp-legend-dot', 'style': 'background:#3b82f6' }),
-							'下行'
-						]),
+					E('div', { 'class': 'mp-card-actions', 'style': 'flex-wrap:wrap;gap:6px 10px' }, [
 						E('span', { 'id': 'traffic-iface', 'class': 'mp-badge' }, '接口识别中…'),
 						E('button', {
 							'class': 'mp-btn mp-btn-ghost mp-btn-sm',
@@ -316,34 +308,39 @@ return view.extend({
 						}, '累计清零')
 					])
 				]),
-				/* 布局：左列上下两个「瞬时」指标，右列曲线占满两行；累计量单独一行。
+				/* 2×2 布局：**每一行是「速率 + 它自己的曲线」**
 				 *
-				 *   [上行速率] [        曲线        ]
-				 *   [下行速率] [        曲线        ]
-				 *   [累计上传] [    累计下载        ]
+				 *   [上行速率] [   上行曲线   ]
+				 *   [下行速率] [   下行曲线   ]
+				 *   [本次累计上传] [ 本次累计下载 ]
 				 *
-				 * 这样「此刻多快」和「曲线怎么走」在同一视线高度上，
-				 * 不用上下扫；累计量是「换了多少」的汇总，放最后一排。
-				 * 窄屏（<720px）自动塌成单列，见 modemd.css 的 .mp-traffic-layout。 */
+				 * 早先两条线叠在同一张图里共用一根纵轴 —— 上行 20 kbps、下行 100 Mbps 时，
+				 * 上行那条会被压成贴着底边的一条直线，等于没有信息。拆开后各用各的纵轴，
+				 * 「上行此刻多快」和「上行这分钟怎么走」就在同一行，眼睛不用来回扫。 */
 				E('div', { 'class': 'mp-traffic-layout' }, [
-					E('div', { 'class': 'mp-traffic-meters' }, [
-						metricBox('上行速率', '0', 'bps', '实时发送速率', icons.arrowUp(16)),
-						metricBox('下行速率', '0', 'bps', '实时接收速率', icons.arrowDown(16))
+					E('div', { 'class': 'mp-traffic-meter', 'id': 'metric-up' }, [
+						metricBox('上行速率', '0 bps', '', '实时发送速率', icons.arrowUp(16))
 					]),
-					E('div', { 'id': 'traffic-chart', 'class': 'mp-traffic-chart' }, [
-						E('div', { 'style': 'padding:28px 0;text-align:center;color:var(--mp-neutral-500);font-size:12.5px' }, '等待采样…')
+					E('div', { 'id': 'traffic-chart-up', 'class': 'mp-traffic-chart' }, [
+						E('div', { 'class': 'mp-traffic-empty' }, '等待采样…')
+					]),
+					E('div', { 'class': 'mp-traffic-meter', 'id': 'metric-down' }, [
+						metricBox('下行速率', '0 bps', '', '实时接收速率', icons.arrowDown(16))
+					]),
+					E('div', { 'id': 'traffic-chart-down', 'class': 'mp-traffic-chart' }, [
+						E('div', { 'class': 'mp-traffic-empty' }, '等待采样…')
 					])
 				]),
 				E('div', { 'id': 'traffic-grid-total', 'class': 'mp-traffic-totals' }, [
 					metricBox('本次累计上传', '0 B', '', '已发数据量'),
 					metricBox('本次累计下载', '0 B', '', '已收数据量')
 				]),
-				E('div', { 'style': 'margin-top:8px;font-size:11.5px;color:var(--mp-neutral-500)' },
-					'数据来自本机网卡计数（后台每 1 秒采样，与页面是否打开无关）；曲线保留最近 60 秒，与上面的四个数字同源。')
+				E('div', { 'class': 'mp-traffic-note' },
+					'数据来自本机网卡计数（后台每秒采样，与页面是否打开无关）；两条曲线各保留最近 60 秒，纵轴各自自适应。')
 			]),
 
 			/* 7. 双列布局：SIM 卡信息 + 模组硬件 */
-			E('div', { 'style': 'display:grid;grid-template-columns:repeat(auto-fit, minmax(320px, 1fr));gap:16px;margin-bottom:18px' }, [
+			E('div', { 'style': 'display:grid;grid-template-columns:repeat(auto-fit, minmax(min(320px, 100%), 1fr));gap:16px;margin-bottom:18px' }, [
 				/* SIM 卡 */
 				E('div', { 'class': 'mp-card', 'style': 'margin-bottom:0' }, [
 					E('div', { 'class': 'mp-card-hd' }, [
@@ -369,7 +366,7 @@ return view.extend({
 			]),
 
 			/* 8. 双列布局：基站小区摘要 + 拨号链路 */
-			E('div', { 'style': 'display:grid;grid-template-columns:repeat(auto-fit, minmax(320px, 1fr));gap:16px;margin-bottom:18px' }, [
+			E('div', { 'style': 'display:grid;grid-template-columns:repeat(auto-fit, minmax(min(320px, 100%), 1fr));gap:16px;margin-bottom:18px' }, [
 				/* 基站摘要 */
 				E('div', { 'class': 'mp-card', 'style': 'margin-bottom:0' }, [
 					E('div', { 'class': 'mp-card-hd' }, [
@@ -427,8 +424,6 @@ return view.extend({
 
 	/* 画曲线 + 更新接口徽章。`t` 是 /api/traffic 的 data。 */
 	drawTrafficChart: function (t) {
-		var box = document.getElementById('traffic-chart');
-		if (!box) return;
 		var badge = document.getElementById('traffic-iface');
 		if (badge) {
 			if (t && t.iface) {
@@ -440,7 +435,18 @@ return view.extend({
 			}
 		}
 		var pts = (t && t.history) || [];
-		box.innerHTML = spark.render(pts, { h: 190 });
+		/* 上下行各画一张，纵轴各自自适应（见 spark 的 `only` 参数）。
+		 *
+		 * 尺寸取容器实测值：viewBox 与显示尺寸 1:1，刻度文字才不会被拉伸变形。
+		 * 早先写死 viewBox 宽 1000、实际只显示 190~890px，再配
+		 * preserveAspectRatio="none"，刻度数字会被横向压扁成竖线。 */
+		[['up', 'up_bps'], ['down', 'down_bps']].forEach(function (pair) {
+			var box = document.getElementById('traffic-chart-' + pair[0]);
+			if (!box) return;
+			var cw = box.clientWidth || 820;
+			var ch = box.clientHeight || 76;
+			box.innerHTML = spark.render(pts, { w: cw, h: ch, only: pair[0] });
+		});
 	},
 
 	redraw: function (s) {
@@ -636,11 +642,16 @@ return view.extend({
 		var tr = net.traffic || {};
 		/* 瞬时指标进左列表盘，累计量进下面一行 —— 两个容器分开更新，
 		   否则 4 个格子会全塞进累计容器、把新布局撑乱。 */
-		var meters = document.querySelector('.mp-traffic-meters');
-		if (meters) {
-			meters.innerHTML = '';
-			meters.appendChild(metricBox('上行速率', tr.up_text || fmt.bpsRate(tr.up_bps), 'bps', '瞬时发送速率', icons.arrowUp(16)));
-			meters.appendChild(metricBox('下行速率', tr.down_text || fmt.bpsRate(tr.down_bps), 'bps', '瞬时接收速率', icons.arrowDown(16)));
+		/* 第三参是单位：up_text / bpsRate 自带「bps / Mbps」，再传一次会变成「0 bps bps」 */
+		var mUp = document.getElementById('metric-up');
+		if (mUp) {
+			mUp.innerHTML = '';
+			mUp.appendChild(metricBox('上行速率', tr.up_text || fmt.bpsRate(tr.up_bps), '', '瞬时发送速率', icons.arrowUp(16)));
+		}
+		var mDown = document.getElementById('metric-down');
+		if (mDown) {
+			mDown.innerHTML = '';
+			mDown.appendChild(metricBox('下行速率', tr.down_text || fmt.bpsRate(tr.down_bps), '', '瞬时接收速率', icons.arrowDown(16)));
 		}
 		var trafTotal = document.getElementById('traffic-grid-total');
 		if (trafTotal) {

@@ -471,7 +471,7 @@ return view.extend({
 						E('h3', { 'class': 'mp-card-title' }, [ icons.get('gauge', 17), '月度流量配额与超限控制' ]),
 						E('span', { 'class': 'mp-badge ' + (quota.enabled ? 'mp-badge-success' : 'mp-badge-muted') }, quota.enabled ? '配额监控中' : '未启用')
 					]),
-					E('div', { 'style': 'display:grid;grid-template-columns:repeat(auto-fit, minmax(220px, 1fr));gap:12px;margin-bottom:18px' }, [
+					E('div', { 'style': 'display:grid;grid-template-columns:repeat(auto-fit, minmax(min(220px, 100%), 1fr));gap:12px;margin-bottom:18px' }, [
 						metricBox('月度限额', quota.limit_text || (quota.limit_bytes ? fmt.bytes(quota.limit_bytes) : '不限制'), '', '设定阈值'),
 						metricBox('本周期已用', quota.used_text || (quota.used_bytes ? fmt.bytes(quota.used_bytes) : '0 B'), '', '累计用量'),
 						metricBox('剩余流量', quota.remain_text || (quota.remain_bytes ? fmt.bytes(quota.remain_bytes) : '-'), '', '可用额度'),

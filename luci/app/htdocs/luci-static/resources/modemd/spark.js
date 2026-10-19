@@ -34,8 +34,28 @@ function render(points, opts) {
 	opts = opts || {};
 	var w = opts.w || 1000;
 	var h = opts.h || 180;
-	/* 左边留白给纵轴刻度，底部留白给时间标签 */
-	var padL = 62, padR = 12, padT = 14, padB = 22;
+	/* 窄图（手机上的这个小曲线）要换一套留白与字号。
+	 *
+	 * 关键：调用方现在传的是**容器真实像素宽高**，viewBox 与显示尺寸 1:1，
+	 * 再叠加 preserveAspectRatio="none" 也不会把文字横向压扁。
+	 * 早先固定 viewBox 宽 1000、实际显示 190px —— 横向缩放 0.34，
+	 * 刻度数字被压成一条竖线，完全读不出来。 */
+	var compact = w < 420;
+	/* 高度很矮（上下行各自一条、每条只有六七十像素）时也要收留白与字号，
+	   否则光时间轴就吃掉三分之一。 */
+	var short = h < 100;
+	var padL = compact ? 34 : 56, padR = compact ? 6 : 10;
+	/* 矮图上下都要留出字高，否则顶部刻度被裁、底部时间轴压着曲线。
+	   字号只看宽度：宽图（桌面 890px）用 10px 才不显得碎。 */
+	var padT = short ? 7 : (compact ? 8 : 14);
+	var padB = short ? 14 : (compact ? 16 : 22);
+	var fs = compact ? 9 : 10;
+	var yTicks = (compact || short) ? 2 : 4;
+
+	/* 只画一条：`only: 'up' | 'down'`（上下行各自一条曲线时用）。
+	   缺省 'both' 保持原行为，两条线叠在一张图里。 */
+	var only = opts.only || 'both';
+	var showUp = only !== 'down', showDown = only !== 'up';
 	var iw = Math.max(10, w - padL - padR);
 	var ih = Math.max(10, h - padT - padB);
 	var upColor = opts.upColor || '#f59e0b';     /* 上行：琥珀 */
@@ -46,10 +66,12 @@ function render(points, opts) {
 	/* 只取最近 60 个（后端已裁剪，这里再兜一层：老固件/旧缓存可能给多了） */
 	if (pts.length > 60) pts = pts.slice(pts.length - 60);
 
+	/* 峰值按**实际画出来的线**算：分开画时各用各的纵轴 —— 上行 20 kbps 与
+	   下行 100 Mbps 若共用一根轴，上行那条会被压成贴底的一条直线，看不出变化。 */
 	var maxV = 0;
 	for (var i = 0; i < pts.length; i++) {
-		if (pts[i].up_bps > maxV) maxV = pts[i].up_bps;
-		if (pts[i].down_bps > maxV) maxV = pts[i].down_bps;
+		if (showUp && pts[i].up_bps > maxV) maxV = pts[i].up_bps;
+		if (showDown && pts[i].down_bps > maxV) maxV = pts[i].down_bps;
 	}
 	var top = niceCeil(maxV);
 
@@ -82,32 +104,35 @@ function render(points, opts) {
 		return d;
 	}
 
-	/* 横向网格：4 等分，标注对应速率 */
+	/* 横向网格：等分若干段，标注对应速率（窄图少画两条，免得刻度糊成一片） */
 	var grid = '';
-	for (var g = 0; g <= 4; g++) {
-		var gy = padT + (ih * g) / 4;
-		var val = top * (4 - g) / 4;
+	for (var g = 0; g <= yTicks; g++) {
+		var gy = padT + (ih * g) / yTicks;
+		var val = top * (yTicks - g) / yTicks;
 		grid += '<line x1="' + padL + '" y1="' + gy.toFixed(1) + '" x2="' + (padL + iw) +
 			'" y2="' + gy.toFixed(1) + '" stroke="currentColor" stroke-opacity="0.10" stroke-width="1"/>';
-		grid += '<text x="' + (padL - 8) + '" y="' + (gy + 3.5).toFixed(1) +
-			'" text-anchor="end" font-size="10" fill="currentColor" fill-opacity="0.55">' +
+		grid += '<text x="' + (padL - 6) + '" y="' + (gy + fs * 0.35).toFixed(1) +
+			'" text-anchor="end" font-size="' + fs + '" fill="currentColor" fill-opacity="0.55">' +
 			shortRate(val) + '</text>';
 	}
 
-	/* 底部时间刻度：左「60s 前」、中「30s」、右「现在」 */
+	/* 底部时间刻度：左「60s 前」、中「30s」、右「现在」（窄图砍掉中间那条，否则挤在一起） */
 	var timeLbl = '';
-	[[0, '60s 前'], [0.5, '30s'], [1, '现在']].forEach(function (p) {
+	var marks = (compact || short) ? [[0, '60s'], [1, '现在']]
+	                              : [[0, '60s 前'], [0.5, '30s'], [1, '现在']];
+	marks.forEach(function (p) {
 		var tx = padL + iw * p[0];
-		timeLbl += '<text x="' + tx.toFixed(1) + '" y="' + (h - 6) +
+		timeLbl += '<text x="' + tx.toFixed(1) + '" y="' + (h - (compact ? 4 : 6)) +
 			'" text-anchor="' + (p[0] === 0 ? 'start' : p[0] === 1 ? 'end' : 'middle') +
-			'" font-size="10" fill="currentColor" fill-opacity="0.45">' + p[1] + '</text>';
+			'" font-size="' + fs + '" fill="currentColor" fill-opacity="0.45">' + p[1] + '</text>';
 	});
 
 	var empty = pts.length
 		? ''
 		: '<text x="' + (padL + iw / 2) + '" y="' + (padT + ih / 2) +
-		  '" text-anchor="middle" font-size="12" fill="currentColor" fill-opacity="0.45">' +
-		  '等待采样…（后台每秒一个点，约 2 秒后出现曲线）</text>';
+		  '" text-anchor="middle" font-size="' + (compact ? 10 : 12) +
+		  '" fill="currentColor" fill-opacity="0.45">' +
+		  (compact ? '等待采样…' : '等待采样…（后台每秒一个点，约 2 秒后出现曲线）') + '</text>';
 
 	return '' +
 		'<svg viewBox="0 0 ' + w + ' ' + h + '" width="100%" height="' + h +
@@ -123,17 +148,17 @@ function render(points, opts) {
 			'</linearGradient>' +
 		'</defs>' +
 		grid +
-		(pts.length ? '<path d="' + area('down_bps') + '" fill="url(#' + uid + '-dn)"/>' : '') +
-		(pts.length ? '<path d="' + area('up_bps') + '" fill="url(#' + uid + '-up)"/>' : '') +
-		(pts.length ? '<path d="' + poly('down_bps') + '" fill="none" stroke="' + downColor +
+		(pts.length && showDown ? '<path d="' + area('down_bps') + '" fill="url(#' + uid + '-dn)"/>' : '') +
+		(pts.length && showUp ? '<path d="' + area('up_bps') + '" fill="url(#' + uid + '-up)"/>' : '') +
+		(pts.length && showDown ? '<path d="' + poly('down_bps') + '" fill="none" stroke="' + downColor +
 			'" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>' : '') +
-		(pts.length ? '<path d="' + poly('up_bps') + '" fill="none" stroke="' + upColor +
+		(pts.length && showUp ? '<path d="' + poly('up_bps') + '" fill="none" stroke="' + upColor +
 			'" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>' : '') +
 		/* 最新一点画个圆点，方便一眼看到「现在」 */
-		(pts.length ? '<circle cx="' + xOf(pts.length - 1).toFixed(1) + '" cy="' +
-			yOf(pts[pts.length - 1].down_bps).toFixed(1) + '" r="2.6" fill="' + downColor + '"/>' : '') +
-		(pts.length ? '<circle cx="' + xOf(pts.length - 1).toFixed(1) + '" cy="' +
-			yOf(pts[pts.length - 1].up_bps).toFixed(1) + '" r="2.6" fill="' + upColor + '"/>' : '') +
+		(pts.length && showDown ? '<circle cx="' + xOf(pts.length - 1).toFixed(1) + '" cy="' +
+			yOf(pts[pts.length - 1].down_bps).toFixed(1) + '" r="2.4" fill="' + downColor + '"/>' : '') +
+		(pts.length && showUp ? '<circle cx="' + xOf(pts.length - 1).toFixed(1) + '" cy="' +
+			yOf(pts[pts.length - 1].up_bps).toFixed(1) + '" r="2.4" fill="' + upColor + '"/>' : '') +
 		empty +
 		timeLbl +
 		'</svg>';

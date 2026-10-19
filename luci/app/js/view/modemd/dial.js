@@ -218,7 +218,7 @@ return view.extend({
 						'拨号策略与网络开关'
 					])
 				]),
-				E('div', { 'style': 'display:grid;grid-template-columns:repeat(auto-fit, minmax(280px, 1fr));gap:16px' }, [
+				E('div', { 'style': 'display:grid;grid-template-columns:repeat(auto-fit, minmax(min(280px, 100%), 1fr));gap:16px' }, [
 					/* 拨号总开关 */
 					E('div', { 'class': 'mp-metric-box', 'style': 'justify-content:center' }, [
 						E('div', { 'style': 'display:flex;align-items:center;justify-content:space-between;margin-bottom:8px' }, [
@@ -347,7 +347,7 @@ return view.extend({
 			]),
 
 			/* 4. 双列布局：模组 USB 总线判定 + 内置拨号器 */
-			E('div', { 'style': 'display:grid;grid-template-columns:repeat(auto-fit, minmax(320px, 1fr));gap:16px;margin-bottom:18px' }, [
+			E('div', { 'style': 'display:grid;grid-template-columns:repeat(auto-fit, minmax(min(320px, 100%), 1fr));gap:16px;margin-bottom:18px' }, [
 				/* USB 识别 */
 				E('div', { 'class': 'mp-card', 'style': 'margin-bottom:0' }, [
 					E('div', { 'class': 'mp-card-hd' }, [
