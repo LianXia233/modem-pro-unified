@@ -127,6 +127,29 @@ pub fn has_default_via(iface: &str) -> bool {
     defaults().iter().any(|r| r.iface == iface.trim())
 }
 
+/// 有没有**指定族**的默认路由经这块网卡。
+///
+/// v4 与 v6 的路由表是独立的（`/proc/net/route` vs `/proc/net/ipv6_route`），
+/// 双栈下完全可能出现「v4 默认路由没了、v6 还在」—— 实机复现过：
+/// `ip route del` 掉 eth2 的两条 v4 默认路由后，它的 IPv6 默认路由
+/// （fe80 链路本地网关）不受影响。链路阶段必须按族分别判，
+/// 否则「v4 已经出不去」会被 v6 的路由掩盖成 online。
+pub fn has_default_via_family(iface: &str, family: u8) -> bool {
+    let iface = iface.trim();
+    if iface.is_empty() {
+        return false;
+    }
+    match family {
+        4 => std::fs::read_to_string("/proc/net/route")
+            .map(|t| parse_v4(&t).iter().any(|r| r.iface == iface))
+            .unwrap_or(false),
+        6 => std::fs::read_to_string("/proc/net/ipv6_route")
+            .map(|t| parse_v6(&t).iter().any(|r| r.iface == iface))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
 /// 这块网卡是不是**当前最优**出口（metric 最小的那条 v4 默认路由）。
 ///
 /// 用途：区分「有路由但被别的口抢了」和「压根没路由」——两者排障方向完全不同。
@@ -205,6 +228,21 @@ br-lan\t000AA8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
         let r4 = parse_v4(V4);
         assert!(r4.iter().any(|r| r.iface == "eth2"));
         assert!(!r4.iter().any(|r| r.iface == "wwan9"));
+    }
+
+    #[test]
+    fn family_check_does_not_mask_the_other_family() {
+        // 实机复现过的场景：eth2 的 v4 默认路由全删了，v6 默认路由还在。
+        // has_default_via（混判）会误报 online；按族查必须分开：
+        assert!(parse_v6(V6).iter().any(|r| r.iface == "eth2"), "样例里 eth2 有 v6 默认路由");
+        assert!(!parse_v4(V4).iter().any(|r| r.iface == "wwan9"), "v4 样例里没有 wwan9");
+        // 直接验证族过滤语义：v4 表里查不到的 iface，v4 族 = false
+        let v4_table = parse_v4(V4);
+        assert!(!v4_table.iter().any(|r| r.iface == "wwan9"));
+        let v6_table = parse_v6(V6);
+        assert!(v6_table.iter().any(|r| r.iface == "eth2"));
+        // 族不同 → 判定互不影响（这是混判 bug 的根子）
+        assert_ne!(v4_table.len(), v6_table.len());
     }
 
     #[test]

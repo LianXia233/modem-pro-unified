@@ -1774,14 +1774,17 @@ impl Modem {
         //    每次都 fork 一次 `ip route` 不可接受。
         st.phase = match st.state.as_str() {
             s if s == DIAL_CONNECTED => {
-                let has_route = !st.host_iface.trim().is_empty()
-                    && crate::netprov::route::has_default_via(&st.host_iface);
-                phase_for_connected(
-                    !st.host_iface.trim().is_empty(),
-                    !st.host_ips.is_empty(),
-                    has_route,
-                )
-                .to_string()
+                // 逐族检查：v4 与 v6 的路由表独立，双栈下「v4 路由没了、v6 还在」
+                // 是实测出现过的（eth2 删掉 v4 默认路由后其 v6 默认路由不受影响）。
+                // 混在一起判会把「v4 已经出不去」掩盖成 online。
+                let iface = st.host_iface.trim();
+                let has_v4 = st.host_ips.iter().any(|a| !a.contains(':'));
+                let has_v6 = st.host_ips.iter().any(|a| a.contains(':'));
+                let route_ok = (!has_v4
+                    || crate::netprov::route::has_default_via_family(iface, 4))
+                    && (!has_v6 || crate::netprov::route::has_default_via_family(iface, 6));
+                phase_for_connected(!iface.is_empty(), !st.host_ips.is_empty(), route_ok)
+                    .to_string()
             }
             s if s == DIAL_DIALING => PHASE_DIALING.to_string(),
             s if s == DIAL_FAILED => PHASE_FAILED.to_string(),

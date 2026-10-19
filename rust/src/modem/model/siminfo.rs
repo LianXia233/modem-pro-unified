@@ -229,7 +229,15 @@ impl Modem {
         };
         // 界面要直接展示这个值：去掉模组应答自带的引号
         let text = field.trim().trim_matches('"').to_string();
-        match parse_cclk(&text) {
+        // 时区换算：默认按 3GPP 减 `±zz`（未知模组最不容易错）；
+        // 怪癖表 `ignore_cclk_tz` 的违规固件（值是 UTC、后缀却报 +32）不减。
+        // 实机核对：FM350 报 `23:02:41+00` 且与主机 UTC 同刻 —— 两种路径结果一致。
+        let ignore_tz = crate::modem::quirk::ignore_cclk_tz(&self.quirk_hint());
+        let unix = match parse_cclk_tz(&text) {
+            Some((utc, _off)) if !ignore_tz => Some(utc),
+            _ => parse_cclk(&text),
+        };
+        match unix {
             Some(unix) => {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -389,6 +397,47 @@ pub fn parse_gtsenrdtemp(resp: &str) -> Vec<Sensor> {
 }
 
 /// `AT+CCLK?` 的 `"26/09/29,04:31:55+32"` → unix 秒（按 UTC 解释，忽略时区尾巴）。
+/// `+CCLK` 的**时区偏移解析**（3GPP TS 27.007：`±zz` 是相对 UTC 的 15 分钟单位）。
+///
+/// 返回 `(修正后的 UTC unix, 偏移分钟数)`。
+///
+/// ## 为什么要专门一个函数
+///
+/// 固件对 `AT+CCLK?` 有两种实测行为：
+///
+/// - **守规矩的**：值就是 UTC、后缀 `+00`（FM350-GL 固件 81600 实测：
+///   `26/10/19,23:02:41+00`，与主机 UTC 同刻）—— 减 0，无所谓；
+/// - **违规的**：值是 UTC 但后缀报 `+32`（RM520N/EM05/MT5700 等一批，见怪癖表）——
+///   按 3GPP 减 8 小时反而**错**，这种固件必须忽略后缀；
+/// - **报本地时间的**：值是本地时间、后缀 `+32` 正确（FM160 实测）——
+///   必须减 8 小时才是 UTC。
+///
+/// 所以正确做法是：**默认按 3GPP 减后缀**（对未知模组最不容易错），
+/// 只有怪癖表标记 `ignore_cclk_tz` 的违规固件才跳过。这就是
+/// [`parse_cclk_tz`] 与怪癖表 `ignore_cclk_tz` 字段的真实接入。
+pub fn parse_cclk_tz(field: &str) -> Option<(i64, i64)> {
+    let field = field.trim().trim_matches('"');
+    let (date, rest) = field.split_once(',')?;
+    let time: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == ':')
+        .collect();
+    // 时区段：时间之后剩下的部分（形如 `+32` / `-05` / 空）
+    let tz = rest[time.len()..].trim();
+    let base = parse_cclk(&format!("{date},{time}"))?;
+    if tz.is_empty() {
+        return Some((base, 0));
+    }
+    let (sign, digits) = match tz.chars().next()? {
+        '+' => (1i64, &tz[1..]),
+        '-' => (-1i64, &tz[1..]),
+        _ => return Some((base, 0)), // 不是 ±zz 就别猜
+    };
+    let units: i64 = digits.parse().ok()?;
+    let offset_min = sign * units * 15;
+    Some((base - offset_min * 60, offset_min))
+}
+
 pub fn parse_cclk(field: &str) -> Option<i64> {
     let field = field.trim().trim_matches('"');
     let (date, rest) = field.split_once(',')?;
@@ -612,7 +661,7 @@ mod tests {
     }
 
     use super::{
-        gtsen_sensor_name, operator_from_imsi, parse_cbc, parse_cclk, parse_cnum,
+        gtsen_sensor_name, operator_from_imsi, parse_cbc, parse_cclk, parse_cclk_tz, parse_cnum,
         parse_gtsenrdtemp, parse_iccid, parse_imsi, parse_qtemp, roam_state, round1,
     };
 
@@ -659,6 +708,37 @@ mod tests {
         assert_eq!(parse_cbc("+CBC: 0\r\nOK"), None);
         assert_eq!(parse_cbc("+CBC: 0,0\r\nOK"), None);
         assert_eq!(parse_cbc("ERROR"), None);
+    }
+
+    #[test]
+    fn cclk_tz_follows_3gpp_unless_quirked() {
+        // FM350 实测（本机）：+00，减 0，与 parse_cclk 一致
+        let (utc, off) = parse_cclk_tz("26/10/19,23:02:41+00").expect("fm350");
+        assert_eq!(off, 0);
+        assert_eq!(utc, parse_cclk("26/10/19,23:02:41").expect("base"));
+        // FM160 实测（上游证据）：报本地时间、+32 正确 → 减 8h 才是 UTC
+        let (utc, off) = parse_cclk_tz("26/09/29,22:25:46+32").expect("fm160");
+        assert_eq!(off, 8 * 60);
+        assert_eq!(utc, parse_cclk("26/09/29,22:25:46").expect("base") - 8 * 3600);
+        // 负偏移：-05 → 加 75 分钟
+        let (_, off) = parse_cclk_tz("26/01/01,12:00:00-05").expect("neg");
+        assert_eq!(off, -75);
+        // 没有后缀：偏移 0
+        let (utc, off) = parse_cclk_tz("26/01/01,12:00:00").expect("notz");
+        assert_eq!(off, 0);
+        assert_eq!(utc, parse_cclk("26/01/01,12:00:00").expect("base"));
+        // 垃圾后缀不猜
+        assert!(parse_cclk_tz("26/01/01,12:00:00xx").is_some(), "非 ±zz 原样返回");
+        assert_eq!(
+            parse_cclk_tz("26/01/01,12:00:00xx").map(|(u, o)| (u, o)),
+            parse_cclk("26/01/01,12:00:00").map(|u| (u, 0))
+        );
+        // 怪癖表：违规固件名单必须包含 RM520/EM05/MT5700/FM650（上游实测）
+        assert!(crate::modem::quirk::ignore_cclk_tz("RM520N-GL"));
+        assert!(crate::modem::quirk::ignore_cclk_tz("EM05"));
+        assert!(crate::modem::quirk::ignore_cclk_tz("MT5700M-CN"));
+        assert!(crate::modem::quirk::ignore_cclk_tz("FM350-GL"));
+        assert!(!crate::modem::quirk::ignore_cclk_tz("FM160-EAU"));
     }
 
     #[test]

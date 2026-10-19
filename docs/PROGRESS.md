@@ -3109,3 +3109,39 @@ QModem 的 `application/`（语音、短信转发、固件刷写、上行管理�
 1. 自动组网 15s 轮询改事件驱动（现有零写入幂等保护下收益小、竞态面大，缓做）；
 2. DNS 层诊断（有地址无路由已由 phase 覆盖，DNS 待实机复现）；
 3. `route_pending` 实机复现（临时降 metric 把默认路由挪走，需要维护窗口）。
+
+
+---
+
+## 50. 待办清零：CCLK 3GPP 时区 + 路由按族判定（2026-10-20，1.0.0-10）
+
+§49 留下的三件待办全部实机做完。
+
+### 50.1 `ignore_cclk_tz` 接入（语义以实机为准）
+
+FM350 实测 `+CCLK: 26/10/19,23:02:41+00` 与主机 UTC 同刻 → 后缀正确。
+**接入方式：默认按 3GPP 减 `±zz`（parse_cclk_tz），怪癖表违规固件跳过**。
+与 §49.4 担心的相反：本机行为零变化（+00 减 0）；变化只在 FM160 类
+「报本地时间」的型号上，修正后 clock_skew 不再 +8h。
+
+### 50.2 `route_pending` 复现 + v4/v6 混判修复
+
+删 eth2 v4 默认路由（frp 走 eth1 不断连）→ `phase=route_pending` ✓。
+第一次复现 phase 仍 online：eth2 的 **v6 默认路由不受 v4 删除影响**，
+`has_default_via` 混判两张表。修复：`has_default_via_family()` 按族判，
+phase 计算改为「有 v4 地址要求 v4 路由、有 v6 地址要求 v6 路由」。
+另实测 netifd 会在 ~3s 内重装被外部删除的 static 路由。
+
+### 50.3 DNS 盘点：无缺陷
+
+modem0（static）无 dns/peerdns → DNS 走 eth1 上游；纯模组机器由
+peerdns/static dns 提供，netifd 常规行为，不改代码。
+
+### 50.4 验证
+
+| 项 | 结果 |
+| --- | --- |
+| `cargo test` | ✅ 689 passed / 0 failed（新增 9） |
+| CCLK 实机 | ✅ FM350 +00，两种路径结果一致（行为零变化） |
+| route_pending | ✅ 实机复现并持续稳定；恢复后 online + ping 0% 丢包 |
+| 实机状态 | ✅ 已恢复原状（顺手清掉了 metric 50 的遗留路由，比实验前更干净） |
