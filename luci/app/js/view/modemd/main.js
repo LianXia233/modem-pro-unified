@@ -1,13 +1,17 @@
 'use strict';
 'require view';
 'require ui';
-'require poll';
+'require fs';
 
 /* 5G 终端主页面：页内 Tab 菜单（设备中心 / 拨号 / 基站 / 锁网 / 短信 / 工具 / 模块 / 服务）。
  *
  * 为什么不把 8 个页面继续挂在菜单树里：
  *   设备固件（ImmortalWrt SNAPSHOT）的 ucode dispatcher 只有 firstchild 一种子菜单渲染，
  *   8 个子页面会全部平铺进侧栏；改成 Tab 后菜单只有一个入口，页内切换。
+ *
+ * 与 modemd 原生 WebUI（:9527）的关系：
+ *   **共存但不内嵌** —— 本页所有内容都是原生 LuCI JS 渲染，不加载任何 WebUI 资源；
+ *   Tab 栏旁保留一个「打开 WebUI」跳转按钮（新窗口），供过渡期对照使用。
  *
  * 实现方式：本视图只做 Tab 骨架，各功能页仍是独立的 view 模块
  * （view/modemd/*.js），按需 `L.require` 动态加载并 render ——
@@ -38,11 +42,15 @@ function currentTab() {
 
 return view.extend({
 	load: function () {
-		return Promise.resolve();
+		/* 端口从 config.toml 解析（服务控制页可改）；读不到回落 9527 */
+		return fs.read('/etc/modemd/config.toml').catch(function () { return ''; });
 	},
 
-	render: function () {
+	render: function (data) {
 		var self = this;
+		var m = /\[server\][\s\S]*?listen\s*=\s*["']?[^"'\n]*:(\d+)/.exec(data || '');
+		var port = m ? m[1] : '9527';
+		var webui = 'http://' + window.location.hostname + ':' + port + '/';
 
 		var bar = E('div', {
 			'id': 'md-tabbar',
@@ -52,9 +60,19 @@ return view.extend({
 		var body = E('div', { 'id': 'md-body' }, []);
 
 		var root = E('div', { 'class': 'cbi-map' }, [
-			E('h2', {}, '5G 终端'),
+			E('h2', { 'style': 'display:flex;align-items:center;gap:12px;flex-wrap:wrap' }, [
+				'5G 终端',
+				/* 共存期辅助：新窗口打开 modemd 原生 WebUI（本页不内嵌它的任何资源） */
+				E('a', {
+					'class': 'btn cbi-button cbi-button-action',
+					'href': webui,
+					'target': '_blank',
+					'rel': 'noopener noreferrer',
+					'title': '在新窗口打开 modemd 原生 WebUI（:' + port + '）'
+				}, '打开 WebUI ↗')
+			]),
 			E('div', { 'style': 'font-size:12px;color:#888' },
-				'由 modemd（modem-pro）提供；Tab 内数据按需加载，慢操作走后台任务。'),
+				'本页由 LuCI 原生渲染（不加载 WebUI 资源）；Tab 内数据按需加载，慢操作走后台任务。'),
 			bar,
 			body
 		]);

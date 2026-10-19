@@ -149,7 +149,6 @@ define Package/modem-pro/install
 	# 已退役 Lua 世代，所以菜单标题就是这里的英文原文）；页面能力在
 	# js/view/ 里，鉴权端点在 ucode/controller/ 里。
 	$(INSTALL_DIR) $(1)/usr/share/ucode/luci/controller
-	$(INSTALL_DATA) $(CURDIR)/luci/app/ucode/controller/modemd_auth.uc $(1)/usr/share/ucode/luci/controller/modemd_auth.uc
 	$(INSTALL_DATA) $(CURDIR)/luci/app/ucode/controller/modemd_api.uc $(1)/usr/share/ucode/luci/controller/modemd_api.uc
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/modemd
 	$(INSTALL_DATA) $(CURDIR)/luci/app/js/view/modemd/*.js $(1)/www/luci-static/resources/view/modemd/

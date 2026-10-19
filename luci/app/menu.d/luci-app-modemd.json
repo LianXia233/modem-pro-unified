@@ -12,19 +12,6 @@
 			]
 		}
 	},
-	"admin/modemd_auth/session": {
-		"action": {
-			"type": "function",
-			"module": "luci.controller.modemd_auth",
-			"function": "action_session"
-		},
-		"auth": {
-			"methods": [
-				"cookie:sysauth_https",
-				"cookie:sysauth_http"
-			]
-		}
-	},
 	"admin/modemd_api/proxy": {
 		"action": {
 			"type": "function",
