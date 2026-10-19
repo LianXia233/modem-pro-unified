@@ -36,7 +36,14 @@ PKG_USE_MIPS16:=0
 #   · 前置：宿主已 `rustup target add aarch64-unknown-linux-musl`；
 #   · MODEM_PRO_CARGO_TARGET_DIR 可指向仓库外的稳定目录（如 CI 的 .cargo-target），
 #     让 cargo 复用上次的编译产物。
-MODEM_PRO_HOST_RUST ?= 0
+#   开关取值来源（按优先级）：
+#     ① 命令行 / 环境变量：本地或 CI 直接 `MODEM_PRO_HOST_RUST=1 make ...`；
+#     ② 都没有时回退到 .config 符号 CONFIG_MODEM_PRO_HOST_RUST。
+#   为何需要 ②：OpenWrt 的**包元数据扫描在子 make 里进行**，命令行变量不一定能传进去；
+#   扫描阶段一旦看不到本开关，就会把 rust/host 当作构建依赖，又跑去源码编译 rustc + LLVM
+#   （正是要绕开的那 1~2 小时）。而 .config 由 rules.mk 在解析每个包 Makefile 时读取，
+#   扫描阶段一定可见，故 ② 最稳；CI 用 ②，本地两条都行。
+MODEM_PRO_HOST_RUST ?= $(if $(filter y,$(CONFIG_MODEM_PRO_HOST_RUST)),1,0)
 MODEM_PRO_RUST_TARGET:=aarch64-unknown-linux-musl
 MODEM_PRO_CARGO_TARGET_DIR ?= $(PKG_BUILD_DIR)/rust/target
 
@@ -112,6 +119,11 @@ endef
 # 子选项内联在此（OpenWrt 包内 config 机制，生成 CONFIG_MODEM_PRO_* 符号，
 # 被 Build/Compile 的 $(if $(CONFIG_MODEM_PRO_*),...) 引用决定各家拨号器是否编译）。
 define Package/modem-pro/config
+	config MODEM_PRO_HOST_RUST
+		bool "用宿主 rustup 工具链直编 modemd（跳过 feeds 的 rust/host 源码编译）"
+		depends on PACKAGE_modem-pro
+		default n
+
 	config MODEM_PRO_QUECTEL
 		bool "打包移远 Quectel 拨号器 (quectel-CM)"
 		depends on PACKAGE_modem-pro

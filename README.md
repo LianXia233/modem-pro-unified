@@ -40,6 +40,7 @@ echo "src-link modem-pro /path/to/modem-pro-unified" >> feeds.conf.default
 make menuconfig   # Network -> Modem Manager -> modem-pro
 make package/modem-pro/compile V=s                    # 默认：feeds 的 lang/rust
 make package/modem-pro/compile V=s MODEM_PRO_HOST_RUST=1   # 宿主 rustup 直编
+# 也可在 menuconfig 勾选「用宿主 rustup 工具链直编 modemd」（即 CONFIG_MODEM_PRO_HOST_RUST=y，等价）
 ```
 
 ## 文档

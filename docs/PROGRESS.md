@@ -7,7 +7,8 @@
 > - [`API.md`](./API.md)：对外接口契约。`INTEGRATION.md` / `BUILD.md`：整合方案与编译。
 >
 > 快照时间：2026-10-19 ｜ 分支 `main` ｜ 远端 `https://github.com/LianXia233/modem-pro-unified`
-> 最近提交：`0472de2`（fix(CI)：包 Makefile 必须位于 feed 子目录，修正 feeds 扫描失败真正根因）
+> 最近提交：云编译**真正**跳过 rust host（根因修复，见 §38）；
+> 此前 `96a06a8`（docs：致谢补充 350 系列参考工程 luci-app-fm350）
 > 工作区：广和通 FM350 / RW350 系列对齐 **P0-1（IPv6 归一化接进网络链路）、
 > P0-2（频段锁定写）均已完成、实机验证通过**（见 §16 / §17）；
 > **P0-3（IMEI 的 MFG 块备份）已按替代方案完成**（见 §20）；
@@ -2285,6 +2286,36 @@ Rust 独立模块实现。
 
 - `iana_offset` 把名字里的下划线误换成斜杠 —— `Asia/Hong_Kong` 整类认不出；
 - `query_addr` 的收发错误不带服务器名 —— 多服务器依次失败时日志对不上号。
+
+---
+
+## 38. 云编译真正跳过 rust host：根因修复（2026-10-19）
+
+**背景**：§7「编译提速」把 Rust 后端改成宿主工具链直编，声称绕开 `feeds/packages` 的
+rust/host（从源码编 rustc + LLVM，冷启动 1~2 小时）。但实测云编译仍卡在 `编译 modem-pro`
+步骤 ~58 分钟，日志里是 CMake `[2878/3710]` 在编 **LLVM**——也就是 rust/host 根本没被跳过。
+
+**根因**：`MODEM_PRO_HOST_RUST=1` 是 **make 命令行变量**。OpenWrt 的**包元数据扫描在子
+make 里进行**，该子 make 不保证继承命令行变量；扫描阶段看不到开关 → `HAVE_RUST:=1` →
+`PKG_BUILD_DEPENDS:=rust/host` 被写进包元数据 → 构建时照常从源码编 rustc + LLVM。
+（`.config` 里的 `CONFIG_MODEM_PRO_*` 能被保留，反而是可靠通道。）
+
+**修复**（两处，互为保险）：
+
+- **`Makefile`**：把开关同时做成 `.config` 符号——新增 `MODEM_PRO_HOST_RUST` 到
+  `Package/modem-pro/config`（默认 `n`），并用
+  `MODEM_PRO_HOST_RUST ?= $(if $(filter y,$(CONFIG_MODEM_PRO_HOST_RUST)),1,0)`
+  取值：命令行/环境变量优先，未给则回退 `.config`。`.config` 由 `rules.mk` 在解析每个包
+  Makefile 时读取，**扫描阶段一定可见**，故扫描侧不再误挂 rust/host；本地默认行为不变
+  （符号未设 → flag=0 → 仍走 feeds 路径）。
+- **`.github/workflows/build.yml`**：
+  - 选包配置追加 `CONFIG_MODEM_PRO_HOST_RUST=y`；
+  - 编译步骤把 `MODEM_PRO_HOST_RUST=1` / `MODEM_PRO_CARGO_TARGET_DIR` 从 **make 命令行参数**
+    改为 **make 之前的环境变量**（环境变量必被子 make 继承），双保险；
+  - 超时上限 60 → 90 分钟，给编 vendor 拨号器 + kmod 留余量（原 60 是被 LLVM 拖爆的）。
+
+**验证**：`?=` 取值三路（命令行 / 环境变量 / `.config`）用最小 make 用例逐一跑通；
+workflow YAML 通过解析校验。CI 侧由移动 `v1.0.0` 标签触发重编确认。
 
 ---
 

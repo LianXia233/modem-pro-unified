@@ -18,14 +18,21 @@
   - 版本号注入改走 `CARGO_PKG_VARS`（上游配方自带行首 `+`，外层再叠会展开出
     多余的 `+VAR=...` 被 shell 当命令执行）；
   - 新增 `MODEM_PRO_CARGO_TARGET_DIR`，可指向稳定目录以复用编译产物。
+  - 开关取值有**两种等价写法**（见 `docs/BUILD.md`）：命令行/环境变量
+    `MODEM_PRO_HOST_RUST=1`，或 `.config` 符号 `CONFIG_MODEM_PRO_HOST_RUST=y`。
+    后者供 CI 使用——**OpenWrt 的包元数据扫描在子 make 里进行，命令行变量不一定传得到**，
+    一旦扫描阶段看不到开关就会把 `rust/host` 当成构建依赖、又回到源码编 rustc + LLVM；
+    而 `.config` 由 `rules.mk` 解析时读取，扫描阶段一定可见，最稳。
 - **云编译流水线**（`.github/workflows/build.yml`）：
   - 新增「安装宿主 Rust 工具链」步骤（`rustup` minimal profile +
     `aarch64-unknown-linux-musl` target，版本由 `RUST_TOOLCHAIN` 固定）；
   - 缓存由 `dl/` + `staging_dir/host*` 改为 `~/.cargo/registry` + `~/.cargo/git` +
     `.cargo-target`，key 绑定 `rust/Cargo.lock` / `Makefile` / 本文件哈希；
   - feeds 更新只拉 `packages`/`luci`，不再安装 `lang/rust`；
-  - 编译传入 `MODEM_PRO_HOST_RUST=1` 与 `MODEM_PRO_CARGO_TARGET_DIR`；
-  - 超时由 240 分钟下调到 60 分钟。
+  - 选包配置追加 `CONFIG_MODEM_PRO_HOST_RUST=y`，编译步骤再以环境变量
+    `MODEM_PRO_HOST_RUST=1` + `MODEM_PRO_CARGO_TARGET_DIR` 双保险
+    （环境变量才保证被包元数据扫描的子 make 继承）；
+  - 超时由 240 分钟下调到 60 分钟，后又放宽到 90 分钟（编 vendor 拨号器 + kmod 需要余量）。
 - **文档**：`docs/BUILD.md`、`docs/INTEGRATION.md` 补充两种构建方式与切换方法。
 
 ### 云编译流水线 + LuCI 菜单汉化

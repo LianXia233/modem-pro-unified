@@ -10,12 +10,19 @@
 - 官方 SDK 或完整源码树（`openwrt-25.x`，与目标固件**同版本、同 target**）。
 - 主机侧需要联网拉取 crates（`rust/Cargo.lock` 已锁定版本）。
 
-Rust 守护进程有两种编译方式，按 `MODEM_PRO_HOST_RUST` 切换：
+Rust 守护进程有两种编译方式，按**宿主直编开关**切换。开关有两种等价写法，任选：
+
+- 命令行 / 环境变量：`MODEM_PRO_HOST_RUST=1`（本地常用）；
+- `.config` 符号：`CONFIG_MODEM_PRO_HOST_RUST=y`（**CI 用这条**，menuconfig 里也能勾）。
+
+> 为何提供 `.config` 写法：OpenWrt 的**包元数据扫描在子 make 里进行**，命令行变量不一定
+> 传到扫描进程；而 `.config` 由 `rules.mk` 在每个包 Makefile 解析时读取，扫描阶段一定可见。
+> 若扫描阶段看不到开关，就会把 `rust/host` 当成构建依赖，又去源码编译 rustc + LLVM。
 
 | 方式 | 开关 | 依赖 | 说明 |
 | --- | --- | --- | --- |
-| feeds 工具链（默认） | `MODEM_PRO_HOST_RUST=0` | `feeds/packages` 的 `lang/rust` | OpenWrt 从源码编译 rustc + LLVM，**冷启动 1~2 小时**；产物随构建树 |
-| 宿主直编 | `MODEM_PRO_HOST_RUST=1` | 宿主 `rustup` + `aarch64-unknown-linux-musl` target | 跳过 rust 源码编译，几分钟级；产出静态 musl 二进制；CI 走这条 |
+| feeds 工具链（默认） | 不设（`=0`） | `feeds/packages` 的 `lang/rust` | OpenWrt 从源码编译 rustc + LLVM，**冷启动 1~2 小时**；产物随构建树 |
+| 宿主直编 | `MODEM_PRO_HOST_RUST=1` 或 `CONFIG_MODEM_PRO_HOST_RUST=y` | 宿主 `rustup` + `aarch64-unknown-linux-musl` target | 跳过 rust 源码编译，几分钟级；产出静态 musl 二进制；CI 走这条 |
 
 **默认（feeds）方式**需启用 `feeds/packages`（提供 `lang/rust` 工具链）：
 
@@ -69,6 +76,7 @@ echo "src-git modem-pro https://github.com/LianXia233/modem-pro-unified.git" >> 
 ```sh
 make menuconfig
 # Network -> Modem Manager -> <*> modem-pro
+#   ├─ [ ] 用宿主 rustup 工具链直编 modemd（跳过 feeds 的 rust/host 源码编译）
 #   ├─ <*> 打包移远 Quectel 拨号器 (quectel-CM)
 #   ├─ <*> 打包广和通 Fibocom 拨号器 (fibocom-dial)
 #   ├─ <*> 打包美格 Meig 拨号器 (meig-cm)
@@ -89,10 +97,14 @@ make package/feeds/modem-pro/modem-pro/compile V=s
 make package/modem-pro/{clean,compile} V=s
 ```
 
-宿主直编（跳过 feeds 的 rust 源码编译，推荐）：
+宿主直编（跳过 feeds 的 rust 源码编译，推荐），二选一：
 
 ```sh
+# ① 命令行 / 环境变量（本地常用）
 make package/modem-pro/compile V=s MODEM_PRO_HOST_RUST=1
+
+# ② 或先在 menuconfig 勾选 modem-pro → 「用宿主 rustup 工具链直编 modemd」
+#    （即 CONFIG_MODEM_PRO_HOST_RUST=y，效果与 ① 相同）
 ```
 
 > `MODEM_PRO_CARGO_TARGET_DIR` 可指向一个稳定目录（默认 `$(PKG_BUILD_DIR)/rust/target`），
@@ -196,9 +208,10 @@ feeds → 选包配置 → 编译（V=s）→ 收集产物 + SHA256 → 上传 a
 
 要点：
 - **触发**：推 `v*` 标签（编译 + 自动建 Release 上传产物）或手动 `workflow_dispatch`（只编译）；
-- **Rust 走宿主工具链**：`MODEM_PRO_HOST_RUST=1`，宿主 `rustup` + 官方
-  `aarch64-unknown-linux-musl` target 交叉编译，**不再**从源码编译 rust host 工具链
-  （原路冷启动 1~2 小时），也不再安装 feeds 的 `lang/rust`；
+- **Rust 走宿主工具链**：`.config` 里 `CONFIG_MODEM_PRO_HOST_RUST=y`（并在编译步骤用
+  环境变量 `MODEM_PRO_HOST_RUST=1` 双保险——OpenWrt 的元数据扫描在子 make 里跑，环境变量
+  才保证被继承），宿主 `rustup` + 官方 `aarch64-unknown-linux-musl` target 交叉编译，
+  **不再**从源码编译 rust host 工具链（原路冷启动 1~2 小时），也不再安装 feeds 的 `lang/rust`；
 - **缓存**：`~/.cargo/registry` + `~/.cargo/git` + `.cargo-target`（cargo 依赖与编译产物），
   key 绑定 `rust/Cargo.lock` / `Makefile` / workflow 文件哈希，二次起只需几分钟；
 - **odhcp6c stub**：SDK 不带 base 包源码，`DEPENDS:+odhcp6c` 由本地 stub feed

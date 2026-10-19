@@ -48,7 +48,7 @@ jobs:
   build:
     name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -188,6 +188,7 @@ jobs:
         run: |
           cat >> .config <<'EOF'
           CONFIG_PACKAGE_modem-pro=y
+          CONFIG_MODEM_PRO_HOST_RUST=y
           CONFIG_MODEM_PRO_QUECTEL=y
           CONFIG_MODEM_PRO_FIBOCOM=y
           CONFIG_MODEM_PRO_MEIG=y
@@ -204,10 +205,12 @@ jobs:
           set -o pipefail
           # MODEM_PRO_HOST_RUST=1              —— 宿主 rustup 工具链直编，跳过 feeds 的 rust 源码编译
           # MODEM_PRO_CARGO_TARGET_DIR         —— 固定到工作区，给上面的 cargo 缓存复用编译产物
-          make package/modem-pro/compile V=s -j"$(nproc)" \
-            MODEM_PRO_HOST_RUST=1 \
-            MODEM_PRO_CARGO_TARGET_DIR="$GITHUB_WORKSPACE/.cargo-target" \
-            2>&1 | tee build.log
+          # 变量放在 make 之前（= 环境变量）而非 make 命令行参数：OpenWrt 的包元数据扫描
+          # 在子 make 里跑，环境变量必然被继承，命令行参数则不保证传到扫描进程；
+          # 开关另在 .config 里有 CONFIG_MODEM_PRO_HOST_RUST=y 兜底（见上一步），双保险。
+          MODEM_PRO_HOST_RUST=1 \
+          MODEM_PRO_CARGO_TARGET_DIR="$GITHUB_WORKSPACE/.cargo-target" \
+          make package/modem-pro/compile V=s -j"$(nproc)" 2>&1 | tee build.log
 
       - name: 收集产物 + 校验和
         working-directory: sdk
