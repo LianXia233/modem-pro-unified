@@ -7258,7 +7258,7 @@ const parseBands = s => String(s).split(/[:,、\s]+/).map(x => parseInt(x, 10)).
 /* ---------- 锁频段：按型号支持的组自动排版 + 勾选（含每组的「不限制」） ----------
    数据来自 /api/lock/status：
      · band_groups —— 后端按「清单 + 运行期设备上报」整理好的可勾选组
-       （见 module/bands 的 LockStatus.BandGroups）；每组的 tech 就是下发时用的技术域
+       （见 rust/src/modem/bands.rs 的 bands::groups）；每组的 tech 就是下发时用的技术域
        频段列表 = 清单的全部支持频段 ∪ 设备能力 ∪ 设备当前锁定值
        ⇒ 取消勾选并下发后，那个频段**仍留在列表里**（还能勾回来），列表不会越用越少。
      · band_lte / band_nr / band_nr_nsa 的 .bands / .locked —— 设备**当前**配置的频段
@@ -7376,7 +7376,7 @@ function renderBandGroups() {
     const cm = curModem() || {};
     const model = cm.model || '（未识别型号）';
     box.innerHTML = `<div class="muted">本机型号 <code>${esc(model)}</code> 在
-      <code>module/kernel/modem_bands.json</code>（型号 → 支持频段 的唯一数据源）里没有频段记录，
+      <code>rust/src/modem/modem_bands.json</code>（型号 → 支持频段 的唯一数据源）里没有频段记录，
       也读不到设备上报的频段能力 ⇒ 这一页没有可勾选的频段。<br>
       要让它按模块显示：在 <code>modem_bands.json</code> 里给这个型号加一条
       （<code>model</code> 用型号小写、<code>lte</code> / <code>nr_nsa</code> / <code>nr_sa</code> 填该型号支持的频段；

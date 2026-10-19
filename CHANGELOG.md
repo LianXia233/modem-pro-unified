@@ -4,6 +4,23 @@
 
 ## [未发布]
 
+### 移植 QModem 频段表：型号 → 支持频段（92 条）
+
+`/api/modules` 的 `bands` 之前是空的（页面显示「未提供」），锁频段页的
+`band_groups` / `declared` 也没有后端赋值 —— 前端这两块实际是死的。本轮补齐：
+
+- **内嵌频段表** `rust/src/modem/modem_bands.json`（92 条记录 / 89 条有频段 / 68 条支持 NR），
+  逐字取自 QModem `modem_support.json`，按 MPL-2.0 使用（文件头注明）。
+- **`modem/bands.rs`**：四组频段（WCDMA / LTE / NR-NSA / NR-SA）、型号匹配
+  （去分隔符 + 最长优先 + ≤4 字符词边界 + 别名同权）、三态说明
+  （没登记 / 上游没写 / 该制式没记录），以及按型号自动排版的 `groups()`。
+- **`/api/modules?model=` / `?modem_id=`**：`plan.bands` 给出四组频段，
+  `plan.bands_note` 说明来源与个数（`?modem_id=` 的匹配键带上 ATI 原文，别名也认）。
+- **`/api/lock/status`**：`band_lte` / `band_nr` / `band_nr_nsa` 新增 `declared` +
+  `declared_note`（出厂口径，与运行期 `capable` 并存对照）；新增 `bands` 与
+  `band_groups`（清单 ∪ 设备能力 ∪ 当前锁定值；分两套 NR 列表的方言才出 NSA / SA 两组）。
+- **前端**：修正「没有频段记录」提示里的旧路径（`module/kernel/…` → `rust/src/modem/…`）。
+
 ### 全量移植：逐型号 AT 指令面 + 厂商 × 平台变体表
 
 - **AT 指令面**（`rust/src/modem/atplan.rs`）：按上游 `modem_at_plan.go` 的字段契约

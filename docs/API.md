@@ -144,7 +144,7 @@
 platform_variant / platform_variant_note / in_catalog / live /
 usb_modes / pcie_modes / usb_text / pcie_text / cmd_impl / cmd_impl_note /
 lock_dialect / usb_dialect / mode_dialect / imei_dialect /
-commands[] / gaps[] / gap_notes[]`。
+bands / bands_note / commands[] / gaps[] / gap_notes[]`。
 
 `commands` 每条形如
 `{key,label,cmd,candidates?,enable_cmd?,parser,format,on,source,note?}`，
@@ -402,6 +402,43 @@ IPv6 开关（`{on}`，**必须显式给值**）：写回 `[net] wan_ipv6` 并�
 {"code":0,"data":{"modem_id":0,"cmd":"AT+CFUN=1,1","confirmed":false,
  "note":"指令已下发但未收到确认（重启会断开 AT 口，属预期）"},"msg":"ok"}
 ```
+
+### GET /api/lock/status
+锁网状态（`modem_id` 查询参数）。返回四块：
+
+```json
+{"code":0,"data":{
+  "modem_id":0,
+  "mode_pref":"AUTO","dialect":"qnw","dialect_name":"高通 QNW",
+  "separate_nsa":false,
+  "band_lte":{"tech":"LTE","bands":[3],"capable":[1,3,41],"locked":true,
+              "declared":[1,2,3,4,5,7,8,12,13,18,19,20,25,26,28,38,40,41,42],
+              "declared_note":"Modem-Pro 频段表（出厂口径）：支持 19 个 LTE 频段，可与上方「设备能力」对照"},
+  "band_nr":{"tech":"NR","bands":[],"capable":[78],"locked":false,
+             "declared":[1,3,7,8,20,28,38,40,77,78],"declared_note":"…"},
+  "bands":{"model":"fm350-gl","vendor":"fibocom","platform":"mediatek",
+           "wcdma":[1,2,5,8],"lte":[...],"nr_nsa":[...],"nr_sa":[...]},
+  "band_groups":[
+    {"key":"wcdma","title":"WCDMA（3G）","label":"WCDMA","tech":"","lockable":false,
+     "bands":[1,2,5,8],"declared":[1,2,5,8],"note":"只展示：…"},
+    {"key":"lte","title":"LTE（4G）","label":"LTE","tech":"LTE","lockable":true,
+     "bands":[1,2,3,...],"declared":[1,2,3,...]},
+    {"key":"nr","title":"NR（5G）","label":"NR","tech":"NR","lockable":true,
+     "bands":[1,3,7,8,20,28,38,40,77,78],"declared":[...],
+     "note":"NSA / SA 在设备侧是同一套频段（只有一条锁频段指令）"}
+  ]
+},"msg":"ok"}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `band_lte` / `band_nr` / `band_nr_nsa` | 单技术域状态：`bands` = 设备当前值，`capable` = 运行期读到的**设备能力**（固件不报时为空 + `capable_note`），`declared` = **清单出厂口径**（QModem 频段表），两者不一致正是排查信息 |
+| `declared_note` | 清单口径说明：型号没登记 / 上游没写频段 / 该制式没记录 / 支持 N 个 |
+| `bands` | 本型号四组支持频段（`wcdma/lte/nr_nsa/nr_sa`）；`null` = 不在频段表 |
+| `band_groups` | 锁频段页的可勾选分组（清单 ∪ 设备能力 ∪ 当前锁定值，按型号自动排版）。`tech` 是下发时用的技术域，空 = 本组只读；`lockable=false` 的组（WCDMA）只展示 |
+| `separate_nsa` | 本机方言的 NR 是否分 NSA / SA 两套列表：`true` 时 `band_groups` 出 `nr_nsa` + `nr_sa` 两组，否则只出一组 `nr`（设备侧只有一条锁频段指令） |
+
+> 分组频率列表**必须**含清单全集：少了它，用户取消勾选并下发后，那个频段会从页面消失、勾不回来。
 
 ### POST /api/lock/band
 锁频段 / 解除频段锁定。请求体 `{modem_id, tech, bands, unlock?}`：

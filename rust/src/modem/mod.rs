@@ -2,6 +2,7 @@
 
 pub mod at;
 pub mod atplan;
+pub mod bands;
 pub mod catalog;
 mod discovery;
 pub mod manager;

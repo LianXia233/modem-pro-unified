@@ -21,6 +21,7 @@
 
 use serde::Serialize;
 
+use crate::modem::bands;
 use crate::modem::catalog;
 use crate::modem::variant;
 use crate::modem::vendor::Vendor;
@@ -120,6 +121,13 @@ pub struct ModemAtPlan {
     pub pcie_modes: Vec<String>,
     pub usb_text: String,
     pub pcie_text: String,
+    /// 本型号的支持频段（QModem 频段表，出厂口径）。
+    ///
+    /// `None` = 型号不在频段表里；`Some` 但四组全空 = 在表里、上游没写频段 ——
+    /// 两种都不是「不支持任何频段」，`bands_note` 里有明确说法。
+    pub bands: Option<bands::ModemBands>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub bands_note: String,
     pub cmd_impl: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub cmd_impl_note: String,
@@ -387,18 +395,22 @@ pub fn for_model(model: &str, vendor_hint: Option<Vendor>, live: bool) -> ModemA
     if vendor == Vendor::Huawei && (upper.contains("MT5700") || upper.contains("MT5710")) {
         vendor = Vendor::TDTech;
     }
-    build(model, vendor, entry, live)
+    build(model, model, vendor, entry, live)
 }
 
 /// 按在网模组推导（`?modem_id=`）。
 pub fn for_modem(modem: &crate::modem::model::Modem) -> ModemAtPlan {
     let model = modem.model().unwrap_or_default();
     let entry = catalog::lookup(&model);
-    build(&model, modem.vendor(), entry, true)
+    // 频段表的匹配键带上 ATI 原文：有些固件只在原文里报别名（如 QogirN6Pro_PS）
+    let key = format!("{} {}", model, modem.model_raw().unwrap_or_default());
+    build(&model, &key, modem.vendor(), entry, true)
 }
 
 fn build(
     model: &str,
+    // 频段表匹配键（型号 + ATI 原文；离线时与 `model` 相同）。
+    key: &str,
     vendor: Vendor,
     entry: Option<&'static catalog::Entry>,
     live: bool,
@@ -513,6 +525,8 @@ fn build(
         pcie_modes: entry.map(|e| e.pcie.clone()).unwrap_or_default(),
         usb_text: entry.map(|e| e.usb_text()).unwrap_or_else(|| "—".into()),
         pcie_text: entry.map(|e| e.pcie_text()).unwrap_or_else(|| "—".into()),
+        bands: bands::lookup(key).cloned(),
+        bands_note: bands::note_for(key),
         cmd_impl: format!("rust::modem::vendor::{}", vendor.as_str()),
         cmd_impl_note: "指令来自厂商模块；USB/PCIe 切换来自 QModem 型号清单".into(),
         lock_dialect: var.map(|v| v.lock.to_string()).unwrap_or_default(),
@@ -566,6 +580,27 @@ mod tests {
         assert_eq!(p.platform_variant, "华为 · 海思巴龙");
         let imei = p.commands.iter().find(|c| c.key == "imei_set").unwrap();
         assert!(imei.cmd.contains("PHYNUM"));
+    }
+
+    #[test]
+    fn plan_carries_declared_bands() {
+        // 有频段数据：四组数组 + 说明
+        let p = for_model("FM350-GL", None, false);
+        let b = p.bands.as_ref().expect("FM350-GL 在频段表里");
+        assert_eq!(b.lte.len(), 19);
+        assert!(b.nr_sa.contains(&78));
+        assert!(p.bands_note.contains("LTE 19 个"), "{}", p.bands_note);
+
+        // 在表里但上游没写频段：bands 有值、四组为空，说明不是「不支持」
+        let p = for_model("T99W640", None, false);
+        let b = p.bands.as_ref().expect("T99W640 在频段表里");
+        assert!(!b.has_bands());
+        assert!(p.bands_note.contains("没写频段"), "{}", p.bands_note);
+
+        // 不在表里：bands=None，说明是「没登记」
+        let p = for_model("XYZ-9999", Some(Vendor::Quectel), false);
+        assert!(p.bands.is_none());
+        assert!(p.bands_note.contains("没登记"), "{}", p.bands_note);
     }
 
     #[test]

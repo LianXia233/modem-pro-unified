@@ -15,6 +15,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::error::{msg, Result};
+use crate::modem::bands;
 
 use super::super::at::{csv, is_ok};
 use super::super::vendor::Vendor;
@@ -30,6 +31,16 @@ pub struct BandLock {
     pub raw_value: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capable_note: Option<String>,
+    /// 清单（QModem 频段表）声明本型号支持的该制式频段 —— **出厂口径**。
+    ///
+    /// 与 `capable` 的区别：`capable` 是运行期问模组（固件不报就只有 `-`），
+    /// 这份是型号级快照。两者不一致（固件被裁频段、或上游写错）正是排查要看的信息，
+    /// 所以两个都展示、不互相覆盖。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub declared: Vec<i32>,
+    /// 清单口径的说明（说清是「上游没登记」「上游没写频段」还是「该制式没记录」）。
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub declared_note: String,
 }
 
 /// 小区/频点锁定状态（与界面三个选项一一对应）。
@@ -69,6 +80,15 @@ pub struct LockStatus {
     pub band_nr_nsa: Option<BandLock>,
     #[serde(skip_serializing_if = "is_false")]
     pub separate_nsa: bool,
+    /// 本型号的四组支持频段（清单口径：WCDMA / LTE / NR-NSA / NR-SA）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bands: Option<bands::ModemBands>,
+    /// 锁频段页要渲染的分组（清单 ∪ 设备上报，自动排版；规则见 [`bands::groups`]）。
+    ///
+    /// ⚠️ 必须由 [`Modem::query_lock_status`] 赋值：前端只读 JSON 的 `band_groups`，
+    /// 漏掉赋值不会编译报错，只表现为「所有机型的锁频段页永远没有勾选框」。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub band_groups: Vec<bands::BandGroup>,
 }
 
 fn is_false(v: &bool) -> bool {
@@ -321,19 +341,22 @@ impl Modem {
     fn query_lock_status(&self) -> LockStatus {
         let info = self.lock_dialect();
         let Some(d) = info.dialect else {
-            return LockStatus {
+            let mut st = LockStatus {
                 modem_id: self.id,
                 queried_at: crate::logging::timestamp(),
                 note: Some("该厂商的固件不支持锁网指令".to_string()),
                 ..Default::default()
             };
+            // 锁不了也要告诉用户「这个型号出厂支持哪些频段」，而不是一片空白
+            self.apply_declared_bands(&mut st);
+            return st;
         };
         let policy = self.query_policy_bands(d);
         let mode_pref = self.query_mode_pref(d);
         let band_nr_nsa = d
             .nsa_independent()
             .then(|| self.query_band_lock(d, "NRNSA", policy.nr_nsa.clone()));
-        LockStatus {
+        let mut st = LockStatus {
             modem_id: self.id,
             queried_at: crate::logging::timestamp(),
             mode_pref,
@@ -348,7 +371,65 @@ impl Modem {
             dialect_note: info.note,
             band_nr_nsa,
             separate_nsa: d.nsa_independent(),
+            ..Default::default()
+        };
+        self.apply_declared_bands(&mut st);
+        st
+    }
+
+    /// 把「清单声明支持的频段」贴到锁网状态上，并整理锁频段页的分组。
+    ///
+    /// 三种数据来源各有用途，**都要保留**：
+    ///
+    /// | 来源 | 性质 | 用途 |
+    /// | --- | --- | --- |
+    /// | `declared`（本函数） | 出厂口径（QModem 频段表） | 告诉用户「能勾什么」，并对照固件能力 |
+    /// | `capable` | 运行期问模组（policy_band） | 判断是否真的被限制；固件不报就空 |
+    /// | `bands` | 运行期读当前锁定值 | 勾选状态的初始值 |
+    ///
+    /// 分组时三者取并集：少了清单，取消勾选下发后那个频段会从列表消失（勾不回来）；
+    /// 少了运行期值，清单没数据/固件不报能力的机型会一条都显示不出来。
+    fn apply_declared_bands(&self, st: &mut LockStatus) {
+        // 匹配键带上 ATI 原文：有些固件只在原文里报别名（如 QogirN6Pro_PS）
+        let key = format!(
+            "{} {}",
+            self.model().unwrap_or_default(),
+            self.model_raw().unwrap_or_default()
+        );
+        let declared = bands::lookup(&key).cloned();
+
+        for (bl, tech) in [
+            (&mut st.band_lte, bands::Tech::Lte),
+            (&mut st.band_nr, bands::Tech::Nr),
+        ] {
+            let d = bands::declared(&key, tech);
+            bl.declared = d.bands;
+            bl.declared_note = d.note;
         }
+        if let Some(bl) = st.band_nr_nsa.as_mut() {
+            let d = bands::declared(&key, bands::Tech::NrNsa);
+            bl.declared = d.bands;
+            bl.declared_note = d.note;
+        }
+
+        let (lte_capable, lte_current) = (st.band_lte.capable.clone(), st.band_lte.bands.clone());
+        let (nr_capable, nr_current) = (st.band_nr.capable.clone(), st.band_nr.bands.clone());
+        let (nsa_capable, nsa_current) = st
+            .band_nr_nsa
+            .as_ref()
+            .map(|b| (b.capable.clone(), b.bands.clone()))
+            .unwrap_or_default();
+        st.band_groups = bands::groups(&bands::BandState {
+            declared: declared.as_ref(),
+            separate_nsa: st.separate_nsa,
+            lte_capable: &lte_capable,
+            lte_current: &lte_current,
+            nr_capable: &nr_capable,
+            nr_current: &nr_current,
+            nsa_capable: &nsa_capable,
+            nsa_current: &nsa_current,
+        });
+        st.bands = declared;
     }
 
     /// 探测锁网指令支持情况（全部只读）。

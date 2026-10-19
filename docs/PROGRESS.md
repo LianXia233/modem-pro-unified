@@ -2445,7 +2445,7 @@ gnu89 模式下上述两类都不再是错误，**一个开关同时解决两类
 - 线协议有 golden-bytes 与真实布局断言（QMI 13 字节头、WDA TLV 顺序、MBIM 48 字节命令头）；
 - 另有一条**假设备端到端用例**：socketpair 冒充 `/dev/cdc-wdm`，逐帧核对 QMAP 会话的
   请求顺序（Sync → ClientID×3 → SetDataFormat → BindMux×2 → Start×2 → Runtime）与 client id 归属；
-- `cargo test` **573 项全绿**、`cargo clippy --all-targets` 零告警、`cargo build` 零告警；
+- `cargo test` **593 项全绿**、`cargo clippy --all-targets` 零告警、`cargo build` 零告警；
 - 切换后**接口形态不变**：地址/DNS/默认路由仍由 netifd 的 `proto=modem_pro` 取，
   内置后端只做「数据呼叫生命周期」，与外部拨号器的职责边界一致。
 
@@ -2503,7 +2503,7 @@ gnu89 模式下上述两类都不再是错误，**一个开关同时解决两类
 | 逐型号 AT 指令面 | `modem_at_plan.go`（35K） | **已移植**：`modem/atplan.rs` + 各厂商 `at_plan_commands()`（20+ 能力） | ✅ 字段契约一致；差异见下 |
 | 平台变体表 | `module/variant`（22 条） | **已移植**：`modem/variant.rs`（家族/平台档 + 22 条变体 + 方言名） | ✅ 判定与上游同序 |
 | 主机磁盘占用 | `hostdisk`（statfs） | 未实现 | 屏端少一个指标，不影响业务 |
-| 频段表 | `module/bands`（QModem 频段表） | 未移植 | `plan.bands` 暂缺，页面显示「未提供」 |
+| 频段表 | `module/bands`（92 条） | **已移植**：`modem/bands.rs` + `modem_bands.json`（四组频段、别名匹配、锁频段分组） | ✅ |
 
 ### 42.4 QModem 里没抄的部分（明确不适用/不做）
 
@@ -2515,6 +2515,44 @@ gnu89 模式下上述两类都不再是错误，**一个开关同时解决两类
 
 QModem 为 MPL-2.0；`rust/src/modem/modem_catalog.json` 与 `catalog.rs` 的数据/解析
 按 MPL-2.0 使用，文件头已注明；仓库其余代码保持 MIT。
+
+---
+
+## 43. 移植 QModem 频段表（2026-10-19）
+
+上一轮补了指令面与变体表，频段表仍是空的 —— 后果不只是「页面少一栏」：
+
+| 前端位置 | 依赖字段 | 之前的实际表现 |
+| --- | --- | --- |
+| 支持模块页 `bandText(p.bands, p.bands_note)` | `plan.bands` / `plan.bands_note` | 永远显示「未提供」 |
+| 锁网状态卡「清单支持」 | `band_lte.declared` / `declared_note` | 永远显示 `-` |
+| 锁频段页勾选芯片 | `band_groups` | 永远为空 → 页面提示「型号没有频段记录」 |
+
+本轮三个都接上。
+
+### 43.1 数据
+
+`rust/src/modem/modem_bands.json`（27K，内嵌）：**92 条记录**，其中 89 条有频段、
+68 条支持 NR；3 条（T99W175/T99W373/T99W640）上游没写频段 —— 这是**数据事实**，
+接口与页面都按「上游没写，不代表不支持」表达，不填 0、不猜。
+
+来源：QModem `modem_support.json`（MPL-2.0）；`docs/support_list.md` 只是它的摘要，
+**不含频段列**，所以不能从 md 生成。
+
+### 43.2 实现（`rust/src/modem/bands.rs`）
+
+| 能力 | 做法 |
+| --- | --- |
+| 型号匹配 | 与支持清单同规则：去分隔符归一 + **最长优先**；≤4 字符要求词边界（`S10` 不命中 `S100`）；≥5 字符允许 ATI 连写（`RM520NGLAAR03A03M4G`）；别名同权（`QogirN6Pro_PS` → `f50-mu300`） |
+| 三态说明 | 没登记 / 上游没写 / 该制式没记录，三种文案分开（`declared_note`） |
+| 分组排版 | `groups()`：只出有频段的组；列表 = 清单 ∪ 设备能力 ∪ 当前锁定值；NR 默认一组，方言分两套时才出 NSA / SA 两组；WCDMA 只读 |
+| 运行期接入 | `query_lock_status()` 调 `apply_declared_bands()`；**锁网方言不支持时也照样贴**（至少能看到出厂支持哪些频段） |
+
+### 43.3 验证
+
+- `cargo test` **593 全绿**（频段表新增 6 条：数据形态、FM350/MT5700 取值、最长匹配与词边界、
+  三态说明、分组规则、无清单数据时降级）；
+- `cargo clippy --all-targets` 零告警。
 
 ---
 
