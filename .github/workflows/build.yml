@@ -50,7 +50,7 @@ env:
   TARGET: armsr/armv8
   PKG: modem-pro
   # 宿主 Rust 工具链（需与 rust/Cargo.toml 的 rust-version 兼容；升级时只改这里）
-  RUST_TOOLCHAIN: "1.92.0"
+  RUST_TOOLCHAIN: "1.93.0"
   # 宿主直编开关放到 job 级 env：OpenWrt 的**包元数据扫描发生在 feeds 步骤**（子 make 在
   # 每个包目录下 `make -r DUMP=1`），必须让它也看到本开关，否则扫描会把 rust/host 记为
   # modem-pro 的 Build-Depends，写进 tmp/.packageinfo 后被后续 make 复用，怎么设都白搭。
@@ -314,37 +314,12 @@ jobs:
       - name: 发布 Release
         uses: softprops/action-gh-release@v3
         with:
+          # 产物日志：手写的发版说明（版本亮点 / 产物清单 / 升级注意 / 已知边界），
+          # 比自动生成的 commit 列表有用。每次发版先更新仓库根的 RELEASE_NOTES.md，
+          # 产物清单与安装命令也写在里面（不再用内联 body，避免两处维护）。
+          body_path: RELEASE_NOTES.md
           name: modem-pro ${{ github.ref_name }}
           draft: false
           prerelease: false
           generate_release_notes: true
           files: dist/*
-          body: |
-            modem-pro ${{ github.ref_name }}（OpenWrt 官方 SDK 云编译）
-
-            ## 产物说明
-
-            | 文件 | 适用于 |
-            | --- | --- |
-            | `modem-pro-*.apk`（`apk-mainline`） | OpenWrt 主线 / snapshots，包架构 **aarch64_generic**（A53/A55/A72 等通用） |
-            | `modem-pro-*.apk`（`apk-filogic`） | OpenWrt 主线 / snapshots，包架构 **aarch64_cortex-a53**（MT7981/7986 等 filogic 设备；`apk --print-arch` 为 `aarch64_cortex-a53` 时选它） |
-            | `modem-pro_*.ipk` | OpenWrt 24.10.x（opkg 包管理器） |
-
-            > 两个 APK 内容相同（同一份静态 musl 二进制、无内核模块），只是包架构标签不同。
-            > apk 会拒绝架构不匹配的包（`error: uninstallable / arch: …`），按设备
-            > `apk --print-arch` 的输出选对应文件即可。
-
-            两者均为 **aarch64_generic**（Cortex-A53 及以上 64 位通用，无内核模块依赖），
-            内含 modemd 守护进程、四家厂商拨号器、netifd 协议脚本与 LuCI 前端（菜单已汉化）。
-
-            ## 安装
-
-            ```sh
-            # OpenWrt 25.x（apk）
-            apk add --allow-untrusted /tmp/modem-pro-*.apk
-
-            # OpenWrt 24.10（opkg）
-            opkg install /tmp/modem-pro_*.ipk
-            ```
-
-            完整安装验证清单见仓库 [docs/BUILD.md](../../blob/main/docs/BUILD.md)。
