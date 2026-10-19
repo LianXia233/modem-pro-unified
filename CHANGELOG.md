@@ -4,6 +4,21 @@
 
 ## [未发布]
 
+### 1.0.0-4：LuCI 子菜单修复 + 魔改主题适配
+
+- **恢复 8 个子菜单节点**（设备中心/拨号上网/基站扫描/锁网/短信/调试工具/支持模块/
+  服务控制）：单入口 + hash Tab 依赖主题的视图解析，在魔改主题下不可靠；
+  原生多子页形态在标准 LuCI 语义下稳定，菜单完整、功能对齐 WebUI。
+- **概览页加「打开 WebUI ↗」**：与 :9527 原生 WebUI 共存期的新窗口跳转
+  （端口从 config.toml 解析），页面本身不加载 WebUI 资源。
+- **删除 main.js**（单入口 Tab 骨架，随形态调整退役）。
+- **修复 ucode 代理**：`String.prototype.format` 不是 ucode API，改 `sprintf()`——
+  之前代理必 500，LuCI 所有数据请求失败（`ApiError` 的直接根因之一）。
+- **postinst 自愈**：升级后清 `/tmp/luci-indexcache*`、`/tmp/luci-menu.json`、
+  `/tmp/luci-modulecache`，并 touch 全部插件 JS/menu/acl 文件 —— 修复
+  「升级后菜单树/页面还是旧的」。
+- 实测（aurora 主题）：8 页全部渲染、菜单完整、快照数据正常、proxy 500 清零。
+
 ### WebUI/LuCI 共存口径定稿（1.0.0-3）
 
 - **LuCI 完整对齐 WebUI**：8 个 Tab（设备中心 / 拨号上网 / 基站扫描 / 锁网 / 短信 /

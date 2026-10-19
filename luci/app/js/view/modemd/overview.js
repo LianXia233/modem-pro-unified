@@ -2,6 +2,7 @@
 'require view';
 'require poll';
 'require ui';
+'require fs';
 'require modemd.api as api';
 'require modemd.store as store';
 'require modemd.task as task';
@@ -36,12 +37,17 @@ return view.extend({
 	load: function () {
 		return Promise.all([
 			api.get('/api/version'),
-			store.start(api)
+			store.start(api),
+			/* WebUI 端口：服务控制页可改；读不到回落 9527 */
+			fs.read('/etc/modemd/config.toml').catch(function () { return ''; })
 		]);
 	},
 
-	render: function () {
+	render: function (data) {
 		var self = this;
+		var cfg = (data && data[2]) || '';
+		var m = /\[server\][\s\S]*?listen\s*=\s*["']?[^"'\n]*:(\d+)/.exec(cfg || '');
+		var webui = 'http://' + window.location.hostname + ':' + (m ? m[1] : '9527') + '/';
 
 		function taskBtn(kind, label) {
 			return E('button', {
@@ -64,7 +70,16 @@ return view.extend({
 		}
 
 		var root = E('div', { 'class': 'cbi-map' }, [
-			E('h2', {}, '5G 终端 · ' + fmt.T('Device Center')),
+			E('h2', { 'style': 'display:flex;align-items:center;gap:12px;flex-wrap:wrap' }, [
+				'5G 终端 · ' + fmt.T('Device Center'),
+				/* 与 modemd 原生 WebUI（:9527）共存：本页原生渲染，不加载其资源；
+				   需要完整排障界面时新窗口跳转过去 */
+				E('a', {
+					'class': 'btn cbi-button cbi-button-action',
+					'href': webui, 'target': '_blank', 'rel': 'noopener noreferrer',
+					'title': '在新窗口打开 modemd 原生 WebUI'
+				}, '打开 WebUI ↗')
+			]),
 			E('div', { 'class': 'cbi-map-descr' },
 				'页面显示的是最近一次采样值（标注了数据年龄）；点「刷新」会提交后台任务读取模组，完成后自动更新，全程不阻塞页面。'),
 
@@ -81,10 +96,10 @@ return view.extend({
 			card(fmt.T('Signal'), 'ov-signal', taskBtn('signal.refresh', fmt.T('Refresh signal'))),
 			card(fmt.T('Network'), 'ov-network', taskBtn('network.refresh', fmt.T('Refresh network'))),
 			card(fmt.T('Cells'), 'ov-cells',
-				E('a', { 'href': LuCI.url('admin/modemd/cells') }, '→ ' + fmt.T('Cells'))),
+				E('a', { 'href': '#md=cells' }, '→ ' + fmt.T('Cells'))),
 			card(fmt.T('Identity'), 'ov-identity'),
 			card(fmt.T('Dial-up'), 'ov-dial',
-				E('a', { 'href': LuCI.url('admin/modemd/dial') }, '→ ' + fmt.T('Dial-up')))
+				E('a', { 'href': '#md=dial' }, '→ ' + fmt.T('Dial-up')))
 		]);
 
 		store.on(function (s) { self.redraw(s); });

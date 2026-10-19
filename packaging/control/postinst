@@ -7,6 +7,15 @@ for s in /lib/netifd/proto/modem_pro.sh /usr/lib/modem-pro/mp-client.sh; do
 	[ -f "$s" ] && chmod +x "$s" 2>/dev/null
 done
 
+# LuCI 缓存与静态资源：升级后 dispatcher 的菜单索引缓存必须清掉，
+# 否则旧菜单树（子页面结构）会一直用到下次重启；apk 安装的文件 mtime 是
+# 1970-01-01，会让浏览器对旧 JS 的启发式缓存几乎永久有效 —— 统一 touch 成
+# 当前时间，ETag/Last-Modified 随之变化，浏览器重新验证即可拿到新版本。
+rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache /tmp/luci-menu.json 2>/dev/null
+find /www/luci-static/resources/view/modemd /www/luci-static/resources/modemd \
+     /usr/share/luci/menu.d /usr/share/rpcd/acl.d -type f \
+     -exec touch {} + 2>/dev/null
+
 # 升级清理：2026-10-19 起 QMI/MBIM 拨号已内化进 modemd，旧包留下的厂商二进制
 # 与 quectel.sh 协议脚本不再使用（不清掉会白占几百 KB，且误导排障）。
 rm -f /usr/lib/modemd/quectel-CM /usr/lib/modemd/fibocom-dial \

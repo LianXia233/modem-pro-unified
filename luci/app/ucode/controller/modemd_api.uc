@@ -79,7 +79,7 @@ return {
 			method = http.getenv('REQUEST_METHOD') ?? 'GET';
 		method = uc(method);
 
-		let base = 'http://127.0.0.1:%d'.format(backend_port());
+		let base = sprintf('http://127.0.0.1:%d', backend_port());
 		let cmd;
 		if (method == 'POST') {
 			let body = http.formvalue('body');
@@ -88,12 +88,12 @@ return {
 			if (length(body) > MAX_BODY)
 				return fail(400, '请求体过大');
 
-			cmd = 'wget -qO- -T %d --post-data=%s --header=%s %s'.format(
+			cmd = sprintf('wget -qO- -T %d --post-data=%s --header=%s %s',
 				TIMEOUT, shell_quote(body), shell_quote('Content-Type: application/json'),
 				shell_quote(base + path));
 		}
 		else {
-			cmd = 'wget -qO- -T %d %s'.format(TIMEOUT, shell_quote(base + path));
+			cmd = sprintf('wget -qO- -T %d %s', TIMEOUT, shell_quote(base + path));
 		}
 
 		let p = fs.popen(cmd, 'r');
@@ -107,7 +107,7 @@ return {
 
 		if (type(out) != 'string' || length(out) == 0) {
 			// 常见原因：modemd 没起 / 正在重启 / 接口本身 500。把 rc 带回去便于排查。
-			http.write_json({ code: -1, msg: 'modemd 无响应（wget rc=%d）'.format(rc) });
+			http.write_json({ code: -1, msg: sprintf('modemd 无响应（wget rc=%d）', rc) });
 			return;
 		}
 
