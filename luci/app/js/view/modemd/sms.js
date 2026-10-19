@@ -181,7 +181,7 @@ return view.extend({
 							E('label', { 'style': 'font-size:12px;color:var(--mp-neutral-500)' }, '切换存储区:'),
 							E('select', { 'id': 'sel-sms-mem', 'class': 'mp-select', 'style': 'min-width:120px' },
 								(storage.supported && storage.supported.length ? storage.supported : ['SM', 'ME', 'MT']).map(function (m) {
-									return E('option', { 'value': m, 'selected': (storage.current || storage.mem1) === m }, memLabel(m));
+									return E('option', { 'value': m, 'selected': ((storage.current || storage.mem1) === m) ? 'selected' : null }, memLabel(m));
 								})
 							),
 							E('button', {

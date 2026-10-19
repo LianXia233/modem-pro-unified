@@ -278,12 +278,12 @@ return view.extend({
 						E('div', {}, [
 							E('label', { 'style': 'display:block;font-size:12.5px;font-weight:600;margin-bottom:6px' }, '选择目标模式:'),
 							E('select', { 'id': 'sel-pref-mode', 'class': 'mp-select', 'style': 'width:100%' }, [
-								E('option', { 'value': 'AUTO', 'selected': (modeSt.value === 'AUTO') }, 'AUTO (自动网络搜索，默认)'),
-								E('option', { 'value': 'NR5G', 'selected': (modeSt.value === 'NR5G') }, '仅 5G NR (SA / NSA)'),
-								E('option', { 'value': 'LTE', 'selected': (modeSt.value === 'LTE') }, '仅 4G LTE'),
-								E('option', { 'value': 'LTE:NR5G', 'selected': (modeSt.value === 'LTE:NR5G' || modeSt.value === 'NR5G:LTE') }, '4G LTE + 5G NR 优先'),
-								E('option', { 'value': 'WCDMA', 'selected': (modeSt.value === 'WCDMA') }, '仅 3G WCDMA'),
-								E('option', { 'value': 'WCDMA:LTE', 'selected': (modeSt.value === 'WCDMA:LTE') }, '3G + 4G')
+								E('option', { 'value': 'AUTO', 'selected': ((modeSt.value === 'AUTO')) ? 'selected' : null }, 'AUTO (自动网络搜索，默认)'),
+								E('option', { 'value': 'NR5G', 'selected': ((modeSt.value === 'NR5G')) ? 'selected' : null }, '仅 5G NR (SA / NSA)'),
+								E('option', { 'value': 'LTE', 'selected': ((modeSt.value === 'LTE')) ? 'selected' : null }, '仅 4G LTE'),
+								E('option', { 'value': 'LTE:NR5G', 'selected': ((modeSt.value === 'LTE:NR5G' || modeSt.value === 'NR5G:LTE')) ? 'selected' : null }, '4G LTE + 5G NR 优先'),
+								E('option', { 'value': 'WCDMA', 'selected': ((modeSt.value === 'WCDMA')) ? 'selected' : null }, '仅 3G WCDMA'),
+								E('option', { 'value': 'WCDMA:LTE', 'selected': ((modeSt.value === 'WCDMA:LTE')) ? 'selected' : null }, '3G + 4G')
 							])
 						]),
 						E('div', {}, [

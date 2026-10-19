@@ -204,20 +204,34 @@ return view.extend({
 			tzPresets.forEach(function (p) {
 				var sel = p.zonename === tzCur.zonename;
 				if (sel) have = true;
-				tzSel.appendChild(E('option', { 'value': p.zonename, 'selected': sel },
+				tzSel.appendChild(E('option', { 'value': p.zonename, 'selected': sel ? 'selected' : null },
 					p.zonename + '（' + p.label + '）'));
 			});
 			/* 系统当前时区不在预置列表里 → 保留并置顶显示，绝不自动覆盖。
 			   用户可能是用 uci 手工设的，界面只如实展示。 */
 			if (!have && tzCur.zonename) {
 				tzSel.insertBefore(
-					E('option', { 'value': tzCur.zonename, 'selected': true },
+					E('option', { 'value': tzCur.zonename, 'selected': 'selected' },
 						tzCur.zonename + '（当前值，不在预置列表）'),
 					tzSel.firstChild
 				);
 			}
 			if (!tzCur.zonename && tzSel.firstChild) {
 				tzSel.firstChild.selected = true;
+			}
+			/* 一个选项都没有（接口拉失败 / 还没加载完）：别留个空下拉，
+			   明确告诉用户「没读到」，比空白好排查。 */
+			if (!tzSel.firstChild) {
+				tzSel.appendChild(E('option', { 'value': '' }, '（未读到系统时区，点「刷新状态」重试）'));
+			}
+			/* ⚠️ LuCI 的 `E()` 会把 `selected: false` 照样输出成
+			   `selected="false"`，而 HTML 里布尔属性**只看存在性** ——
+			   于是所有选项都被判为选中，最后一个赢。实测这台机器的下拉
+			   永远停在 Australia/Sydney（预置列表最后一项），而系统时区
+			   其实是 Asia/Shanghai。
+			   用 `.value` 兜底纠正，不依赖 `selected` 属性是否正确。 */
+			if (tzCur.zonename) {
+				tzSel.value = tzCur.zonename;
 			}
 		})();
 
@@ -261,10 +275,23 @@ return view.extend({
 				E('div', { 'style': 'display:flex;align-items:center;gap:8px;' }, [
 					icons.get('clock', 18), ' 时间同步 (SNTP 全局校时)'
 				]),
-				E('div', { 'style': 'display:flex;gap:8px;' }, [ btnNtpSync, btnNtpTz, btnNtpReload ])
+				/* 时区下拉必须**进 DOM**。
+				   早先只把它创建出来、按钮也绑了，却没 append 到任何节点 ——
+				   页面上只剩一个「应用时区」按钮，点下去 `tzSel.value` 恒为空、
+				   函数第一行就 return，表现为「时区选择功能不可用」。
+				   现在和按钮并排放进卡片头，并标出这一项管的是**系统**时区。 */
+				E('div', { 'style': 'display:flex;gap:8px;align-items:center;flex-wrap:wrap' }, [
+					E('span', { 'style': 'font-size:12px;color:var(--mp-text-sub)' }, '系统时区'),
+					tzSel,
+					btnNtpTz,
+					btnNtpSync,
+					btnNtpReload
+				])
 			]),
 			ntpGrid,
 			E('div', { 'class': 'mp-desc', 'style': 'font-size:12px;line-height:1.6;color:var(--mp-text-sub);padding-top:4px;' }, [
+				'右上角「系统时区」改的是**路由器本身**（/etc/config/system 的 zonename+timezone 与 /etc/TZ），改完立即回读校验；',
+				'下方「当前时区」显示的是 **modemd 自己**的时区（[ntp] timezone，决定日志时间戳与定时任务）。两者已在上面的应用动作里同步。',
 				'modemd 内置独立 SNTP 客户端，启动 3 秒后首试校准。校准仅对插件内部日志、定时器和流量配额生效，不改变系统底层时钟。',
 				'服务器与时区持久化保存在 ', E('code', {}, '/etc/modemd/config.toml'), ' 的 ', E('code', {}, '[ntp]'), ' 段。'
 			])

@@ -101,9 +101,9 @@ return view.extend({
 						E('div', {}, [
 							E('label', { 'style': 'display:block;font-size:12.5px;color:var(--mp-neutral-700);margin-bottom:4px;font-weight:500' }, '协议类型 (PDP Type):'),
 							E('select', { 'id': 'modal-apn-pdp', 'class': 'mp-select', 'style': 'width:100%' }, [
-								E('option', { 'value': 'IPV4V6', 'selected': pdpVal === 'IPV4V6' }, 'IPv4/IPv6 双栈 (IPV4V6)'),
-								E('option', { 'value': 'IP', 'selected': pdpVal === 'IP' }, '仅 IPv4 (IP)'),
-								E('option', { 'value': 'IPV6', 'selected': pdpVal === 'IPV6' }, '仅 IPv6 (IPV6)')
+								E('option', { 'value': 'IPV4V6', 'selected': (pdpVal === 'IPV4V6') ? 'selected' : null }, 'IPv4/IPv6 双栈 (IPV4V6)'),
+								E('option', { 'value': 'IP', 'selected': (pdpVal === 'IP') ? 'selected' : null }, '仅 IPv4 (IP)'),
+								E('option', { 'value': 'IPV6', 'selected': (pdpVal === 'IPV6') ? 'selected' : null }, '仅 IPv6 (IPV6)')
 							])
 						]),
 						E('p', { 'style': 'font-size:12px;color:var(--mp-neutral-500);margin:0' },
@@ -248,7 +248,7 @@ return view.extend({
 									{ mode: 'dhcp', label: 'DHCP 客户端' },
 									{ mode: 'both', label: '双协议兼容' }
 								]).map(function (mItem) {
-									return E('option', { 'value': mItem.mode, 'selected': mItem.mode === dial.wan_mode }, mItem.label);
+									return E('option', { 'value': mItem.mode, 'selected': (mItem.mode === dial.wan_mode) ? 'selected' : null }, mItem.label);
 								})
 							),
 							E('button', {

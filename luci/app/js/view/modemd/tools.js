@@ -414,7 +414,7 @@ return view.extend({
 						E('label', { 'style': 'font-size:12.5px;font-weight:600' }, '最长等待:'),
 						E('select', { 'id': 'netscan-min-sel', 'class': 'mp-select', 'style': 'width:100px' }, [
 							E('option', { 'value': '2' }, '2 分钟'),
-							E('option', { 'value': '3', 'selected': true }, '3 分钟'),
+							E('option', { 'value': '3', 'selected': (true) ? 'selected' : null }, '3 分钟'),
 							E('option', { 'value': '5' }, '5 分钟'),
 							E('option', { 'value': '8' }, '8 分钟')
 						]),
@@ -496,9 +496,9 @@ return view.extend({
 						E('div', {}, [
 							E('label', { 'style': 'display:block;font-size:12.5px;font-weight:600;margin-bottom:4px' }, '超限执行动作:'),
 							E('select', { 'id': 'quota-action', 'class': 'mp-select', 'style': 'width:100%' }, [
-								E('option', { 'value': 'block', 'selected': quota.action === 'block' }, '断开数据连接 (推荐)'),
-								E('option', { 'value': 'block_rf', 'selected': quota.action === 'block_rf' }, '关闭模组射频 (飞行模式)'),
-								E('option', { 'value': 'warn', 'selected': quota.action === 'warn' }, '仅发送告警提醒不阻断')
+								E('option', { 'value': 'block', 'selected': (quota.action === 'block') ? 'selected' : null }, '断开数据连接 (推荐)'),
+								E('option', { 'value': 'block_rf', 'selected': (quota.action === 'block_rf') ? 'selected' : null }, '关闭模组射频 (飞行模式)'),
+								E('option', { 'value': 'warn', 'selected': (quota.action === 'warn') ? 'selected' : null }, '仅发送告警提醒不阻断')
 							])
 						]),
 						E('div', {}, [
@@ -588,7 +588,7 @@ return view.extend({
 									{ value: '3', name: 'RNDIS' },
 									{ value: '5', name: 'NCM' }
 								]).map(function (m) {
-									return E('option', { 'value': String(m.value), 'selected': String(m.value) === String(usbnet.value) }, m.name + ' (' + m.value + ')');
+									return E('option', { 'value': String(m.value), 'selected': (String(m.value) === String(usbnet.value)) ? 'selected' : null }, m.name + ' (' + m.value + ')');
 								})
 							)
 						]),
