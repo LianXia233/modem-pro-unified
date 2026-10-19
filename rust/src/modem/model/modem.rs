@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use crate::error::Result;
 
-use super::super::at::{error_line, extract_field, AtPort, UrcKind, UrcLine};
+use super::super::at::{
+    error_line, extract_field, AtPort, Prio, SchedStats, Scheduler, UrcKind, UrcLine,
+};
 use super::super::vendor::Vendor;
 use super::cells::CellScanResult;
 use super::dial::{DialState, DialTypeInfo};
@@ -38,6 +40,17 @@ pub struct Modem {
     at_port_manual: AtomicBool,
     /// 惰性打开的 AT 口（首次查询时打开）
     pub(super) at: Mutex<Option<AtPort>>,
+    /// 打开失败的冷却闸（见 `at/cooldown.rs`）。
+    ///
+    /// 串口打不开往往持续几十秒（模组重启、USB 重新枚举），而 6~8 个后台
+    /// 循环会同时来问。没有这层冷却就是「每 200ms 一次 open 全失败」——
+    /// 日志刷屏、USB 子系统被拖慢、CPU 空转。
+    pub(super) at_cooldown: super::super::at::OpenCooldown,
+    /// 串口访问调度（优先级排队 + 限流，见 `at/sched.rs`）。
+    ///
+    /// **必须先于 `at` 拿**：顺序见 [`Self::with_at_prio`]。
+    /// 它是「谁能用串口」的唯一裁决者，`at` 那把锁只负责保护 `Option<AtPort>` 本身。
+    pub(super) at_sched: Scheduler,
     /// 最近一次 USSD 应答（`+CUSD` 异步到达，见 model/ussd.rs）
     ussd: Mutex<Option<UssdResult>>,
     /// 最近一次基站扫描缓存（见 model/cells.rs）
@@ -48,6 +61,15 @@ pub struct Modem {
     pub(super) lock_status_slot: Mutex<Option<LockStatus>>,
     /// 最近一次读到的短信与未读统计（见 model/sms.rs）
     sms: Mutex<Option<SmsCache>>,
+    /// PDP / 选网参数的 TTL 缓存（15 秒，见 model/params.rs）。
+    ///
+    /// 进一次设置页要问三条命令，而 APN 只有被人改时才变 —— 冷门查询
+    /// 就该缓存，别把串口占满（见 `at/cache.rs` 的三条纪律）。
+    pub(super) params_cache: super::super::at::Ttl<super::params::ParamsStatus>,
+    /// USB 网卡模式的 TTL 缓存（30 秒，见 model/usbnet.rs）。
+    pub(super) usbnet_cache: super::super::at::Ttl<super::usbnet::UsbNetMode>,
+    /// 组网模式偏好的 TTL 缓存（30 秒，见 model/mode.rs）。
+    pub(super) mode_cache: super::super::at::Ttl<super::mode::ModePref>,
     /// `[sms] sms_memory` 的持久化偏好（空 = 不干预）。
     pub(super) sms_mem_pref: Mutex<String>,
     /// 本会话已经切到的存储区（避免每次读短信都发 `AT+CPMS`）。
@@ -115,11 +137,16 @@ impl Modem {
             model_raw: Mutex::new(None),
             at_port_manual: AtomicBool::new(false),
             at: Mutex::new(None),
+            at_cooldown: super::super::at::OpenCooldown::default(),
+            at_sched: Scheduler::default(),
             ussd: Mutex::new(None),
             cells: Mutex::new(None),
             lock_dialect_slot: Mutex::new(None),
             lock_status_slot: Mutex::new(None),
             sms: Mutex::new(None),
+            params_cache: super::super::at::Ttl::new(Duration::from_secs(15)),
+            usbnet_cache: super::super::at::Ttl::new(Duration::from_secs(30)),
+            mode_cache: super::super::at::Ttl::new(Duration::from_secs(30)),
             sms_mem_pref: Mutex::new(String::new()),
             sms_mem_active: Mutex::new(None),
             traffic_prev: Mutex::new(None),
@@ -171,8 +198,11 @@ impl Modem {
     }
 
     /// 执行一条 AT 命令并返回原始应答（失败返回空串）。
-    pub(super) fn at_cmd(&self, cmd: &str) -> String {
-        self.with_at(|p| p.command(cmd, self.cmd_timeout))
+    ///
+    /// **必须显式给优先级**：这里刻意不提供「默认级别」的重载 ——
+    /// 新建调用点时不写优先级就编译不过，逼着作者想一秒「这条命令急不急」。
+    pub(super) fn at_cmd_prio(&self, prio: Prio, cmd: &str) -> String {
+        self.with_at_prio(prio, |p| p.command(cmd, self.cmd_timeout))
             .unwrap_or_default()
     }
 
@@ -181,11 +211,12 @@ impl Modem {
     /// 返回 `(应答, 是否被叫停)`；被叫停时应答可能是半截的，由调用方判断能不能用。
     pub(super) fn at_cmd_cancel(
         &self,
+        prio: Prio,
         cmd: &str,
         timeout: Duration,
         cancel: &dyn Fn() -> bool,
     ) -> (String, bool) {
-        self.with_at(|p| p.command_cancellable(cmd, timeout, cancel))
+        self.with_at_prio(prio, |p| p.command_cancellable(cmd, timeout, cancel))
             .unwrap_or_else(|_| (String::new(), false))
     }
 
@@ -212,7 +243,7 @@ impl Modem {
 
     /// 走文本模式读短信（另切一次 PDU 模式补拼接信息）。
     fn read_sms_text(&self) -> Result<Vec<Sms>> {
-        let (resp, concat) = self.with_at(|p| {
+        let (resp, concat) = self.with_at_prio(Prio::Bulk, |p| {
             let t = self.cmd_timeout;
             // 模组默认可能是 PDU 模式，此时 AT+CMGL="ALL" 会直接报错
             p.command("AT+CMGF=1", t)?;
@@ -230,7 +261,7 @@ impl Modem {
     ///
     /// 无论成功与否都把模式切回文本模式 —— 发短信依赖文本模式。
     fn read_sms_via_pdu(&self) -> Result<Vec<Sms>> {
-        let (list, concat) = self.with_at(|p| {
+        let (list, concat) = self.with_at_prio(Prio::Bulk, |p| {
             let t = self.cmd_timeout;
             p.command("AT+CMGF=0", t)?;
             let resp = p.command("AT+CMGL=4", t);
@@ -284,7 +315,8 @@ impl Modem {
 
     /// 查询短信存储用量（附带 `AT+CPMS=?` 支持列表，取不到就留空）。
     pub fn query_sms_storage(&self) -> Result<SmsStorage> {
-        self.with_at(|p| {
+        // 冷门：只在短信页打开时问一次
+        self.with_at_prio(Prio::Bulk, |p| {
             let t = self.cmd_timeout;
             let resp = p.command("AT+CPMS?", t)?;
             let mut st = sms::parse_storage(&resp)
@@ -366,13 +398,85 @@ impl Modem {
     }
 
     /// 在已打开的 AT 口上执行一段操作（没有就现开）。
-    pub fn with_at<T>(&self, f: impl FnOnce(&mut AtPort) -> Result<T>) -> Result<T> {
-        let mut guard = self.at.lock().unwrap();
+    /// 按优先级拿串口并发命令（见 `at/sched.rs`）。
+    ///
+    /// ## 为什么要带优先级
+    ///
+    /// 早先所有人抢同一把 `Mutex`，谁先到谁先发。后台采样一密集，用户点「发送 AT」
+    /// 就要排十几秒的队；反过来，用户翻短信列表（几十条命令）又把信号采样饿死，
+    /// 页面上的信号值停住不动。现在按级别插队：
+    /// `User`（手动 AT）> `Signal`（信号）> `Data`（拨号/IP/CA）> `Bulk`（冷门）。
+    ///
+    /// ## 锁的顺序（别改）
+    ///
+    /// 先拿调度票、再拿 `at` 锁。反过来会死锁：持 `at` 的人等票、持票的人等 `at`。
+    ///
+    /// ## 超时语义
+    ///
+    /// 排队本身**不超时**（理由见 `Scheduler::acquire`）。真卡住看
+    /// [`Self::at_sched_stats`] 的 `waiting` / `max_wait_ms`。
+    pub fn with_at_prio<T>(
+        &self,
+        prio: Prio,
+        f: impl FnOnce(&mut AtPort) -> Result<T>,
+    ) -> Result<T> {
+        // 票的 drop 在 `guard` 之后（Rust 逆序析构）：
+        // 先放开 `at`，再喊下一位，避免下一位醒来抢到票又卡在 `at` 上。
+        let _ticket = self.at_sched.acquire(prio);
+        let mut guard = self.at.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
+            // 冷却期内直接拒，**不去碰串口**（见 `at/cooldown.rs`）。
+            // 返回的是带倒计时的错误，不是空数据 —— 页面要能区分
+            // 「模组未就绪」和「流量/信号真的是 0」。
+            if let Some(left) = self.at_cooldown.blocked_for() {
+                return Err(crate::error::msg(format!(
+                    "AT 口打开失败，{} 秒后重试",
+                    left.as_secs() + 1
+                )));
+            }
             let port = self.port();
-            *guard = Some(AtPort::open(&port, self.baud, self.cmd_timeout)?);
+            match AtPort::open(&port, self.baud, self.cmd_timeout) {
+                Ok(p) => {
+                    *guard = Some(p);
+                    self.at_cooldown.on_ok();
+                }
+                Err(e) => {
+                    self.at_cooldown.on_fail();
+                    return Err(e);
+                }
+            }
         }
         f(guard.as_mut().unwrap())
+    }
+
+    /// 串口调度的统计快照（`GET /api/at/sched`）。
+    pub fn at_sched_stats(&self) -> SchedStats {
+        self.at_sched.stats()
+    }
+
+    /// 当前限流参数（给接口展示，方便对账「这个数字为什么被限」）。
+    pub fn at_sched_limits(&self) -> super::super::at::Limits {
+        self.at_sched.limits()
+    }
+
+    /// 打开失败冷却状态 `(失败次数, 被冷却跳过次数, 冷却时长ms)`。
+    pub fn at_open_stats(&self) -> (u64, u64, u64) {
+        let (fails, skipped) = self.at_cooldown.stats();
+        (
+            fails,
+            skipped,
+            self.at_cooldown.cooldown().as_millis() as u64,
+        )
+    }
+
+    /// 命令节奏统计 `(间隔ms, 被节流次数, 累计等待ms)`。
+    ///
+    /// 用 `try_lock`：AT 口正在发命令时立刻返回 `None`，**不让排障接口
+    /// 去排队等串口**（否则页面点一下要等几百毫秒）。
+    /// `None` 的语义是「此刻读不到」，不是「没有节流」。
+    pub fn at_pacing_stats(&self) -> Option<(u64, u64, u64)> {
+        let g = self.at.try_lock().ok()?;
+        g.as_ref().map(|p| p.pacing_stats())
     }
 
     /// 取走并清空本模组 AT 口积压的 URC（主动上报）。
@@ -385,7 +489,8 @@ impl Modem {
     /// 加速、状态推进）由 `http::loops::spawn_urc` 按 [`UrcKind`] 分流，
     /// 折算逻辑集中在 `model::urc`（纯函数，可单测）。
     pub fn take_urc_lines(&self) -> Vec<UrcLine> {
-        self.with_at(|p| Ok(p.take_urc())).unwrap_or_default()
+        self.with_at_prio(Prio::Signal, |p| Ok(p.take_urc()))
+            .unwrap_or_default()
     }
 
     /// 只取走指定类别的 URC，其余留在队列里。
@@ -394,7 +499,7 @@ impl Modem {
     /// [`Self::send_ussd`] 收 `+CUSD`）：整队列取走会把 `+GTSIM` / 注册态
     /// URC 一起吃掉，巡检加速就失灵了。
     pub fn take_urc_of(&self, kinds: &[UrcKind]) -> Vec<UrcLine> {
-        self.with_at(|p| Ok(p.take_urc_of(kinds)))
+        self.with_at_prio(Prio::Signal, |p| Ok(p.take_urc_of(kinds)))
             .unwrap_or_default()
     }
 
@@ -402,7 +507,8 @@ impl Modem {
     ///
     /// 长期大于 0 说明串口在被垃圾行淹没，是排障时第一个该看的数。
     pub fn urc_dropped(&self) -> u64 {
-        self.with_at(|p| Ok(p.urc_dropped())).unwrap_or_default()
+        self.with_at_prio(Prio::Signal, |p| Ok(p.urc_dropped()))
+            .unwrap_or_default()
     }
 
     /// 识别厂商与型号（`ATI`；不识别的模组回落 `AT+CGMR`/`AT+CGMM`）。
@@ -411,7 +517,7 @@ impl Modem {
     /// 用 3GPP 标准指令的应答**重跑一遍**厂商识别，再取型号短名。
     pub fn identify(&self) -> Result<()> {
         let ati = self
-            .with_at(|p| p.command("ATI", self.cmd_timeout))
+            .with_at_prio(Prio::Data, |p| p.command("ATI", self.cmd_timeout))
             .unwrap_or_default();
         let lines = split_at_lines(&ati);
         let mut vendor = Vendor::detect(&lines);
@@ -419,7 +525,7 @@ impl Modem {
         if vendor == Vendor::Unknown && at_resp_is_error(&lines) {
             for alt in ["AT+CGMR", "AT+CGMM"] {
                 let resp = self
-                    .with_at(|p| p.command(alt, self.cmd_timeout))
+                    .with_at_prio(Prio::Data, |p| p.command(alt, self.cmd_timeout))
                     .unwrap_or_default();
                 let alt_lines = split_at_lines(&resp);
                 if alt_lines.is_empty() {
@@ -533,7 +639,7 @@ impl Modem {
     pub fn query_sim_identity(&self) -> SimIdentity {
         let mut id = SimIdentity::default();
         let resp = self
-            .with_at(|p| p.command("AT+CPIN?", self.cmd_timeout))
+            .with_at_prio(Prio::Signal, |p| p.command("AT+CPIN?", self.cmd_timeout))
             .unwrap_or_default();
         match extract_field(&resp, "+CPIN") {
             Some(state) => id.state = state,
@@ -550,7 +656,7 @@ impl Modem {
             }
         }
         let resp = self
-            .with_at(|p| p.command("AT+CIMI", self.cmd_timeout))
+            .with_at_prio(Prio::Signal, |p| p.command("AT+CIMI", self.cmd_timeout))
             .unwrap_or_default();
         if let Some(v) = super::siminfo::parse_imsi(&resp) {
             id.imsi = v;
@@ -632,7 +738,9 @@ impl Modem {
         }
         if super::sim::should_reset_modem(kind, cfg_reset) {
             // 有的固件这条不回 OK，超时是正常的 —— 只记日志
-            if let Err(e) = self.with_at(|p| p.command("AT+CFUN=1,1", Duration::from_secs(5))) {
+            if let Err(e) = self.with_at_prio(Prio::Data, |p| {
+                p.command("AT+CFUN=1,1", Duration::from_secs(5))
+            }) {
                 log::debug!("模组 id={} 换卡后复位未拿到 OK: {e}", self.id);
             }
             log::warn!("模组 id={} 已发 AT+CFUN=1,1 让新卡生效", self.id);

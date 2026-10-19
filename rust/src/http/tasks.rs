@@ -310,7 +310,8 @@ impl Registry {
         let worker = task.clone();
         std::thread::spawn(move || {
             worker.run();
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(worker.clone())));
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(worker.clone())));
             match outcome {
                 Ok(Ok(v)) => worker.finish(
                     if worker.cancelled() {

@@ -41,7 +41,10 @@ pub fn handle(mut req: Request, state: &AppState, query: &HashMap<String, String
         );
     };
     let timeout = state.cfg.serial.command_timeout();
-    match modem.with_at(|p| p.command(&cmd, timeout)) {
+    // 用户手动发的指令：**最高优先级**，插到所有后台采样前面。
+    // 这是这一层调度存在的直接理由 —— 早先用户点「发送」要排队等信号采样
+    // 和短信巡检，十几秒才回，看起来像卡死。
+    match modem.with_at_prio(crate::modem::at::Prio::User, |p| p.command(&cmd, timeout)) {
         Ok(out) => response::ok(
             req,
             serde_json::json!({ "cmd": cmd, "resp": split_at_lines(&out) }),

@@ -17,7 +17,7 @@ use serde::Serialize;
 
 use crate::error::Result;
 
-use super::super::at::{csv, extract_all, extract_field, field_part, is_ok};
+use super::super::at::{csv, extract_all, extract_field, field_part, is_ok, Prio};
 use super::modem::Modem;
 
 /// 信号信息（含 5G NR 小区信号）。
@@ -41,7 +41,7 @@ impl Modem {
     /// 查询一次信号（CSQ + 服务小区/扩展信号）。
     pub fn signal(&self) -> Result<SignalInfo> {
         let (rssi, ber) = self
-            .with_at(|p| p.command("AT+CSQ", self.cmd_timeout))
+            .with_at_prio(Prio::Signal, |p| p.command("AT+CSQ", self.cmd_timeout))
             .map(|raw| parse_csq(&raw))
             .unwrap_or((99, 99));
 
@@ -66,7 +66,9 @@ impl Modem {
         let fibo_mtk = self.is_fibocom_mtk();
         if !fibo_mtk {
             let qeng = self
-                .with_at(|p| p.command("AT+QENG=\"servingcell\"", self.cmd_timeout))
+                .with_at_prio(Prio::Signal, |p| {
+                    p.command("AT+QENG=\"servingcell\"", self.cmd_timeout)
+                })
                 .unwrap_or_default();
             if let Some(v) = parse_qeng_servingcell(&qeng) {
                 return v;
@@ -74,13 +76,15 @@ impl Modem {
         }
 
         let cesq = self
-            .with_at(|p| p.command("AT+CESQ", self.cmd_timeout))
+            .with_at_prio(Prio::Signal, |p| p.command("AT+CESQ", self.cmd_timeout))
             .unwrap_or_default();
         let mut out = parse_cesq(&cesq).unwrap_or((0, 0, 0));
 
         if fibo_mtk && (out.0 == 0 || out.1 == 0 || out.2 == 0) {
             let gtcc = self
-                .with_at(|p| p.command("AT+GTCCINFO?", self.cmd_timeout))
+                .with_at_prio(Prio::Signal, |p| {
+                    p.command("AT+GTCCINFO?", self.cmd_timeout)
+                })
                 .unwrap_or_default();
             if let Some(cell) = super::cells::parse_gtccinfo_rows(&gtcc)
                 .into_iter()

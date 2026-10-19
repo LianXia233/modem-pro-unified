@@ -25,11 +25,18 @@ pub fn handle(req: Request, state: &AppState, query: &HashMap<String, String>) -
         let Some(modem) = modem_by_query(state, query) else {
             return response::fail(req, -1, "modem not found");
         };
-        return response::ok(req, serde_json::json!({ "plan": atplan::for_modem(&modem) }));
+        return response::ok(
+            req,
+            serde_json::json!({ "plan": atplan::for_modem(&modem) }),
+        );
     }
 
     // ② 按型号：离线推导
-    if let Some(model) = query.get("model").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    if let Some(model) = query
+        .get("model")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         return response::ok(
             req,
             serde_json::json!({ "plan": atplan::for_model(model, None, false) }),

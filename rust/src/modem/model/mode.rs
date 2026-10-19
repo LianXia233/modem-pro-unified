@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use crate::error::{msg, Result};
 
-use super::super::at::{csv, extract_field, is_ok};
+use super::super::at::{csv, extract_field, is_ok, Prio};
 use super::super::vendor::Vendor;
 use super::modem::Modem;
 
@@ -34,8 +34,26 @@ pub struct ModePref {
 }
 
 impl Modem {
-    /// 读取组网模式偏好。
+    /// 读取组网模式偏好（**走 30 秒缓存**）。
+    ///
+    /// 切制式是低频操作，但页面会反复问；缓存掉省串口。
+    /// 写之后的回读用 [`Self::mode_pref_refresh`]。
     pub fn mode_pref(&self) -> ModePref {
+        if let Some(v) = self.mode_cache.get() {
+            return v;
+        }
+        let v = self.read_mode_pref();
+        self.mode_cache.set(v.clone());
+        v
+    }
+
+    /// 强制实时读取（写之后的回读确认用）。
+    pub fn mode_pref_refresh(&self) -> ModePref {
+        self.mode_cache.invalidate();
+        self.mode_pref()
+    }
+
+    fn read_mode_pref(&self) -> ModePref {
         let vendor = self.vendor();
         // 各家读哪条、用哪个解析分支，统一在 `VendorSpec::mode_read` 里
         let (cmd, source) = vendor.spec().mode_read();
@@ -54,7 +72,7 @@ impl Modem {
             };
         }
         let resp = self
-            .with_at(|p| p.command(cmd, self.cmd_timeout))
+            .with_at_prio(Prio::Data, |p| p.command(cmd, self.cmd_timeout))
             .unwrap_or_default();
         if is_ok(&resp) {
             if let Some(value) = parse_mode_value(&resp, source) {
@@ -93,7 +111,7 @@ impl Modem {
             // 鼎桥：读-改-写（其余字段回读后原样带回去），acqorder 换成目标档
             Vendor::TDTech => {
                 let cur = self
-                    .with_at(|p| p.command("AT^SYSCFGEX?", self.cmd_timeout))
+                    .with_at_prio(Prio::Data, |p| p.command("AT^SYSCFGEX?", self.cmd_timeout))
                     .unwrap_or_default();
                 let Some((acq, band, roam, srv, lteband)) = parse_syscfgex(&cur) else {
                     return Err(msg("读不到当前的 AT^SYSCFGEX 配置，拒绝盲写"));
@@ -112,11 +130,11 @@ impl Modem {
             },
             _ => format!("AT+QNWPREFCFG=\"mode_pref\",{value}"),
         };
-        let resp = self.with_at(|p| p.command(&cmd, Duration::from_secs(10)))?;
+        let resp = self.with_at_prio(Prio::Data, |p| p.command(&cmd, Duration::from_secs(10)))?;
         if !is_ok(&resp) {
             return Err(msg(format!("下发失败：{}", resp.trim())));
         }
-        let pref = self.mode_pref();
+        let pref = self.mode_pref_refresh();
         if pref.value.is_empty() || !pref.value.eq_ignore_ascii_case(value) {
             // 回读不到目标值时不算成功：界面会照模组的真实状态显示
             return Err(msg(format!(

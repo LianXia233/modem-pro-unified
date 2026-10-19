@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use crate::error::Result;
 
-use super::super::at::{csv, extract_field, is_ok};
+use super::super::at::{csv, extract_field, is_ok, Prio};
 use super::super::vendor::Vendor;
 use super::modem::Modem;
 use super::netselect::{self, NetSelect};
@@ -113,12 +113,12 @@ impl Modem {
         let (module_time, module_unix, clock_skew_s) = self.query_cclk();
 
         let net_select = self
-            .with_at(|p| p.command("AT+COPS?", self.cmd_timeout))
+            .with_at_prio(Prio::Data, |p| p.command("AT+COPS?", self.cmd_timeout))
             .map(|raw| netselect::parse(&raw))
             .unwrap_or_default();
 
         let ps = self
-            .with_at(|p| p.command("AT+CGREG?", self.cmd_timeout))
+            .with_at_prio(Prio::Data, |p| p.command("AT+CGREG?", self.cmd_timeout))
             .map(|raw| regstate::parse(&raw, "+CGREG"))
             .unwrap_or_default();
         let roam = roam_state(ps.roaming, imsi.as_deref(), net_select.plmn.as_deref());
@@ -157,7 +157,7 @@ impl Modem {
     pub(super) fn query_first(&self, cmds: &[&str]) -> Option<String> {
         for cmd in cmds {
             let resp = self
-                .with_at(|p| p.command(cmd, self.cmd_timeout))
+                .with_at_prio(Prio::Data, |p| p.command(cmd, self.cmd_timeout))
                 .unwrap_or_default();
             if is_ok(&resp) {
                 return Some(resp);
@@ -169,7 +169,7 @@ impl Modem {
     /// `AT+CPIN?` →（状态文本, 卡是否在）。
     fn query_cpin(&self) -> (Option<String>, bool) {
         let resp = self
-            .with_at(|p| p.command("AT+CPIN?", self.cmd_timeout))
+            .with_at_prio(Prio::Data, |p| p.command("AT+CPIN?", self.cmd_timeout))
             .unwrap_or_default();
         match extract_field(&resp, "+CPIN") {
             Some(state) => (Some(state), true),

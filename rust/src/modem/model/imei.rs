@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use crate::error::{msg, Result};
 
-use super::super::at::is_ok;
+use super::super::at::{is_ok, Prio};
 use super::super::vendor::Vendor;
 use super::modem::Modem;
 
@@ -50,11 +50,11 @@ impl Modem {
     /// IMEI（`AT+CGSN`，退回 `AT+GSN`）。
     pub fn imei(&self) -> Option<String> {
         let resp = self
-            .with_at(|p| p.command("AT+CGSN", self.cmd_timeout))
+            .with_at_prio(Prio::Bulk, |p| p.command("AT+CGSN", self.cmd_timeout))
             .unwrap_or_default();
         parse_imei(&resp).or_else(|| {
             let resp = self
-                .with_at(|p| p.command("AT+GSN", self.cmd_timeout))
+                .with_at_prio(Prio::Bulk, |p| p.command("AT+GSN", self.cmd_timeout))
                 .unwrap_or_default();
             parse_imei(&resp)
         })
@@ -63,7 +63,7 @@ impl Modem {
     /// 固件版本（`AT+CGMR` 原文）。
     pub fn firmware(&self) -> Option<String> {
         let resp = self
-            .with_at(|p| p.command("AT+CGMR", self.cmd_timeout))
+            .with_at_prio(Prio::Bulk, |p| p.command("AT+CGMR", self.cmd_timeout))
             .unwrap_or_default();
         resp.lines()
             .map(str::trim)
@@ -212,7 +212,7 @@ impl Modem {
     fn imei_snapshot(&self) -> Option<(String, &'static str)> {
         if self.is_fibocom_mtk() {
             let resp = self
-                .with_at(|p| p.command(EGMREXT_READ, self.cmd_timeout))
+                .with_at_prio(Prio::Bulk, |p| p.command(EGMREXT_READ, self.cmd_timeout))
                 .unwrap_or_default();
             if let Some(v) = parse_egmrext(&resp) {
                 return Some((v, EGMREXT_READ));
@@ -280,8 +280,9 @@ impl Modem {
     ///   附重启提示返回成功，让调用方如实告知用户；
     /// - **其它厂商**（高通 `AT+EGMR`）：维持原语义，回读不一致即报错。
     fn write_imei(&self, cmd: &str, imei: &str) -> Result<Option<String>> {
-        let resp =
-            self.with_at(|p| p.command(&format!("{cmd}\"{imei}\""), Duration::from_secs(5)))?;
+        let resp = self.with_at_prio(Prio::Bulk, |p| {
+            p.command(&format!("{cmd}\"{imei}\""), Duration::from_secs(5))
+        })?;
         if !is_ok(&resp) {
             return Err(msg(format!("写入失败：{}", resp.trim())));
         }

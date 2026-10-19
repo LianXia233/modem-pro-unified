@@ -5,7 +5,7 @@
 
 use serde::Serialize;
 
-use super::super::at::{csv, extract_field, is_ok};
+use super::super::at::{csv, extract_field, is_ok, Prio};
 use super::modem::Modem;
 
 /// 「该机型不支持关射频」的统一说明（执行报错与定时器预检共用一句，别写岔）。
@@ -28,7 +28,7 @@ impl Modem {
     /// 读取飞行模式状态。
     pub fn airplane(&self) -> Airplane {
         let resp = self
-            .with_at(|p| p.command("AT+CFUN?", self.cmd_timeout))
+            .with_at_prio(Prio::Data, |p| p.command("AT+CFUN?", self.cmd_timeout))
             .unwrap_or_default();
         if is_ok(&resp) {
             if let Some(level) = parse_cfun(&resp) {

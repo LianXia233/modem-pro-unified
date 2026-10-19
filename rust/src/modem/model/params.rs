@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::error::{msg, Result};
 
-use super::super::at::{csv, extract_all, is_duplicate_activate, is_ok};
+use super::super::at::{csv, extract_all, is_duplicate_activate, is_ok, Prio};
 use super::modem::Modem;
 use super::netselect::{self, NetSelect};
 
@@ -27,27 +27,64 @@ pub struct Context {
 #[derive(Debug, Clone, Serialize)]
 pub struct ParamsStatus {
     pub modem_id: u32,
+    /// **真实查询**时刻（命中缓存时是上一次问模组的时间，不是现在）
     pub queried_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub apn: Option<String>,
     pub contexts: Vec<Context>,
     pub net_select: NetSelect,
+    /// 这份数据是几秒前问的（0 / 缺省 = 刚刚实时查的）。
+    ///
+    /// 中文页面上要显示成「15 秒前」，别让用户以为看到的是此刻的值。
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub cached_secs: u64,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 impl Modem {
-    /// 读取参数总览。
+    /// 读取参数总览（**走缓存**）。
+    ///
+    /// 15 秒 TTL：进一次设置页要问三条命令（`AT+CGDCONT?` / `AT+CGACT?` /
+    /// `AT+COPS?`），页面来回切两次就是六条 —— 而 APN 只有被人改的时候才变。
+    /// 写操作（`set_apn` 等）成功后会 [作废缓存](super::super::at::Ttl::invalidate)，
+    /// 所以「改完立刻看到新值」不受影响。
     pub fn params(&self) -> ParamsStatus {
-        let defined = self
-            .with_at(|p| p.command("AT+CGDCONT?", self.cmd_timeout))
-            .unwrap_or_default();
-        let activated = self
-            .with_at(|p| p.command("AT+CGACT?", self.cmd_timeout))
-            .unwrap_or_default();
-        let net_select = self
-            .with_at(|p| p.command("AT+COPS?", self.cmd_timeout))
-            .map(|raw| netselect::parse(&raw))
+        if let Some(cached) = self.params_cache.get() {
+            let mut v = cached;
+            v.cached_secs = self.params_cache.age_secs().unwrap_or(0);
+            return v;
+        }
+        let v = self.read_params();
+        self.params_cache.set(v.clone());
+        v
+    }
+
+    /// 强制实时读取（页面「刷新」按钮、拨号流程要拿最新 APN 时用）。
+    pub fn params_refresh(&self) -> ParamsStatus {
+        self.params_cache.invalidate();
+        self.params()
+    }
+
+    /// 真正发 AT 问一遍。
+    ///
+    /// 三条命令放在**同一次端口占用**里发：早先每条都单独排一次队，
+    /// 光排队间隔（60ms × 2）就比命令本身还久。合起来之后，每条命令
+    /// 「等应答」的时间天然构成间隔，模组不会被打得更急。
+    fn read_params(&self) -> ParamsStatus {
+        let (defined, activated, cops) = self
+            .with_at_prio(Prio::Bulk, |p| {
+                let t = self.cmd_timeout;
+                let defined = p.command("AT+CGDCONT?", t).unwrap_or_default();
+                let activated = p.command("AT+CGACT?", t).unwrap_or_default();
+                let cops = p.command("AT+COPS?", t).unwrap_or_default();
+                Ok((defined, activated, cops))
+            })
             .unwrap_or_default();
 
+        let net_select = netselect::parse(&cops);
         let contexts = build_contexts(&defined, &activated);
         let apn = contexts
             .iter()
@@ -60,6 +97,7 @@ impl Modem {
             apn,
             contexts,
             net_select,
+            cached_secs: 0,
         }
     }
 }
@@ -98,14 +136,14 @@ impl Modem {
         }
         let mut steps = Vec::new();
         let cmd = format!("AT+CGDCONT={cid},\"{pdp_type}\",\"{apn}\"");
-        let resp = self.with_at(|p| p.command(&cmd, self.cmd_timeout))?;
+        let resp = self.with_at_prio(Prio::Bulk, |p| p.command(&cmd, self.cmd_timeout))?;
         if !is_ok(&resp) {
             return Err(msg(format!("写入失败：{}", resp.trim())));
         }
         steps.push(format!("已下发 {cmd}"));
 
         // 回读确认
-        let defined = self.at_cmd("AT+CGDCONT?");
+        let defined = self.at_cmd_prio(Prio::Bulk, "AT+CGDCONT?");
         let contexts = build_contexts(&defined, "");
         let stored = contexts
             .iter()
@@ -120,13 +158,13 @@ impl Modem {
         steps.push("回读确认一致".to_string());
 
         // 之前激活着的就先断后连，让新 APN 立即生效
-        let activated = self.at_cmd("AT+CGACT?");
+        let activated = self.at_cmd_prio(Prio::Bulk, "AT+CGACT?");
         let was_active = build_contexts(&defined, &activated)
             .iter()
             .any(|c| c.cid == cid && c.active);
         if was_active {
-            let _ = self.at_cmd(&format!("AT+CGACT=0,{cid}"));
-            let resp = self.at_cmd(&format!("AT+CGACT=1,{cid}"));
+            let _ = self.at_cmd_prio(Prio::Bulk, &format!("AT+CGACT=0,{cid}"));
+            let resp = self.at_cmd_prio(Prio::Bulk, &format!("AT+CGACT=1,{cid}"));
             steps.push(if is_ok(&resp) {
                 "已重新激活该上下文（先断后连）".to_string()
             } else {
@@ -137,7 +175,7 @@ impl Modem {
         // IMS 是 VoLTE / IMS 短信的前提，顺手拉起来；失败不影响本次写入
         if activate_ims {
             if let Some(ims) = contexts.iter().find(|c| c.internal) {
-                let resp = self.at_cmd(&format!("AT+CGACT=1,{}", ims.cid));
+                let resp = self.at_cmd_prio(Prio::Bulk, &format!("AT+CGACT=1,{}", ims.cid));
                 steps.push(if is_ok(&resp) {
                     format!("已激活 IMS 上下文（cid {}）", ims.cid)
                 } else {
@@ -156,11 +194,13 @@ impl Modem {
         if cid <= 0 {
             return Err(msg("上下文 cid 要是正数"));
         }
-        let resp = self.with_at(|p| p.command(&format!("AT+CGDCONT={cid}"), self.cmd_timeout))?;
+        let resp = self.with_at_prio(Prio::Bulk, |p| {
+            p.command(&format!("AT+CGDCONT={cid}"), self.cmd_timeout)
+        })?;
         if !is_ok(&resp) {
             return Err(msg(format!("删除失败：{}", resp.trim())));
         }
-        let defined = self.at_cmd("AT+CGDCONT?");
+        let defined = self.at_cmd_prio(Prio::Bulk, "AT+CGDCONT?");
         let still = build_contexts(&defined, "").iter().any(|c| c.cid == cid);
         let msg = if still {
             format!("已下发删除，但模组仍报有 cid {cid}（可能被固件保留）")
@@ -184,7 +224,7 @@ impl Modem {
         if reconnect {
             // 部分固件不允许停用内部上下文（实测 RM502Q-GL 的 AT+CGACT=0,2 回 ERROR），
             // 被拒就跳过断开、直接激活
-            let off = self.at_cmd(&format!("AT+CGACT=0,{cid}"));
+            let off = self.at_cmd_prio(Prio::Bulk, &format!("AT+CGACT=0,{cid}"));
             steps.push(if is_ok(&off) {
                 "已断开".to_string()
             } else {
@@ -192,7 +232,7 @@ impl Modem {
             });
         }
         let want = if active { 1 } else { 0 };
-        let resp = self.at_cmd(&format!("AT+CGACT={want},{cid}"));
+        let resp = self.at_cmd_prio(Prio::Bulk, &format!("AT+CGACT={want},{cid}"));
         // `+CME ERROR: 5847` 是「重复激活」：上下文其实已经激活，不该判失败。
         // 只对激活放行 —— 停用回 5847 没有语义。
         let duplicate = active && is_duplicate_activate(&resp);
@@ -231,7 +271,7 @@ impl Modem {
             other => return Err(msg(format!("不支持的选网方式 {other}"))),
         };
         // 选网会重注册，给足时间（普通命令超时只有几秒）
-        let resp = self.with_at(|p| p.command(&cmd, Duration::from_secs(60)))?;
+        let resp = self.with_at_prio(Prio::Bulk, |p| p.command(&cmd, Duration::from_secs(60)))?;
         if !is_ok(&resp) {
             return Err(msg(format!("下发失败：{}", resp.trim())));
         }

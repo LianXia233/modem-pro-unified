@@ -17,7 +17,7 @@ use serde::Serialize;
 use crate::error::{msg, Result};
 use crate::modem::bands;
 
-use super::super::at::{csv, is_ok};
+use super::super::at::{csv, is_ok, Prio};
 use super::super::vendor::Vendor;
 use super::modem::Modem;
 
@@ -294,7 +294,7 @@ impl Modem {
         };
         let mut tried = Vec::new();
         for d in guess.order() {
-            let resp = self.at_cmd(d.probe());
+            let resp = self.at_cmd_prio(Prio::Bulk, d.probe());
             let ok = is_ok(&resp)
                 && resp
                     .to_ascii_uppercase()
@@ -470,7 +470,7 @@ impl Modem {
             if cmd.is_empty() {
                 continue;
             }
-            let resp = self.at_cmd(&cmd);
+            let resp = self.at_cmd_prio(Prio::Bulk, &cmd);
             caps.probes.push(LockCapProbe {
                 name: name.to_string(),
                 command: cmd,
@@ -486,7 +486,7 @@ impl Modem {
     }
 
     fn query_mode_pref(&self, d: Dialect) -> String {
-        let resp = self.at_cmd(d.mode_pref_cmd());
+        let resp = self.at_cmd_prio(Prio::Bulk, d.mode_pref_cmd());
         match d {
             Dialect::Qnw => parse_qnwprefcfg(&resp, "mode_pref").unwrap_or_default(),
             Dialect::Simcom => parse_cnmp(&resp),
@@ -502,7 +502,7 @@ impl Modem {
         if cmd.is_empty() {
             return PolicyBands::default();
         }
-        let resp = self.at_cmd(cmd);
+        let resp = self.at_cmd_prio(Prio::Bulk, cmd);
         if d.band_shape() == BandShape::Positional {
             // 广和通 MTK：支持全集在 AT+GTACT=? 的各参数组里，按值域认，不按组序号
             let (lte, nr) = parse_gtact_supported(&resp);
@@ -526,7 +526,7 @@ impl Modem {
             capable: capable.clone().unwrap_or_default(),
             ..Default::default()
         };
-        let resp = self.at_cmd(&d.band_cmd(tech));
+        let resp = self.at_cmd_prio(Prio::Bulk, &d.band_cmd(tech));
         match d.band_shape() {
             BandShape::Keyed => {
                 if let Some(v) = parse_prefcfg_value(d.head(), &resp, d.band_key(tech)) {
@@ -559,7 +559,7 @@ impl Modem {
         if cmd.is_empty() {
             return cl;
         }
-        let resp = self.at_cmd(cmd);
+        let resp = self.at_cmd_prio(Prio::Bulk, cmd);
         if d == Dialect::Fibocom {
             // 广和通 MTK：`+EMMCHLCK: 0` = 未锁定；锁定态的字段位置由
             // `AT+EMMCHLCK=?` 的 5 个参数组推断（末两组是 EARFCN / PCI 区间），
@@ -610,12 +610,12 @@ impl Modem {
         };
         // 注意：key 带引号、值不带（`AT+QNWPREFCFG="lte_band",1:3:8`，与读应答一致）
         let cmd = format!("{},{}", d.band_cmd(&tech), value);
-        let resp = self.with_at(|p| p.command(&cmd, Duration::from_secs(10)))?;
+        let resp = self.with_at_prio(Prio::Bulk, |p| p.command(&cmd, Duration::from_secs(10)))?;
         if !is_ok(&resp) {
             return Err(msg(format!("下发失败：{}", resp.trim())));
         }
         // 回读确认（按频段集合比对，容忍模组改顺序/分隔符）：界面要看到模组的真值
-        let back = self.at_cmd(&d.band_cmd(&tech));
+        let back = self.at_cmd_prio(Prio::Bulk, &d.band_cmd(&tech));
         let got = parse_prefcfg_value(d.head(), &back, d.band_key(&tech))
             .and_then(|v| parse_band_list(&v))
             .unwrap_or_default();
@@ -651,11 +651,12 @@ impl Modem {
     ///    读不到支持全集就拒绝执行。
     fn set_gtact_band(&self, tech: &str, bands: &[i32], unlock: bool) -> Result<LockStatus> {
         // 当前值：改另一组时要原样保留（约束 1）
-        let cur = parse_gtact_read(&self.at_cmd("AT+GTACT?")).ok_or_else(|| {
-            msg("读不到 AT+GTACT? 的当前值，拒绝盲写（会把另外两组频段一起改掉）")
-        })?;
+        let cur =
+            parse_gtact_read(&self.at_cmd_prio(Prio::Bulk, "AT+GTACT?")).ok_or_else(|| {
+                msg("读不到 AT+GTACT? 的当前值，拒绝盲写（会把另外两组频段一起改掉）")
+            })?;
         // 支持全集：解锁时写回它；锁定时用它校验用户勾的频段
-        let (cap_lte, cap_nr) = parse_gtact_supported(&self.at_cmd("AT+GTACT=?"));
+        let (cap_lte, cap_nr) = parse_gtact_supported(&self.at_cmd_prio(Prio::Bulk, "AT+GTACT=?"));
 
         let cap = if tech == "NR" { &cap_nr } else { &cap_lte };
         let want: Vec<i32> = if unlock {
@@ -714,23 +715,23 @@ impl Modem {
         let cmd = format!("AT+GTACT={}", parts.join(","));
 
         // 约束 2：先离线再下发，失败也要拉回在线
-        let _ = self.at_cmd("AT+CFUN=0");
-        let resp = self.with_at(|p| p.command(&cmd, Duration::from_secs(10)));
+        let _ = self.at_cmd_prio(Prio::Bulk, "AT+CFUN=0");
+        let resp = self.with_at_prio(Prio::Bulk, |p| p.command(&cmd, Duration::from_secs(10)));
         let resp = match resp {
             Ok(r) => r,
             Err(e) => {
-                let _ = self.at_cmd("AT+CFUN=1");
+                let _ = self.at_cmd_prio(Prio::Bulk, "AT+CFUN=1");
                 return Err(e);
             }
         };
         if !is_ok(&resp) {
-            let _ = self.at_cmd("AT+CFUN=1");
+            let _ = self.at_cmd_prio(Prio::Bulk, "AT+CFUN=1");
             return Err(msg(format!("下发失败：{}", resp.trim())));
         }
-        let _ = self.at_cmd("AT+CFUN=1");
+        let _ = self.at_cmd_prio(Prio::Bulk, "AT+CFUN=1");
 
         // 回读确认（按频段集合比对，容忍模组改顺序）
-        let back = parse_gtact_read(&self.at_cmd("AT+GTACT?"));
+        let back = parse_gtact_read(&self.at_cmd_prio(Prio::Bulk, "AT+GTACT?"));
         let got = back
             .as_ref()
             .map(|g| if tech == "NR" { &g.nr } else { &g.lte });
@@ -788,12 +789,14 @@ impl Modem {
                     "广和通 MTK 的 AT+EMMCHLCK 锁定参数含义未经验证（见 /api/lock/caps 的探测应答），拒绝盲写",
                 ));
             }
-            let resp = self.with_at(|p| p.command("AT+EMMCHLCK=0", Duration::from_secs(10)))?;
+            let resp = self.with_at_prio(Prio::Bulk, |p| {
+                p.command("AT+EMMCHLCK=0", Duration::from_secs(10))
+            })?;
             if !is_ok(&resp) {
                 return Err(msg(format!("下发失败：{}", resp.trim())));
             }
             // 回读确认：未锁定回 `+EMMCHLCK: 0`
-            let back = parse_emmchlck(&self.at_cmd("AT+EMMCHLCK?"), &tech);
+            let back = parse_emmchlck(&self.at_cmd_prio(Prio::Bulk, "AT+EMMCHLCK?"), &tech);
             if back.locked {
                 return Err(msg(format!(
                     "已下发但回读仍为「{}」",
@@ -829,12 +832,12 @@ impl Modem {
             }
             _ => return Err(msg("lock_type 只认 0（解除）/ 1（频点+PCI）/ 2（仅频点）")),
         };
-        let resp = self.with_at(|p| p.command(&cmd, Duration::from_secs(10)))?;
+        let resp = self.with_at_prio(Prio::Bulk, |p| p.command(&cmd, Duration::from_secs(10)))?;
         if !is_ok(&resp) {
             return Err(msg(format!("下发失败：{}", resp.trim())));
         }
         // 回读确认
-        let back = self.at_cmd(d.cell_cmd(&tech));
+        let back = self.at_cmd_prio(Prio::Bulk, d.cell_cmd(&tech));
         let got = parse_qnwlock(&back, kind);
         let ok = match (&got, lock_type) {
             (None, 0) => true, // 解除后有些固件直接不回该条目
@@ -887,7 +890,7 @@ impl Modem {
         if info.dialect != Some(Dialect::Qnw) {
             return;
         }
-        let resp = self.at_cmd("AT+QNWLOCK=\"save_ctrl\",1,1");
+        let resp = self.at_cmd_prio(Prio::Bulk, "AT+QNWLOCK=\"save_ctrl\",1,1");
         if !is_ok(&resp) {
             log::warn!("模组 {} 保存小区锁定到 NV 失败: {}", self.id, resp.trim());
         }
@@ -905,7 +908,7 @@ impl Modem {
         if cmd.is_empty() {
             return Err(msg("本方言没有 policy_band 可读，拒绝盲写解锁"));
         }
-        let resp = self.at_cmd(cmd);
+        let resp = self.at_cmd_prio(Prio::Bulk, cmd);
         let list = parse_qnwprefcfg(&resp, d.band_key(tech)).and_then(|v| parse_band_list(&v));
         match list {
             Some(v) if !v.is_empty() => Ok(join_bands(d, &v)),

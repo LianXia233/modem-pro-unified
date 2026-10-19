@@ -61,6 +61,43 @@ return view.extend({
 		]);
 	},
 
+	/* 拉一次串口调度状态，更新徽章。
+	   返回 false 表示「工具页已经不在了」，调用方的定时器据此自停。 */
+	loadAtSched: function (id) {
+		if (!document.getElementById('at-sched-badge')) return false;
+		api.get('/api/at/sched', { modem_id: id }).then(function (st) {
+			var b = document.getElementById('at-sched-badge');
+			if (!b || !st) return;
+			/* waiting == usize::MAX 时后端的意思是「调度器正卡在限流 sleep 里、
+			   拿不到快照」，不是真有天文数字个等待者 —— 这里如实折成「忙」。 */
+			var waiting = st.waiting;
+			var busyNow = st.busy || waiting > 100000;
+			var parts = [];
+			if (busyNow) parts.push('串口中');
+			if (waiting > 0 && waiting < 100000) parts.push('排队 ' + waiting);
+			var thr = ((st.signal && st.signal.throttled) || 0)
+				+ ((st.data && st.data.throttled) || 0)
+				+ ((st.bulk && st.bulk.throttled) || 0)
+				+ ((st.user && st.user.throttled) || 0);
+			if (thr > 0) parts.push('限流 ' + thr);
+			if (!parts.length) parts.push('空闲');
+
+			b.textContent = parts.join(' · ');
+			/* 只用语义色，不用红绿（那是涨跌语义）：空闲=中性、忙=提示、限流多=警告 */
+			b.className = 'mp-badge ' + (thr > 20 ? 'mp-badge-warning' : (busyNow ? 'mp-badge-info' : ''));
+			var lim = st.limits || {};
+			b.title = '串口调度 · 最长单次等待 ' + (st.max_wait_ms || 0) + ' ms；'
+				+ '服务次数 用户=' + ((st.user || {}).served || 0)
+				+ ' 信号=' + ((st.signal || {}).served || 0)
+				+ ' 数据=' + ((st.data || {}).served || 0)
+				+ ' 冷门=' + ((st.bulk || {}).served || 0) + '；'
+				+ '限流阈值 ' + (lim.per_window || '-') + ' 次/' + ((lim.window_ms || 0) / 1000) + ' 秒'
+				+ '，最小间隔 ' + (lim.gap_ms || 0) + ' ms；'
+				+ '优先级 用户手动 AT > 信号 > 拨号/IP/CA > 冷门查询';
+		}).catch(function () { /* 拉不到不打扰用户：徽章保持上一帧 */ });
+		return true;
+	},
+
 	render: function (data) {
 		var self = this;
 		var snap = data[0] || {};
@@ -75,6 +112,13 @@ return view.extend({
 		var changes = data[8] || {};
 		var logs = data[9] || {};
 		var id = snap.modem_id != null ? snap.modem_id : 0;
+
+		/* 串口调度徽章：6 秒刷一次；工具页被卸载后 loadAtSched 返回 false，定时器自停。
+		   不用 store 的全局轮询，是因为这个状态只在 AT 调试台上有意义。 */
+		var schedTimer = setInterval(function () {
+			if (!self.loadAtSched(id)) clearInterval(schedTimer);
+		}, 6000);
+		self.loadAtSched(id);
 
 		/* 新增定时任务弹窗 */
 		function openScheduleModal() {

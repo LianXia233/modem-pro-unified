@@ -352,6 +352,85 @@ mod tests {
         assert!(!entries[0].up);
     }
 
+    /// 用户报的症状：日志里出现 `undefined · rsrq 从 undefined 变更为 undefined`。
+    ///
+    /// 根因有两层：① 前端读错字段名（`time/old/val/diff` vs `at/from/to/delta`），
+    /// ② 后端若把「未上报」当成一个值参与比较，就会拿空值当新旧值。
+    /// 这里钉住 ②：**未上报的指标根本不进比较**，所以永远不会出现空 from/to。
+    #[test]
+    fn invalid_signal_never_produces_undefined_events() {
+        let m = Metrics::new();
+
+        // ① 一上来就是全无效（四个指标都「未上报」）：不产生任何事件。
+        //
+        //    ⚠️ SINR 用 999（明显超范围）而不是 0：`valid_signal` 把 SINR=0
+        //    当作**有效值**保留（物理上 0 dB 确实存在），所以 0 建不出「全空」的基线。
+        //    这是有意的取舍 —— 见 `sinr_zero_is_kept_as_valid` 那条测试。
+        assert!(m.note_signal(0, &sig(99, 0, 0, 999)).is_empty());
+        assert!(m.note_signal(0, &sig(255, 0, 0, 999)).is_empty());
+
+        // ② 第一次有效值：只建立基线，不该报「从 undefined 变过来」
+        assert!(
+            m.note_signal(0, &sig(22, -95, -11, 12)).is_empty(),
+            "首次有效值只能建基线，不能生成变化事件"
+        );
+
+        // ③ 真的变了才报，且 from/to/label 必须都是实打实的内容
+        let e = m.note_signal(0, &sig(22, -104, -11, 12));
+        assert_eq!(e.len(), 1, "只该报 rsrp 一条");
+        let ev = &e[0];
+        assert_eq!(ev.field, "rsrp");
+        assert!(!ev.label.is_empty(), "label 为空会让前端显示 undefined");
+        assert!(!ev.from.is_empty(), "from 为空会让前端显示 undefined");
+        assert!(!ev.to.is_empty(), "to 为空会让前端显示 undefined");
+        assert!(ev.from.contains("-95"), "from 应是真实数值：{}", ev.from);
+        assert!(ev.to.contains("-104"), "to 应是真实数值：{}", ev.to);
+    }
+
+    /// RSRQ 专项：它在「未上报」时常常是 0，最容易踩空值比较的坑。
+    #[test]
+    fn rsrq_skips_unreported_and_compares_real_values() {
+        let m = Metrics::new();
+        // RSRQ=0 ⇒ 视为未上报：不建基线、不报事件
+        assert!(m.note_signal(0, &sig(22, -95, 0, 12)).is_empty());
+        // 首次有效 RSRQ：建基线
+        assert!(m.note_signal(0, &sig(22, -95, -11, 12)).is_empty());
+        // 有效 → 有效，且跨过阈值：报一条，from/to 都是 dB 数值
+        let e = m.note_signal(0, &sig(22, -95, -18, 12));
+        let rsrq = e
+            .iter()
+            .find(|x| x.field == "rsrq")
+            .expect("RSRQ 从 -11 变到 -18 应产生事件");
+        assert!(rsrq.from.starts_with('-'), "from={}", rsrq.from);
+        assert!(rsrq.to.starts_with('-'), "to={}", rsrq.to);
+        assert!(rsrq.label.contains("RSRQ"), "label={}", rsrq.label);
+    }
+
+    /// 已知取舍（记录在案，不是 bug）：SINR=0 被当作**有效值**。
+    ///
+    /// 为什么不像 RSRQ 那样把 0 当「未上报」：RSRQ 的合法范围是 -43..20 dB，
+    /// 恰好等于 0 的读数极少见，模组普遍用 0 表示「没有」；而 SINR 的合法范围
+    /// 含 0（信号与噪声等强，物理上成立），硬把 0 判成无效会抹掉真实读数。
+    ///
+    /// 代价：若某固件用 0 表示「SINR 未上报」，第一次拿到真实值时会产生一条
+    /// 「0 dB → 12 dB」的事件。这是**可见但可解释**的行为，比「真实 0 dB 被吞掉」好。
+    #[test]
+    fn sinr_zero_is_kept_as_valid() {
+        assert_eq!(valid_signal(&sig(99, 0, 0, 0)).2, Some(0));
+        // 而 RSRQ 的 0 必须被丢掉（模组普遍用 0 表示未上报）
+        assert_eq!(valid_signal(&sig(99, 0, 0, 0)).1, None);
+    }
+
+    /// 值没变就一条都不该有（否则日志会被刷屏，也掩盖真正的事件）。
+    #[test]
+    fn unchanged_signal_reports_nothing() {
+        let m = Metrics::new();
+        assert!(m.note_signal(0, &sig(22, -95, -11, 12)).is_empty());
+        for _ in 0..5 {
+            assert!(m.note_signal(0, &sig(22, -95, -11, 12)).is_empty());
+        }
+    }
+
     #[test]
     fn cell_summary_layout() {
         let c = CellInfo {

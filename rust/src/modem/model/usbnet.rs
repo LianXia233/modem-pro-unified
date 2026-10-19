@@ -29,7 +29,7 @@ use serde::Serialize;
 
 use crate::error::{msg, Result};
 
-use super::super::at::{csv, extract_field, is_ok};
+use super::super::at::{csv, extract_field, is_ok, Prio};
 use super::super::vendor::{UsbnetWrite, Vendor};
 use super::modem::Modem;
 
@@ -79,11 +79,29 @@ pub struct UsbNetMode {
 const QCFG: &str = "AT+QCFG=\"usbnet\"";
 
 impl Modem {
-    /// 读取 USB 网卡模式。
+    /// 读取 USB 网卡模式（**走 30 秒缓存**）。
+    ///
+    /// 这条命令只在工具页用，但用户会来回切页 / 连点刷新。缓存掉能省下串口，
+    /// 真正要实时的地方（写之后的回读）用 [`Self::usbnet_refresh`]。
     pub fn usbnet(&self) -> UsbNetMode {
+        if let Some(v) = self.usbnet_cache.get() {
+            return v;
+        }
+        let v = self.read_usbnet();
+        self.usbnet_cache.set(v.clone());
+        v
+    }
+
+    /// 强制实时读取（写之后的回读确认必须用这个，否则会读到旧值）。
+    pub fn usbnet_refresh(&self) -> UsbNetMode {
+        self.usbnet_cache.invalidate();
+        self.usbnet()
+    }
+
+    fn read_usbnet(&self) -> UsbNetMode {
         let vendor = self.vendor();
         let resp = self
-            .with_at(|p| p.command(QCFG, self.cmd_timeout))
+            .with_at_prio(Prio::Bulk, |p| p.command(QCFG, self.cmd_timeout))
             .unwrap_or_default();
         let parsed = is_ok(&resp).then(|| parse_usbnet(&resp)).flatten();
 
@@ -154,11 +172,12 @@ impl Modem {
             UsbnetWrite::Deny(why) => return Err(msg(why)),
         }
         let cmd = format!("AT+QCFG=\"usbnet\",{value}");
-        let resp = self.with_at(|p| p.command(&cmd, Duration::from_secs(5)))?;
+        let resp = self.with_at_prio(Prio::Bulk, |p| p.command(&cmd, Duration::from_secs(5)))?;
         if !is_ok(&resp) {
             return Err(msg(format!("下发失败：{}", resp.trim())));
         }
-        let st = self.usbnet();
+        // 回读必须实时：走缓存会读到写之前的值，然后误报「回读不符」
+        let st = self.usbnet_refresh();
         if st.value != value.to_string() {
             return Err(msg(format!(
                 "已下发但回读为 {}{}（目标 {value}）",

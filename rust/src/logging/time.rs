@@ -173,6 +173,18 @@ pub(crate) fn unix_now() -> i64 {
     system_now() + clock_offset()
 }
 
+/// Unix **毫秒**（含 NTP 校时偏移）。
+///
+/// 流量采样要按毫秒给每个点打时间戳：曲线横轴是 1 秒一个点，
+/// 用秒级时间戳会让同一秒内的两次采样撞在一起、前端画竖线。
+pub(crate) fn unix_now_ms() -> i64 {
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    ms + clock_offset() * 1000
+}
+
 /// Unix 秒 → RFC3339（UTC，形如 `2026-10-18T17:36:01Z`）。
 ///
 /// 与 [`timestamp`] 的区别：这个接受任意时刻，供采样历史/波动记录序列化。

@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use crate::error::Result;
 
-use super::super::at::{csv, extract_field, is_ok};
+use super::super::at::{csv, extract_field, is_ok, Prio};
 use super::addr;
 use super::band;
 use super::modem::Modem;
@@ -128,7 +128,7 @@ fn join_lines(resp: &str) -> String {
 impl Modem {
     /// 简版网络信息（运营商 + 接入技术）。
     pub fn network(&self) -> Result<NetworkInfo> {
-        let raw = self.with_at(|p| p.command("AT+COPS?", self.cmd_timeout))?;
+        let raw = self.with_at_prio(Prio::Data, |p| p.command("AT+COPS?", self.cmd_timeout))?;
         let ns = netselect::parse(&raw);
         let operator = ns.operator.clone().or_else(|| ns.plmn.clone());
         Ok(NetworkInfo {
@@ -147,7 +147,7 @@ impl Modem {
         if cmd.trim().is_empty() {
             return Ok(String::new());
         }
-        let resp = self.with_at(|p| {
+        let resp = self.with_at_prio(Prio::Data, |p| {
             let (text, _) = p.command_cancellable(cmd, self.cmd_timeout, &|| false)?;
             Ok(text)
         })?;
@@ -160,7 +160,7 @@ impl Modem {
     /// 「国际漫游 + 开关关闭 = 数据链路该停」）。
     pub fn network_status(&self, allow_roaming: bool) -> NetworkStatus {
         let qnw = self
-            .with_at(|p| p.command("AT+QNWINFO", self.cmd_timeout))
+            .with_at_prio(Prio::Data, |p| p.command("AT+QNWINFO", self.cmd_timeout))
             .unwrap_or_default();
         let info = parse_qnwinfo(&qnw);
 
@@ -172,7 +172,7 @@ impl Modem {
         // 只在 QNWINFO 没给出 PLMN 时才多发这一条 —— 指令可用的厂商不增加
         // 往返。`AT+CSPPLMN?` 在该机型同样回 ERROR，没有第二条兜底路。
         let cops = if info.plmn.is_none() {
-            self.with_at(|p| p.command("AT+COPS?", self.cmd_timeout))
+            self.with_at_prio(Prio::Data, |p| p.command("AT+COPS?", self.cmd_timeout))
                 .ok()
                 .map(|raw| netselect::parse(&raw))
                 .filter(|ns| ns.plmn.is_some() || ns.operator.is_some() || ns.act.is_some())
@@ -182,11 +182,11 @@ impl Modem {
         let f = merge_network(&info, cops.as_ref());
 
         let cs_reg = self
-            .with_at(|p| p.command("AT+CREG?", self.cmd_timeout))
+            .with_at_prio(Prio::Data, |p| p.command("AT+CREG?", self.cmd_timeout))
             .map(|raw| regstate::parse(&raw, "+CREG"))
             .unwrap_or_default();
         let ps_reg = self
-            .with_at(|p| p.command("AT+CGREG?", self.cmd_timeout))
+            .with_at_prio(Prio::Data, |p| p.command("AT+CGREG?", self.cmd_timeout))
             .map(|raw| regstate::parse(&raw, "+CGREG"))
             .unwrap_or_default();
 
@@ -197,7 +197,7 @@ impl Modem {
         let (mut reg_5g, mut reg_eps) = (None, None);
         if !cs_reg.registered && !ps_reg.registered {
             let raw = self
-                .with_at(|p| p.command("AT+C5GREG?", self.cmd_timeout))
+                .with_at_prio(Prio::Data, |p| p.command("AT+C5GREG?", self.cmd_timeout))
                 .unwrap_or_default();
             if raw.contains("+C5GREG") {
                 let st = regstate::parse(&raw, "+C5GREG");
@@ -207,7 +207,7 @@ impl Modem {
             }
             if reg_5g.is_none() {
                 let raw = self
-                    .with_at(|p| p.command("AT+CEREG?", self.cmd_timeout))
+                    .with_at_prio(Prio::Data, |p| p.command("AT+CEREG?", self.cmd_timeout))
                     .unwrap_or_default();
                 if raw.contains("+CEREG") {
                     let st = regstate::parse(&raw, "+CEREG");
@@ -231,7 +231,7 @@ impl Modem {
         // 漫游范围：不漫游时不用多读 IMSI
         let roam_scope = if roaming {
             let imsi = self
-                .with_at(|p| p.command("AT+CIMI", self.cmd_timeout))
+                .with_at_prio(Prio::Data, |p| p.command("AT+CIMI", self.cmd_timeout))
                 .map(|raw| super::siminfo::parse_imsi(&raw))
                 .unwrap_or(None);
             super::siminfo::roam_state(true, imsi.as_deref(), f.plmn.as_deref()).scope
@@ -296,7 +296,7 @@ impl Modem {
     /// 当前激活上下文的 APN / 地址（`AT+CGCONTRDP`）。
     fn query_active_context(&self) -> (Option<String>, Option<String>, Option<String>) {
         let resp = self
-            .with_at(|p| p.command("AT+CGCONTRDP", self.cmd_timeout))
+            .with_at_prio(Prio::Data, |p| p.command("AT+CGCONTRDP", self.cmd_timeout))
             .unwrap_or_default();
         parse_active_context(&resp)
     }

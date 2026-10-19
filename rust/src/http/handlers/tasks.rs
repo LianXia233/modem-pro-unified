@@ -187,7 +187,8 @@ fn handle_post(
             tasks.submit(spec, move |t| {
                 t.progress(format!("等待模组应答：{cmd}"));
                 let cancelled = t.clone();
-                let out = m.with_at(|p| {
+                // 走任务队列的手动 AT：同样是**用户操作**，别让后台采样把它压住
+                let out = m.with_at_prio(crate::modem::at::Prio::User, |p| {
                     p.command_cancellable(&cmd, cmd_timeout, &|| cancelled.cancelled())
                 })?;
                 let (resp, stopped) = out;

@@ -34,6 +34,7 @@
 //! 取不到就留空 —— **不猜列序、不编造数值**。解析不出来的厂商返回 `None`，
 //! 由调用方如实显示「未上报」，而不是拿空数组当「没有 CA」。
 
+use super::super::at::Prio;
 use super::network::CcInfo;
 
 /// 一次 CA 查询的结果。
@@ -237,7 +238,7 @@ impl super::Modem {
     pub fn ca_status(&self) -> Option<CaInfo> {
         let cmd = self.ca_cmds().into_iter().next()?;
         let resp = self
-            .with_at(|p| p.command(&cmd, self.cmd_timeout))
+            .with_at_prio(Prio::Data, |p| p.command(&cmd, self.cmd_timeout))
             .unwrap_or_default();
         if resp.trim().is_empty() {
             log::debug!("模组 id={} 的 {} 无应答", self.id, cmd);

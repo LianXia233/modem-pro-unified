@@ -27,6 +27,13 @@ impl AtPort {
         cancel: &dyn Fn() -> bool,
     ) -> Result<(String, bool)> {
         self.drain();
+        // ⚠️ 硬性节奏：距上一条不足 `Pacing::gap`（默认 25ms）就先睡够。
+        //
+        // 这里是**每一条**命令的落点 —— 一次逻辑操作里连发 3~5 条（读参数、
+        // 读短信）时，每条之间都有间隔，而不是「一口气全打给模块」。
+        // 早先只在「两次占用串口」之间限流，闭包内连发是无间隔的，实测会
+        // 丢应答 / 偶发 ERROR / 严重时 AT 口假死。
+        self.pacing.wait_gap();
         let mut out = String::with_capacity(cmd.len() + 2);
         out.push_str(cmd);
         out.push('\r');
@@ -34,6 +41,8 @@ impl AtPort {
             .write_all(out.as_bytes())
             .map_err(|e| msg(format!("写串口 {} 失败: {e}", self.path)))?;
         let _ = self.inner.flush();
+        // 写完才记时刻：从「写完」算间隔，模组收到的两条命令间隔才真是 gap
+        self.pacing.mark_sent();
         self.read_until_terminator(timeout, cancel)
     }
 

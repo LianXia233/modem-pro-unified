@@ -152,7 +152,9 @@ pub fn serve(stream: TcpStream, head: &[u8], state: Arc<AppState>, loopback: boo
     );
     stream.write_all(response.as_bytes())?;
 
-    let client = state.ws.register(stream.try_clone()?, path == "/display/ws");
+    let client = state
+        .ws
+        .register(stream.try_clone()?, path == "/display/ws");
     log::info!("WebSocket 已连接: {} (id={})", path, client.id);
 
     let result = pump(&mut stream, &client, &state);

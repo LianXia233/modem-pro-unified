@@ -6,15 +6,23 @@
 //! 语义解释与事件化消费在 `model::urc`（折算成脏标记）与 `http::loops::spawn_urc`
 //! （后台循环），不要再把解析逻辑塞回本层。
 
+mod cache;
 mod command;
+mod cooldown;
+mod pacing;
 mod parser;
 mod port;
 mod presets;
+mod sched;
 mod urc;
 
+pub use cache::Ttl;
+pub use cooldown::{OpenCooldown, DEFAULT_COOLDOWN};
+pub use pacing::{Pacing, DEFAULT_GAP};
 pub use parser::{
     csv, error_line, extract_all, extract_field, field_part, is_duplicate_activate, is_ok, to_i32,
 };
 pub use port::AtPort;
 pub use presets::{presets_for, AtPreset};
+pub use sched::{Limits, Prio, SchedStats, Scheduler};
 pub use urc::{classify_urc, LineGate, UrcKind, UrcLine};

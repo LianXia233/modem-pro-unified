@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crate::error::{msg, Result};
 
+use super::pacing::Pacing;
 use super::urc::{LineGate, UrcKind, UrcLine};
 
 /// 一个已打开的 AT 串口。
@@ -12,6 +13,11 @@ pub struct AtPort {
     pub(super) path: String,
     /// 行级 URC 过滤器：每个串口一份，缓冲与队列随端口生命周期。
     pub(super) gate: LineGate,
+    /// 命令节奏：**每条** AT 之间硬性延时（见 `at/pacing.rs`）。
+    ///
+    /// 放在端口上而不是全局：换口（`repoint`）之后节拍重新起算，
+    /// 不会因为「上个口刚发过」让新口的第一条命令白等。
+    pub(super) pacing: Pacing,
 }
 
 impl AtPort {
@@ -29,6 +35,7 @@ impl AtPort {
             inner,
             path: path.to_string(),
             gate: LineGate::default(),
+            pacing: Pacing::default(),
         })
     }
 
@@ -51,6 +58,15 @@ impl AtPort {
     /// 被洪水阈值丢弃的 URC 行数（累计，排障用）。
     pub fn urc_dropped(&self) -> u64 {
         self.gate.dropped()
+    }
+
+    /// 命令节奏统计（间隔、被节流的次数与累计等待毫秒）。
+    pub(crate) fn pacing_stats(&self) -> (u64, u64, u64) {
+        (
+            self.pacing.gap().as_millis() as u64,
+            self.pacing.throttled(),
+            self.pacing.waited_ms(),
+        )
     }
 
     /// 快速探活：发 "AT"，能在超时内收到 "OK" 就认为这是 AT 口。

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::QuotaConfig;
 use crate::error::{msg, Result};
 
-use super::super::at::is_ok;
+use super::super::at::{is_ok, Prio};
 use super::modem::Modem;
 
 /// 按模组保存的配额设置（对应 `quota.json` 里的 `settings`）。
@@ -259,8 +259,8 @@ pub fn delta(cur: u64, last: u64) -> u64 {
 impl Modem {
     /// 当前激活的**上网用** PDP 上下文（排除 ims / sos / mms）。
     pub fn data_cids(&self) -> Vec<i32> {
-        let defined = self.at_cmd("AT+CGDCONT?");
-        let activated = self.at_cmd("AT+CGACT?");
+        let defined = self.at_cmd_prio(Prio::Bulk, "AT+CGDCONT?");
+        let activated = self.at_cmd_prio(Prio::Bulk, "AT+CGACT?");
         super::params::build_contexts(&defined, &activated)
             .into_iter()
             .filter(|c| c.active && !c.internal)
@@ -276,7 +276,7 @@ impl Modem {
         }
         let mut done = Vec::new();
         for cid in cids {
-            let resp = self.at_cmd(&format!("AT+CGACT=0,{cid}"));
+            let resp = self.at_cmd_prio(Prio::Bulk, &format!("AT+CGACT=0,{cid}"));
             if is_ok(&resp) {
                 done.push(cid);
             } else {
@@ -293,14 +293,14 @@ impl Modem {
     ///
     /// 上下文定义还在（只是被停用），所以按 `AT+CGDCONT?` 里**非内部**的 cid 重新激活。
     pub fn unblock_data(&self) -> Vec<i32> {
-        let defined = self.at_cmd("AT+CGDCONT?");
+        let defined = self.at_cmd_prio(Prio::Bulk, "AT+CGDCONT?");
         let cids = super::params::build_contexts(&defined, "")
             .into_iter()
             .filter(|c| !c.internal)
             .map(|c| c.cid)
             .collect::<Vec<_>>();
         cids.into_iter()
-            .filter(|cid| is_ok(&self.at_cmd(&format!("AT+CGACT=1,{cid}"))))
+            .filter(|cid| is_ok(&self.at_cmd_prio(Prio::Bulk, &format!("AT+CGACT=1,{cid}"))))
             .collect()
     }
 
@@ -312,7 +312,7 @@ impl Modem {
             return Err(msg(super::airplane::airplane_blocked_reason()));
         }
         let cmd = if on { "AT+CFUN=4" } else { "AT+CFUN=1" };
-        let resp = self.at_cmd(cmd);
+        let resp = self.at_cmd_prio(Prio::Bulk, cmd);
         if is_ok(&resp) {
             Ok(())
         } else {

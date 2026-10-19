@@ -74,8 +74,13 @@ pub fn push_modem(state: &AppState, modem: &Modem) {
 pub(crate) const MODEM_REFRESH_EVERY: i64 = 300;
 
 /// 推上行 / 下行速度（每轮周期推送都会采样，前端才能持续看到实时速度）。
+///
+/// 数据源是 **sysfs 链路计数**（`runtime/ifstat.rs`），不是模组 AT 计数器：
+/// FM350-GL 的 `AT+GTSTATIS` 回 ERROR，走 AT 那条路这里会直接 `return`，
+/// 于是内置 WebUI 的 WS 推送永远收不到 traffic 事件、速率一直是 0。
+/// 换成 sysfs 之后，WS 推送与 `/api/traffic`、`/api/network/status` 三处同源。
 pub fn push_traffic(state: &AppState, modem: &Modem) {
-    let view = modem.traffic_view();
+    let view = state.ifstat.view();
     if !view.supported {
         return;
     }

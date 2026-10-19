@@ -5,6 +5,7 @@
 
 use serde::Serialize;
 
+use super::super::at::Prio;
 use super::modem::Modem;
 use super::siminfo::{self, RoamState};
 
@@ -33,15 +34,15 @@ impl Modem {
     /// 读取漫游视图。`allow_roaming` 来自 `[net] allow_roaming`。
     pub fn roam_view(&self, allow_roaming: bool) -> RoamView {
         let imsi = self
-            .with_at(|p| p.command("AT+CIMI", self.cmd_timeout))
+            .with_at_prio(Prio::Data, |p| p.command("AT+CIMI", self.cmd_timeout))
             .unwrap_or_default();
         let imsi = super::siminfo::parse_imsi(&imsi);
         let reg = self
-            .with_at(|p| p.command("AT+CGREG?", self.cmd_timeout))
+            .with_at_prio(Prio::Data, |p| p.command("AT+CGREG?", self.cmd_timeout))
             .map(|raw| super::regstate::parse(&raw, "+CGREG"))
             .unwrap_or_default();
         let plmn = self
-            .with_at(|p| p.command("AT+COPS?", self.cmd_timeout))
+            .with_at_prio(Prio::Data, |p| p.command("AT+COPS?", self.cmd_timeout))
             .map(|raw| super::netselect::parse(&raw).plmn)
             .unwrap_or(None);
 

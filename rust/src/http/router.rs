@@ -36,6 +36,10 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/vendor/cmds"),
     ("GET", "/api/signal"),
     ("GET", "/api/signal/history"),
+    ("GET", "/api/at/sched"),
+    ("GET", "/api/traffic"),
+    ("GET", "/api/timezone"),
+    ("POST", "/api/timezone"),
     ("GET", "/api/network"),
     ("GET", "/api/network/status"),
     ("GET", "/api/netinfo"),
@@ -158,6 +162,13 @@ pub fn handle(req: Request, state: Arc<AppState>) -> Result<()> {
         ("GET", "/api/vendor/cmds") => handlers::vendor_cmds::handle(req, &state, &query),
         ("GET", "/api/signal") => handlers::signal::handle(req, &state, &query),
         ("GET", "/api/signal/history") => handlers::signal_history::handle(req, &state, &query),
+        // 链路实时速率/累计流量/曲线（sysfs，后台 1s 一拍）
+        // 串口调度状态（优先级服务次数 / 等待时长 / 限流次数）
+        ("GET", "/api/at/sched") => handlers::at_sched::handle(req, &state, &query),
+        ("GET", "/api/traffic") => handlers::traffic::handle(req, &state, &query),
+        // 系统时区（uci + /etc/TZ），与 /api/ntp/set 的分工见 handlers/timezone.rs
+        ("GET", "/api/timezone") => handlers::timezone::get(req, &state, &query),
+        ("POST", "/api/timezone") => handlers::timezone::set(req, &state, &query),
         ("GET", "/api/network") => handlers::network::handle(req, &state, &query),
         ("GET", "/api/network/status") => handlers::network_status::handle(req, &state, &query),
         ("GET", "/api/netinfo") => handlers::netinfo::handle(req, &state, &query),

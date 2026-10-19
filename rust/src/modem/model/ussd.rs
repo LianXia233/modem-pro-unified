@@ -16,7 +16,7 @@ use serde::Serialize;
 
 use crate::error::{msg, Result};
 
-use super::super::at::{error_line, extract_field};
+use super::super::at::{error_line, extract_field, Prio};
 use super::modem::Modem;
 
 /// 一次 USSD 应答。
@@ -106,7 +106,7 @@ pub fn parse_cusd_line(line: &str) -> Option<UssdResult> {
 impl Modem {
     /// SIM 是不是锁着 PIN（`AT+CPIN?` 回 `SIM PIN`）：锁着时发不了 USSD。
     pub fn sim_pin_locked(&self) -> bool {
-        let resp = self.at_cmd("AT+CPIN?");
+        let resp = self.at_cmd_prio(Prio::Bulk, "AT+CPIN?");
         extract_field(&resp, "+CPIN")
             .map(|s| s.trim().eq_ignore_ascii_case("SIM PIN"))
             .unwrap_or(false)
@@ -135,7 +135,7 @@ impl Modem {
         self.clear_ussd();
         // 15 = 7bit 默认字符集；会话模式 1 = 需要应答
         let cmd = format!("AT+CUSD=1,\"{code}\",15");
-        let resp = self.at_cmd(&cmd);
+        let resp = self.at_cmd_prio(Prio::Bulk, &cmd);
         if resp.trim().is_empty() {
             return Err(msg("AT 口无应答（串口未打开或模组不应答）"));
         }

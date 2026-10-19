@@ -7,6 +7,7 @@
 'require modemd.task as task';
 'require modemd.fmt as fmt';
 'require modemd.icons as icons';
+'require modemd.spark as spark';
 
 /* 设备中心（现代化白色毛玻璃总览视图）
  *
@@ -309,6 +310,29 @@ return view.extend({
 				])
 			]),
 
+			/* 6b. 实时速率曲线（最近 60 秒，后端 1 秒一拍的环形缓冲） */
+			E('div', { 'class': 'mp-card' }, [
+				E('div', { 'class': 'mp-card-hd' }, [
+					E('h3', { 'class': 'mp-card-title' }, [ icons.get('pulse', 17), '实时速率曲线' ]),
+					E('div', { 'class': 'mp-card-actions' }, [
+						E('span', { 'class': 'mp-legend-item' }, [
+							E('span', { 'class': 'mp-legend-dot', 'style': 'background:#f59e0b' }),
+							'上行'
+						]),
+						E('span', { 'class': 'mp-legend-item' }, [
+							E('span', { 'class': 'mp-legend-dot', 'style': 'background:#3b82f6' }),
+							'下行'
+						]),
+						E('span', { 'id': 'traffic-iface', 'class': 'mp-badge' }, '接口识别中…')
+					])
+				]),
+				E('div', { 'id': 'traffic-chart', 'style': 'width:100%' }, [
+					E('div', { 'style': 'padding:28px 0;text-align:center;color:var(--mp-neutral-500);font-size:12.5px' }, '等待采样…')
+				]),
+				E('div', { 'style': 'margin-top:6px;font-size:11.5px;color:var(--mp-neutral-500)' },
+					'数据来自本机网卡计数（后台每 1 秒采样，与页面是否打开无关）；曲线保留最近 60 秒。')
+			]),
+
 			/* 7. 双列布局：SIM 卡信息 + 模组硬件 */
 			E('div', { 'style': 'display:grid;grid-template-columns:repeat(auto-fit, minmax(320px, 1fr));gap:16px;margin-bottom:18px' }, [
 				/* SIM 卡 */
@@ -376,7 +400,42 @@ return view.extend({
 		return root;
 	},
 
+	/* 拉一次流量快照并重绘曲线。
+	   防重入：store 每 3 秒通知一次，请求慢时不该叠起来。 */
+	fetchTraffic: function (id) {
+		var self = this;
+		if (self._trafficBusy) return;
+		self._trafficBusy = true;
+		api.get('/api/traffic', { modem_id: id }).then(function (t) {
+			self._trafficBusy = false;
+			self.drawTrafficChart(t);
+		}).catch(function () {
+			self._trafficBusy = false;
+			/* 失败不清空：曲线保持上一帧。后端采样从未中断，
+			   网络恢复后下一个点自然接上，不需要重试风暴。 */
+		});
+	},
+
+	/* 画曲线 + 更新接口徽章。`t` 是 /api/traffic 的 data。 */
+	drawTrafficChart: function (t) {
+		var box = document.getElementById('traffic-chart');
+		if (!box) return;
+		var badge = document.getElementById('traffic-iface');
+		if (badge) {
+			if (t && t.iface) {
+				badge.textContent = t.iface + (t.driver ? ' · ' + t.driver : '');
+				badge.className = 'mp-badge ' + (t.iface_up ? 'mp-badge-success' : 'mp-badge-warning');
+			} else {
+				badge.textContent = t && t.modem_found === false ? '模组未就绪' : '接口未识别';
+				badge.className = 'mp-badge mp-badge-warning';
+			}
+		}
+		var pts = (t && t.history) || [];
+		box.innerHTML = spark.render(pts, { h: 190 });
+	},
+
 	redraw: function (s) {
+		var self = this;
 		var snap = s.snapshot || {};
 		var id = snap.modem_id != null ? snap.modem_id : 0;
 		var modems = s.modems || [];
@@ -562,6 +621,11 @@ return view.extend({
 			trafGrid.appendChild(metricBox('累计已发送', fmt.bytes(tr.sent), '', '会话发送总量'));
 			trafGrid.appendChild(metricBox('累计已接收', fmt.bytes(tr.recv), '', '会话接收总量'));
 		}
+
+		/* 实时速率曲线：/api/traffic 的 history（后端 1 秒一拍、保留 60 个点）。
+		   前端多久拉一次只影响「曲线多久前移一格」，不影响数据完整性 ——
+		   因为历史点在后端环形缓冲里，不是前端自己攒的。 */
+		self.fetchTraffic(id);
 
 		/* SIM 卡信息 */
 		var simKv = document.getElementById('sim-kv');

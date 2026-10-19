@@ -1078,6 +1078,19 @@
 /* 登录表单：用原生 form（回车/按钮都走浏览器原生提交，最稳），
    在外部 flex 条里用 display:contents 把三个控件“拿”出来排版 */
 #loginBar form{display:contents}
+
+/* ---- 实时速率曲线（内联 SVG，无第三方库） ----
+   配色避开红/绿：那是 A 股涨跌语义，用在这里会误导。上行琥珀、下行蓝。 */
+.traffic-chart-wrap { margin-top: 12px; }
+.traffic-chart-hd {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 11.5px; color: var(--muted, #6b7280); margin-bottom: 4px;
+}
+.traffic-chart-hd .lg-dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  margin: 0 4px 0 8px; vertical-align: middle;
+}
+#trafficChart { min-height: 120px; }
 </style>
 <link rel="stylesheet" href="/layouts/standard.css">
 <link rel="stylesheet" href="/layouts/outline.css">
@@ -3619,7 +3632,7 @@ function curNetCard(st, t) {
   const down = has ? t.down_text : '';
   const busy = has && ((t.up_bps || 0) > 0 || (t.down_bps || 0) > 0);
   const detail = !has
-    ? `<div class="muted">该模组未上报流量统计指令（移远 <code>AT+QGDCNT?</code> / 广和通 <code>AT+GTSTATIS?</code> 都不可用），无法计算上下行速度</div>`
+    ? `<div class="muted">还没有识别到模组的数据网卡（或后端采样尚未跑起来）。速率与累计来自 <code>/sys/class/net/&lt;iface&gt;/statistics</code>，与模组 AT 指令无关 —— 后台每秒采样一次，稍等即可。</div>`
     : `<div class="tile-kv">
          ${f(t.estimated ? '累计上行（估算）' : '累计上行', fmtBytes(t.sent))}
          ${f(t.estimated ? '累计下行（估算）' : '累计下行', fmtBytes(t.recv))}
@@ -3662,6 +3675,17 @@ function curNetCard(st, t) {
       </div>
       ${detail}
       ${ambrBox}
+      <div class="traffic-chart-wrap">
+        <div class="traffic-chart-hd">
+          <span class="pill">最近 60 秒</span>
+          <span class="muted" id="trafficIface"></span>
+          <span class="muted" style="margin-left:auto">
+            <i class="lg-dot" style="background:#f59e0b"></i>上行
+            <i class="lg-dot" style="background:#3b82f6"></i>下行
+          </span>
+        </div>
+        <div id="trafficChart"></div>
+      </div>
     </div>
   </div>`;
 }
@@ -3704,7 +3728,102 @@ function renderCurNet(t) {
   const st = lastNet[curId];
   if (!st) { el.innerHTML = '<span class="muted">点击「刷新速率」加载</span>'; return; }
   el.innerHTML = curNetCard(st, t || st.traffic);
+  drawTrafficChart(lastTraffic);
 }
+
+/* ---------- 实时速率曲线 ----------
+ *
+ * 数据源 /api/traffic（后端 runtime/ifstat.rs：固定 1000ms 从
+ * /sys/class/net/<iface>/statistics 采样，**与页面是否打开无关**）。
+ * 前端只负责画：不自己算速率、不自己攒历史 —— 否则 WebUI 与 LuCI 会算出两套数字。
+ *
+ * 画法与 LuCI 侧 spark.js 保持一致（同样的配色、同样的纵轴取整规则），
+ * 但这里内联一份精简实现：WebUI 是单文件页面，不该为了 60 行 SVG 再拉一个请求。 */
+let lastTraffic = null;
+
+function niceCeil(v) {
+  if (!(v > 0)) return 1000;
+  const exp = Math.floor(Math.log(v) / Math.LN10);
+  const base = Math.pow(10, exp);
+  const f = v / base;
+  return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * base;
+}
+
+function shortRate(v) {
+  if (!(v > 0)) return '0';
+  if (v >= 1e9) return (v / 1e9).toFixed(v >= 1e10 ? 0 : 1) + 'G';
+  if (v >= 1e6) return (v / 1e6).toFixed(v >= 1e7 ? 0 : 1) + 'M';
+  if (v >= 1e3) return (v / 1e3).toFixed(v >= 1e4 ? 0 : 1) + 'K';
+  return String(Math.round(v));
+}
+
+function trafficSvg(points) {
+  const w = 1000, h = 170, padL = 58, padR = 10, padT = 10, padB = 18;
+  const iw = w - padL - padR, ih = h - padT - padB;
+  const UP = '#f59e0b', DN = '#3b82f6';
+  let pts = Array.isArray(points) ? points.slice(-60) : [];
+  let maxV = 0;
+  for (const p of pts) maxV = Math.max(maxV, p.up_bps || 0, p.down_bps || 0);
+  const top = niceCeil(maxV);
+  const slots = 60, off = slots - pts.length;
+  const xOf = i => padL + (iw * (off + i)) / Math.max(1, slots - 1);
+  const yOf = b => padT + ih - (ih * Math.min(Math.max(b || 0, 0), top)) / top;
+
+  const line = key => pts.map((p, i) =>
+    (i ? 'L' : 'M') + xOf(i).toFixed(1) + ',' + yOf(p[key]).toFixed(1)).join(' ');
+  const area = key => pts.length
+    ? line(key) + ' L' + xOf(pts.length - 1).toFixed(1) + ',' + (padT + ih).toFixed(1) +
+      ' L' + xOf(0).toFixed(1) + ',' + (padT + ih).toFixed(1) + ' Z' : '';
+
+  let grid = '';
+  for (let g = 0; g <= 4; g++) {
+    const gy = padT + ih * g / 4;
+    grid += `<line x1="${padL}" y1="${gy.toFixed(1)}" x2="${padL + iw}" y2="${gy.toFixed(1)}" stroke="currentColor" stroke-opacity="0.10"/>`;
+    grid += `<text x="${padL - 6}" y="${(gy + 3.5).toFixed(1)}" text-anchor="end" font-size="9" fill="currentColor" fill-opacity="0.55">${shortRate(top * (4 - g) / 4)}</text>`;
+  }
+  const tLbl = [[0, '60s 前', 'start'], [0.5, '30s', 'middle'], [1, '现在', 'end']].map(([r, txt, anc]) =>
+    `<text x="${(padL + iw * r).toFixed(1)}" y="${h - 3}" text-anchor="${anc}" font-size="9" fill="currentColor" fill-opacity="0.45">${txt}</text>`).join('');
+
+  const empty = pts.length ? '' :
+    `<text x="${padL + iw / 2}" y="${padT + ih / 2}" text-anchor="middle" font-size="11" fill="currentColor" fill-opacity="0.45">等待采样…（后台每秒一个点）</text>`;
+
+  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" preserveAspectRatio="none" style="display:block;color:inherit">
+    ${grid}
+    ${pts.length ? `<path d="${area('down_bps')}" fill="${DN}" fill-opacity="0.16"/>` : ''}
+    ${pts.length ? `<path d="${area('up_bps')}" fill="${UP}" fill-opacity="0.16"/>` : ''}
+    ${pts.length ? `<path d="${line('down_bps')}" fill="none" stroke="${DN}" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round"/>` : ''}
+    ${pts.length ? `<path d="${line('up_bps')}" fill="none" stroke="${UP}" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round"/>` : ''}
+    ${pts.length ? `<circle cx="${xOf(pts.length - 1).toFixed(1)}" cy="${yOf(pts[pts.length - 1].down_bps).toFixed(1)}" r="2.4" fill="${DN}"/>` : ''}
+    ${pts.length ? `<circle cx="${xOf(pts.length - 1).toFixed(1)}" cy="${yOf(pts[pts.length - 1].up_bps).toFixed(1)}" r="2.4" fill="${UP}"/>` : ''}
+    ${empty}${tLbl}
+  </svg>`;
+}
+
+function drawTrafficChart(t) {
+  const box = $('#trafficChart');
+  if (!box) return;
+  const badge = $('#trafficIface');
+  if (badge) {
+    if (t && t.iface) {
+      badge.textContent = t.iface + (t.driver ? ' · ' + t.driver : '') + (t.iface_up ? '' : '（未 UP）');
+    } else {
+      badge.textContent = t && t.modem_found === false ? '模组未就绪' : '接口未识别';
+    }
+  }
+  box.innerHTML = trafficSvg((t && t.history) || []);
+}
+
+/* 每 2 秒拉一次曲线。后端 1 秒一拍、保留 60 个点，
+   所以前端拉取频率只影响「多久前移一格」，不会丢数据。 */
+async function pollTraffic() {
+  try {
+    const t = await api('/api/traffic?modem_id=' + encodeURIComponent(curId));
+    lastTraffic = t;
+    drawTrafficChart(t);
+  } catch { /* 失败保持上一帧：后端采样没断，恢复后自然接上 */ }
+}
+setInterval(pollTraffic, 2000);
+document.addEventListener('DOMContentLoaded', () => setTimeout(pollTraffic, 1200));
 
 /* ---------- 基站 ---------- */
 /* 小区用「卡片 + 键值网格」渲染而不是 11 列表格：窄屏下表格会被挤到不可读，

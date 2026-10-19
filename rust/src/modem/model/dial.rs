@@ -13,7 +13,7 @@ use serde::Serialize;
 use crate::error::{msg, Result};
 use crate::logging::{rfc3339, seconds_since, unix_now};
 
-use super::super::at::{csv, extract_field, is_ok};
+use super::super::at::{csv, extract_field, is_ok, Prio};
 use super::addr;
 use super::modem::Modem;
 use super::params::{cgact_state, is_internal_apn, valid_apn, Context};
@@ -23,6 +23,15 @@ use super::regstate;
 
 /// 未拨号（零值归一后的初始态）。
 pub const DIAL_IDLE: &str = "idle";
+/// 有数据网卡但没拿到地址（或地址已失效）。
+pub const DIAL_DISCONNECTED: &str = "disconnected";
+/// 正在断开（含主机侧拨号器收尾）。
+pub const DIAL_DISCONNECTING: &str = "disconnecting";
+/// 连数据网卡都没识别到 —— 状态未知，不是「未连接」。
+///
+/// 两者必须分开：`disconnected` 表示「模组在、链路没起来」（可以重拨），
+/// `unknown` 表示「连该看哪块网卡都不知道」（多半是模组没插好 / 驱动没绑）。
+pub const DIAL_UNKNOWN: &str = "unknown";
 /// 拨号中。
 pub const DIAL_DIALING: &str = "dialing";
 /// 已连接。
@@ -38,7 +47,10 @@ pub fn dial_state_text(state: &str) -> String {
     match state {
         DIAL_DIALING => "拨号中",
         DIAL_CONNECTED => "已连接",
-        DIAL_FAILED => "拨号失败",
+        DIAL_FAILED => "连接异常",
+        DIAL_DISCONNECTED => "未连接",
+        DIAL_DISCONNECTING => "正在断开",
+        DIAL_UNKNOWN => "状态未知",
         _ => "未拨号",
     }
     .to_string()
@@ -103,6 +115,14 @@ pub struct DialState {
     pub last_error: String,
     /// 用户手动点过「断开」→ 自动组网就别再替他拨回来（尊重人的意思）。
     pub manual_stop: bool,
+    /// 这条链路是谁拉起来的（排障关键）：
+    /// `modemd` = 本程序下发的拨号；`netifd` = 路由器按 UCI 配置拉的；
+    /// 空 = 没链路 / 判不出。
+    ///
+    /// 早先只有 `state`，于是「netifd 按 static 配置把 eth2 拉起来、本程序从没拨过号」
+    /// 会被显示成「未拨号」——实际上网是通的。现在用实际地址判定，并标出来源。
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub link_source: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<DialStep>,
 }
@@ -618,6 +638,66 @@ pub fn match_dial_iface(name: &str) -> (bool, bool) {
     (false, false)
 }
 
+/// 读某块网卡的 IPv4 地址（带 5 秒缓存）。
+///
+/// ## 为什么用外部 `ip` 而不是 sysfs
+///
+/// `/sys/class/net/<if>/` 里**没有 IP 地址**（只有 MAC/统计/operstate）；
+/// IPv6 能从 `/proc/net/if_inet6` 读到，IPv4 则必须走 `getifaddrs` ——
+/// Rust 标准库没有这个接口，而本仓库刻意不引 libc 依赖（OpenWrt 交叉编译越省越好）。
+///
+/// 于是用 `ip -4 -o addr show dev <dev>`：OpenWrt 自带 iproute2，输出稳定，
+/// 一行一台地址。**带 5 秒缓存**是因为 `/api/dial` 与 `/api/snapshot` 都会被
+/// 页面轮询，不缓存就会每 3 秒 fork 一个进程 —— 在 MT7621 这类小机器上很浪费。
+fn iface_addrs_cached(dev: &str) -> Vec<String> {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<Option<(String, Instant, Vec<String>)>> = Mutex::new(None);
+
+    if dev.trim().is_empty() {
+        return Vec::new();
+    }
+    {
+        let g = CACHE.lock().unwrap();
+        if let Some((d, at, addrs)) = g.as_ref() {
+            if d == dev && at.elapsed() < Duration::from_secs(5) {
+                return addrs.clone();
+            }
+        }
+    }
+    let addrs = read_iface_addrs(dev);
+    *CACHE.lock().unwrap() = Some((dev.to_string(), Instant::now(), addrs.clone()));
+    addrs
+}
+
+/// 真正执行 `ip -4 -o addr show dev <dev>` 并解析。
+fn read_iface_addrs(dev: &str) -> Vec<String> {
+    let out = std::process::Command::new("ip")
+        .args(["-4", "-o", "addr", "show", "dev", dev])
+        .output();
+    let Ok(out) = out else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut v = Vec::new();
+    for line in text.lines() {
+        // 形如：`2: eth2    inet 10.42.0.16/24 brd 10.42.0.255 scope global eth2`
+        let Some(pos) = line.find(" inet ") else {
+            continue;
+        };
+        let rest = &line[pos + 6..];
+        let addr = rest.split_whitespace().next().unwrap_or("");
+        if addr.is_empty() {
+            continue;
+        }
+        v.push(addr.to_string());
+    }
+    v
+}
+
 /// 扫一遍主机网卡，挑出可能是模组数据口的那些（强候选在前，其余按名字排）。
 ///
 /// 只是**提示**：真正把网卡拉起来要看主机侧的驱动/拨号器（见 [`DialType::host_setup`]），
@@ -642,11 +722,14 @@ pub fn dial_iface_snapshot() -> Vec<IfaceInfo> {
         let up = std::fs::read_to_string(e.path().join("operstate"))
             .map(|s| s.trim() != "down")
             .unwrap_or(false);
+        // addr 现在是真的（带缓存）：早先留空，导致「链路有没有地址」判不出来，
+        // 拨号状态只能退化成「接口 UP 就算连着」——那正是用户报的「读不到状态」。
+        let addr = iface_addrs_cached(&name);
         out.push(IfaceInfo {
             name,
             up,
             strong,
-            addr: Vec::new(),
+            addr,
         });
     }
     out.sort_by(|a, b| match (a.strong, b.strong) {
@@ -1094,12 +1177,12 @@ impl Modem {
     pub fn dial_readiness(&self) -> DialReadiness {
         let mut rd = DialReadiness::default();
 
-        let pin = self.at_cmd("AT+CPIN?");
+        let pin = self.at_cmd_prio(Prio::Data, "AT+CPIN?");
         rd.sim_ready = Some(pin.lines().any(|l| l.to_uppercase().contains("READY")));
         rd.raw
             .push(("AT+CPIN?".to_string(), pin.trim().to_string()));
 
-        let cfun = self.at_cmd("AT+CFUN?");
+        let cfun = self.at_cmd_prio(Prio::Data, "AT+CFUN?");
         // 形如 `+CFUN: 1`；飞行模式是 4
         rd.cfun = cfun
             .lines()
@@ -1113,13 +1196,13 @@ impl Modem {
         // CEREG 优先；回显里没有就换 CREG / CGREG 再试
         let mut reg: Option<i32> = None;
         let mut used = String::new();
-        let mut resp = self.at_cmd("AT+CEREG?");
+        let mut resp = self.at_cmd_prio(Prio::Data, "AT+CEREG?");
         if resp.contains("+CEREG") {
             used = "AT+CEREG?".to_string();
             reg = Some(regstate::parse(&resp, "+CEREG").stat);
         } else {
             for (cmd, tag) in [("AT+CGREG?", "+CGREG"), ("AT+CREG?", "+CREG")] {
-                let r = self.at_cmd(cmd);
+                let r = self.at_cmd_prio(Prio::Data, cmd);
                 if r.contains(tag.trim_start_matches('+')) {
                     used = cmd.to_string();
                     resp = r;
@@ -1488,29 +1571,54 @@ impl Modem {
     /// 地址也拿到了，但状态机仍是 `idle`（没手动拨过号）—— 早先这两格只在
     /// `connected` 时才填，页面上「主机侧网卡」永远是 `-`，看着像没读到数据。
     pub fn dial_status(&self) -> DialState {
-        let st = self.dial_state.lock().unwrap().clone();
-        let mut st = st.normalized();
+        let mut st = self.dial_state.lock().unwrap().clone().normalized();
         st.modem_id = self.id;
-        if st.host_iface.trim().is_empty() || st.host_ips.is_empty() {
+
+        // ① 本程序没记录过数据网卡时，按**这个模组的 USB 设备**推一块出来。
+        if st.host_iface.trim().is_empty() {
             let names = usb_netifs_for_port(&self.port());
-            if st.host_iface.trim().is_empty() {
-                // QMAP：地址在 mux 口（`wwan0_1`）上，优先它
-                let pick = names
-                    .iter()
-                    .find(|n| crate::netprov::provision::qmap_mode(n) == 1)
-                    .or_else(|| names.first());
-                if let Some(n) = pick {
-                    st.host_iface = n.clone();
-                }
+            // QMAP：地址在 mux 口（`wwan0_1`）上，优先它
+            let pick = names
+                .iter()
+                .find(|n| crate::netprov::provision::qmap_mode(n) == 1)
+                .or_else(|| names.first());
+            if let Some(n) = pick {
+                st.host_iface = n.clone();
             }
-            if st.host_ips.is_empty() && !st.host_iface.is_empty() {
-                if let Some(i) = dial_iface_snapshot()
-                    .into_iter()
-                    .find(|i| i.name == st.host_iface)
-                {
-                    st.host_ips = i.addr.clone();
-                }
-            }
+        }
+
+        // ② 补地址。只查**这一块**网卡（带 5 秒缓存），
+        //    不再遍历 `dial_iface_snapshot()` 的所有候选 —— 那会 N 次 fork。
+        if st.host_ips.is_empty() && !st.host_iface.is_empty() {
+            st.host_ips = iface_addrs_cached(&st.host_iface);
+        }
+
+        // ③ 状态机没结论（`idle` = 本程序从没下发过拨号）时，
+        //    用**实际链路事实**给出结论。
+        //
+        //    这是用户报的「拨号链路状态读不到」的根因：这台机器上 `eth2`
+        //    是 netifd 按 UCI（`modem0` proto=static）拉起来的，地址 10.42.0.16
+        //    真实可用、默认路由也在走它 —— 但本程序没拨过号，状态机停在 idle，
+        //    页面就显示「未拨号」。
+        //
+        //    判据刻意**不看** `operstate == up`：接口 UP 只说明链路层在，
+        //    不代表拿到了地址（DHCP 失败、静态配置写错都会 UP 但没 IP）。
+        if st.state == DIAL_IDLE {
+            st.state = if st.host_iface.is_empty() {
+                // 连该看哪块网卡都不知道（模组没插好 / 驱动没绑）
+                DIAL_UNKNOWN.to_string()
+            } else if st.host_ips.is_empty() {
+                // 网卡在、但没拿到地址 → 链路没起来
+                DIAL_DISCONNECTED.to_string()
+            } else {
+                // 有地址 ⇒ 链路真的通了。标注「不是本程序拨的」，排障时一眼能分清
+                st.link_source = "netifd".to_string();
+                DIAL_CONNECTED.to_string()
+            };
+            st.state_text = dial_state_text(&st.state);
+        } else if st.link_source.is_empty() && !st.host_ips.is_empty() {
+            // 本程序拨的（状态机已经给出结论），且有地址
+            st.link_source = "modemd".to_string();
         }
         st
     }
@@ -1671,9 +1779,9 @@ impl Modem {
     /// 两条候选：不带 cid 的标准写法先试；被拒（实测 FM350-GL 的 `AT+CGPADDR`
     /// 直接回 ERROR，而 `AT+CGPADDR=2` 正常）再试带 cid 的写法。
     fn query_pdp_addrs(&self, cid: i32) -> Result<(String, String)> {
-        let mut resp = self.at_cmd("AT+CGPADDR");
+        let mut resp = self.at_cmd_prio(Prio::Data, "AT+CGPADDR");
         if !is_ok(&resp) {
-            resp = self.at_cmd(&format!("AT+CGPADDR={cid}"));
+            resp = self.at_cmd_prio(Prio::Data, &format!("AT+CGPADDR={cid}"));
             if !is_ok(&resp) {
                 return Err(msg(format!(
                     "模组拒绝 AT+CGPADDR（{}）",
@@ -1851,7 +1959,7 @@ impl Modem {
 
         // ② 激活 PDP（cid 校验 / 先断后连 / 回读确认都在 set_pdp 里）
         let mut st_err = self.set_pdp(cid, true, req.reconnect).err();
-        let mut st = self.params();
+        let mut st = self.params_refresh();
         if st_err.is_some() && apn.is_empty() {
             // ⚠️ 实测 FM350-GL：AT+CGACT=0,<cid> 之后该 cid 会从 AT+CGDCONT? 里消失，
             // 于是「断开 → 拨号（APN 留空）」会报错。这时拿**上次用过（本来就从模组读出来）
@@ -1870,7 +1978,7 @@ impl Modem {
                         &format!("cid={cid} {pt} {last}"),
                     );
                     st_err = self.set_pdp(cid, true, req.reconnect).err();
-                    st = self.params();
+                    st = self.params_refresh();
                 }
             }
         }
@@ -2009,14 +2117,14 @@ impl Modem {
         }
 
         let cmd = format!("AT+CGACT=0,{cid}");
-        let resp = self.at_cmd(&cmd);
+        let resp = self.at_cmd_prio(Prio::Data, &cmd);
         if !is_ok(&resp) {
             return Err(msg(format!(
                 "模组拒绝 {cmd}（内部上下文 IMS/sos 不允许手动停用；或该 cid 本来就没激活）"
             )));
         }
         // 回读确认（去激活通常很快，读不到也不影响「已经下发过」这件事，所以不当失败）
-        let activated = self.at_cmd("AT+CGACT?");
+        let activated = self.at_cmd_prio(Prio::Data, "AT+CGACT?");
         // 三态判据：模组一条 `+CGACT:` 行都不回时（实测广和通 MTK 平台如此），
         // 旧写法会把「没列明细」误读成「已确认去激活」， diagnostically 是两件事。
         let mut note = String::new();
@@ -2134,8 +2242,27 @@ mod tests {
         assert_eq!(dial_state_text(DIAL_IDLE), "未拨号");
         assert_eq!(dial_state_text(DIAL_DIALING), "拨号中");
         assert_eq!(dial_state_text(DIAL_CONNECTED), "已连接");
-        assert_eq!(dial_state_text(DIAL_FAILED), "拨号失败");
+        // 用户报的「拨号链路状态读不到」修复时统一了措辞：
+        // failed 从「拨号失败」改成更准确的「连接异常」（链路已建立后掉线也算它）
+        assert_eq!(dial_state_text(DIAL_FAILED), "连接异常");
+        // 新增的三个状态：必须能和「未拨号」区分开，否则界面上看不出是哪种毛病
+        assert_eq!(dial_state_text(DIAL_DISCONNECTED), "未连接");
+        assert_eq!(dial_state_text(DIAL_DISCONNECTING), "正在断开");
+        assert_eq!(dial_state_text(DIAL_UNKNOWN), "状态未知");
         assert_eq!(dial_state_text("别的"), "未拨号");
+    }
+
+    #[test]
+    fn iface_addr_parser_reads_inet_line() {
+        // 解析 `ip -4 -o addr show` 的一行：别把 brd / scope 后面的东西当地址
+        let line = "2: eth2    inet 10.42.0.16/24 brd 10.42.0.255 scope global eth2";
+        let pos = line.find(" inet ").unwrap();
+        let addr = line[pos + 6..].split_whitespace().next().unwrap();
+        assert_eq!(addr, "10.42.0.16/24");
+        // 没有 inet 的行（纯 link 信息）不该产出地址
+        assert!(
+            !"2: eth2    link/ether 00:00:11:12:13:14 brd ff:ff:ff:ff:ff:ff".contains(" inet ")
+        );
     }
 
     #[test]

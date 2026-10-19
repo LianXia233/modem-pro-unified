@@ -87,7 +87,9 @@ return view.extend({
 			fs.read(CONFIG).catch(function () { return ''; }),
 			callInitList().catch(function () { return {}; }),
 			safeServiceList(),
-			api.get('/api/ntp').catch(function () { return null; })
+			api.get('/api/ntp').catch(function () { return null; }),
+			/* 系统时区（uci + /etc/TZ）+ 预置列表；与 [ntp] timezone 不是一回事 */
+			api.get('/api/timezone').catch(function () { return null; })
 		]);
 	},
 
@@ -97,6 +99,7 @@ return view.extend({
 		var initInfo = data[1] || {};
 		var srvInfo = data[2] || {};
 		var ntpData = data[3] || null;
+		var tzInfo = data[4] || null;
 
 		var running = isRunning(srvInfo);
 		var enabled = !!initEntry(initInfo).enabled;
@@ -190,19 +193,54 @@ return view.extend({
 			});
 		});
 
-		var btnNtpTz = E('button', { 'class': 'mp-btn mp-btn-default' }, '修改时区');
+		/* 时区：预置下拉（原来是 window.prompt 让用户手打 IANA 名，很容易打错）。
+		   数据源 /api/timezone：它读写的是**系统**时区（/etc/config/system 的
+		   zonename+timezone 与 /etc/TZ），不是 modemd 自己那份 [ntp] timezone。 */
+		var tzCur = (tzInfo && tzInfo.current) || {};
+		var tzPresets = (tzInfo && tzInfo.presets) || [];
+		var tzSel = E('select', { 'class': 'mp-select', 'style': 'min-width:250px' }, []);
+		(function fillTz() {
+			var have = false;
+			tzPresets.forEach(function (p) {
+				var sel = p.zonename === tzCur.zonename;
+				if (sel) have = true;
+				tzSel.appendChild(E('option', { 'value': p.zonename, 'selected': sel },
+					p.zonename + '（' + p.label + '）'));
+			});
+			/* 系统当前时区不在预置列表里 → 保留并置顶显示，绝不自动覆盖。
+			   用户可能是用 uci 手工设的，界面只如实展示。 */
+			if (!have && tzCur.zonename) {
+				tzSel.insertBefore(
+					E('option', { 'value': tzCur.zonename, 'selected': true },
+						tzCur.zonename + '（当前值，不在预置列表）'),
+					tzSel.firstChild
+				);
+			}
+			if (!tzCur.zonename && tzSel.firstChild) {
+				tzSel.firstChild.selected = true;
+			}
+		})();
+
+		var btnNtpTz = E('button', { 'class': 'mp-btn mp-btn-default' }, '应用时区');
 		btnNtpTz.addEventListener('click', function () {
-			var curTz = (ntpData && ntpData.timezone) || 'Asia/Shanghai';
-			var val = window.prompt('设置时区（如 Asia/Shanghai、UTC 或 POSIX 格式 CST-8；留空取消）：', curTz);
-			if (!val || !val.trim()) return;
-			api.post('/api/ntp/set', { timezone: val.trim() }).then(function (r) {
-				ui.addNotification(null, E('p', {}, '时区已更改为 ' + val.trim() + '，立即生效并写回配置'), 'info');
-				return api.get('/api/ntp').then(function (d) {
-					if (d) { ntpData = d; self.renderNtpBoxes(d, ntpGrid); }
+			var val = tzSel.value;
+			if (!val) return;
+			btnNtpTz.disabled = true;
+			api.post('/api/timezone', { zonename: val }).then(function (r) {
+				var cur = (r && r.current) || {};
+				ui.addNotification(null, E('p', {},
+					'时区已设为 ' + val + (cur.offset_label ? '（' + cur.offset_label + '）' : '') +
+					'，已回读校验'), 'info');
+				return Promise.all([
+					api.get('/api/ntp').catch(function () { return null; }),
+					api.get('/api/timezone').catch(function () { return null; })
+				]).then(function (d) {
+					if (d[0]) { ntpData = d[0]; self.renderNtpBoxes(d[0], ntpGrid); }
+					if (d[1]) tzInfo = d[1];
 				});
 			}).catch(function (e) {
 				ui.addNotification(null, E('p', {}, '更改时区失败: ' + (e.message || e)), 'error');
-			});
+			}).finally(function () { btnNtpTz.disabled = false; });
 		});
 
 		var btnNtpReload = E('button', { 'class': 'mp-btn mp-btn-default' }, [icons.get('refresh', 14), ' 刷新状态']);

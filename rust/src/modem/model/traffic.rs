@@ -11,7 +11,7 @@
 
 use serde::Serialize;
 
-use super::super::at::{csv, extract_all};
+use super::super::at::{csv, extract_all, Prio};
 use super::super::vendor::Vendor;
 use super::modem::Modem;
 
@@ -48,7 +48,7 @@ impl Modem {
     /// 读一次流量计数（失败/不支持也返回一个 `supported=false` 的采样，不报错）。
     pub fn traffic(&self) -> TrafficSample {
         for cmd in candidates(self.vendor()) {
-            let resp = self.at_cmd(cmd);
+            let resp = self.at_cmd_prio(Prio::Bulk, cmd);
             if let Some(mut s) = parse(cmd, &resp) {
                 s.modem_id = self.id;
                 s.cmd = cmd.to_string();
@@ -72,13 +72,13 @@ impl Modem {
         // 速率差分用的本地基线也要一起清：否则下一轮会拿清零前的量算出虚高速度
         *self.traffic_prev.lock().unwrap() = None;
         for cmd in candidates(self.vendor()) {
-            let resp = self.at_cmd(cmd);
+            let resp = self.at_cmd_prio(Prio::Bulk, cmd);
             if parse(cmd, &resp).is_none() {
                 continue;
             }
             if cmd.starts_with("AT+QGDCNT") {
                 // 移远的清零写法是同一条指令带参数 0
-                let r = self.at_cmd("AT+QGDCNT=0");
+                let r = self.at_cmd_prio(Prio::Bulk, "AT+QGDCNT=0");
                 return (r.contains("OK"), Some(r.trim().to_string()));
             }
             return (false, None);

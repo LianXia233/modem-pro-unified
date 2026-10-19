@@ -2881,3 +2881,90 @@ QModem 为 MPL-2.0；`rust/src/modem/modem_catalog.json` 与 `catalog.rs` 的数
 5. **LuCI 前端未在真机浏览器里点过**：本次只做了 `node --check` 语法与字段契约核对，
    没有实际打开页面看渲染（设备只开放了 SSH，LuCI 需隧道）。
 6. `netprov` 的 uci 超时值（10s / 30s）是估值，需在慢速闪存设备上确认不误杀。
+
+---
+
+## 47. AT 串口三层保护（2026-10-20，1.0.0-7）
+
+### 47.1 用户诉求与真实根因
+
+> 「给模组发命令，不要把所有 AT 命令一起打给模块，需要硬性延时 20-30ms」
+
+一开始以为「没限流」，实际上**限流放错了层次**。早先只在「两次占用串口之间」
+（`Scheduler::acquire`）等 60ms，但一次逻辑操作内部往往连发好几条：
+
+| 操作 | 连发的命令 |
+| --- | --- |
+| 读参数 `params()` | `AT+CGDCONT?` → `AT+CGACT?` → `AT+COPS?` |
+| 读短信 `read_sms` | `AT+CMGF=1` → `AT+CMGL="ALL"` → `AT+CMGF=0` → `AT+CMGL=4` → `AT+CMGF=1` |
+| 模组状态 `modem_status` | `AT+CCID` → `AT+CIMI` → `AT+CBC` → `AT+CSQ` → `AT+QTEMP`… |
+
+这几条**中间零间隔**，真正做到了「把所有 AT 一起打给模块」。串口是半双工，
+模组固件要逐条解析，后果是应答截断（只收到半个 `+CSQ: 22,99`）、偶发 `ERROR`、
+严重时 AT 口假死到要重启模组。
+
+### 47.2 新增的四个独立模块
+
+用户要求「新加功能尽量使用单独模块」，所以全部拆开：
+
+| 模块 | 职责 | 关键常量 |
+| --- | --- | --- |
+| `rust/src/modem/at/sched.rs` | 优先级排队 + 窗口配额 | `user` > `signal` > `data` > `bulk`；120 次/10 秒 |
+| `rust/src/modem/at/pacing.rs` | **每条命令之间**硬性延时 | `DEFAULT_GAP = 30ms` |
+| `rust/src/modem/at/cooldown.rs` | 打开失败冷却 | `DEFAULT_COOLDOWN = 5s` |
+| `rust/src/modem/at/cache.rs` | 冷门查询 TTL 缓存 | 15s（参数）/ 30s（usbnet、模式） |
+
+三层的关系：
+
+```
+调用方 ──→ [sched: 谁先用? 配额够吗?] ──→ [pacing: 距上一条够 30ms 吗?] ──→ 串口
+                    ↑
+              [cooldown: 上二次 open 失败过? 那就别碰串口，直接报错]
+```
+
+### 47.3 30ms 的出处（不是拍脑袋）
+
+同作者上游项目 `luci-app-fm350` 的 `rust/src/at/mod.rs`：
+
+```rust
+const MIN_CMD_GAP: Duration = Duration::from_millis(30);
+// 限速：保证与上一条命令的发出时刻至少相隔 MIN_CMD_GAP。
+// 等的是「发令时刻」之差，模组应答本身更慢时自然满足，因此不会把
+// 原本就慢的命令拖得更慢，只在命令排得很密时才生效。
+```
+
+同一 FM350 平台、长时间实机跑出来的值（20ms 零星丢 `OK`，30ms 稳定）。
+本项目的实现与它逐行同构（`last_cmd_at` + `sleep(gap - elapsed)`）。
+
+### 47.4 实机验证（ImmortalWrt / 6.18.55 / aarch64 / FM350-GL）
+
+| 项 | 结果 |
+| --- | --- |
+| `/api/at/sched` 契约 | ✅ `cmd_gap_ms=30`、`limits.per_window=120`、`open.cooldown_ms=5000` |
+| 6 条并发手动 `AT` | ✅ `user.served=6`，全部执行 |
+| 30ms 节奏 | ✅ `pacing.throttled=0` —— 每条 `AT` 往返约 80ms，天然满足下限 |
+| 优先级统计 | ✅ `signal.served=178` / `data.served=99` / `bulk.served=39` 分别计数 |
+| 配额调整前 | ❌ `max_wait_ms=7745`、用户手动 AT 等 2.7 秒、signal 5 分钟累计等 54 秒 |
+| 配额调整后 | ✅ 所有 `wait_ms` ≤ 163ms、`max_wait_ms≤160` |
+| `modem/status` 耗时 | ✅ **8 秒/次 → 0.8 秒/次** |
+| 生产服务 | ✅ 验证后恢复（`running`、FM350-GL 识别、默认路由未变） |
+
+### 47.5 实机踩到的坑（记下来免得重犯）
+
+**串口被上一轮遗留的临时实例占着**。现象是「启动发现完成：模组 0 个」，
+但 `/dev/ttyUSB4` 手动能打开。排查发现 pid 16306（`md3`，PPid=1）虽然
+`cmdline` 读出来是空的，`/proc/16306/fd/4 -> /dev/ttyUSB4` 却实实在在占着串口。
+
+教训：**验证脚本停临时实例要按 pid 文件精确停，停完还要确认
+`/proc/*/fd` 里没人再持有 `ttyUSB*`**，不能只 `pgrep -f 名字`。
+
+### 47.6 仍未验证
+
+1. **`pacing.throttled` 的增长场景**：要触发它需要一条「应答 <30ms 的快命令」，
+   FM350-GL 上所有命令往返都 >60ms，所以实机只验证到「不触发」。
+   逻辑正确性由单测 `consecutive_commands_are_all_paced` 保证
+   （5 条命令必有 4 个间隔，总耗时 ≥ 4×gap）。
+   要验证增长，需换一台响应极快的模组（如 RM500Q 的 `AT` 约 5ms）。
+2. **多模组并存时各走各的调度器**（本机只有一台，无法验证隔离性）。
+3. **`user` 级绕过配额**的副作用：用户狂点发送时最坏 33 次/秒
+   （受 30ms 间隔约束），实机没测过这么极端的点击。

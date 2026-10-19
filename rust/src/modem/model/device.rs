@@ -9,7 +9,7 @@ use serde::Serialize;
 use crate::error::{msg, Result};
 use crate::logging::{civil_from_days, unix_now};
 
-use super::super::at::is_ok;
+use super::super::at::{is_ok, Prio};
 use super::modem::Modem;
 
 /// 重启结果。
@@ -44,7 +44,7 @@ impl Modem {
     /// 约 30 秒后 AT 口恢复；期间信号 / 注册 / 扫描全部中断。
     pub fn reboot(&self) -> Result<RebootResult> {
         let cmd = "AT+CFUN=1,1";
-        let resp = self.with_at(|p| p.command(cmd, self.cmd_timeout))?;
+        let resp = self.with_at_prio(Prio::Data, |p| p.command(cmd, self.cmd_timeout))?;
         if is_ok(&resp) {
             log::info!("模组 {} 重启指令已确认（{cmd}）", self.id);
             Ok(RebootResult {
@@ -75,8 +75,9 @@ impl Modem {
         let (date, hms) = cclk_now();
         let with_tz = format!("{date},{hms}+00");
         let without_tz = format!("{date},{hms}");
-        let resp =
-            self.with_at(|p| p.command(&format!("AT+CCLK=\"{with_tz}\""), self.cmd_timeout))?;
+        let resp = self.with_at_prio(Prio::Data, |p| {
+            p.command(&format!("AT+CCLK=\"{with_tz}\""), self.cmd_timeout)
+        })?;
         if is_ok(&resp) {
             return Ok(ClockSyncResult {
                 modem_id: self.id,
@@ -90,8 +91,9 @@ impl Modem {
             self.id,
             resp.trim()
         );
-        let resp2 =
-            self.with_at(|p| p.command(&format!("AT+CCLK=\"{without_tz}\""), self.cmd_timeout))?;
+        let resp2 = self.with_at_prio(Prio::Data, |p| {
+            p.command(&format!("AT+CCLK=\"{without_tz}\""), self.cmd_timeout)
+        })?;
         if is_ok(&resp2) {
             return Ok(ClockSyncResult {
                 modem_id: self.id,

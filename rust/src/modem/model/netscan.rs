@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use super::super::at::{csv, extract_all, extract_field, is_ok};
+use super::super::at::{csv, extract_all, extract_field, is_ok, Prio};
 use super::cells::CellInfo;
 use super::modem::Modem;
 
@@ -89,12 +89,13 @@ impl Modem {
         };
 
         // 长名格式：短名/数字两种固件都有，统一要长名，界面上名字更好认
-        let _ = self.at_cmd("AT+COPS=3,0");
+        let _ = self.at_cmd_prio(Prio::Bulk, "AT+COPS=3,0");
         out.steps
             .push("设置运营商名为长名格式（AT+COPS=3,0）".to_string());
 
-        let (resp, stopped) =
-            self.at_cmd_cancel("AT+COPS=?", wait, &|| flag.load(Ordering::Relaxed));
+        let (resp, stopped) = self.at_cmd_cancel(Prio::Bulk, "AT+COPS=?", wait, &|| {
+            flag.load(Ordering::Relaxed)
+        });
         out.raw.push(resp.trim().to_string());
         out.stopped = stopped;
         if stopped {
@@ -144,7 +145,8 @@ impl Modem {
                 "本固件没有提供主动扫小区结果（该能力仅部分固件支持）".to_string(),
             );
         };
-        let (resp, stopped) = self.at_cmd_cancel(cmd, wait, &|| flag.load(Ordering::Relaxed));
+        let (resp, stopped) =
+            self.at_cmd_cancel(Prio::Bulk, cmd, wait, &|| flag.load(Ordering::Relaxed));
         let cells = parse_cnwsearch(&resp);
         let note = if !cells.is_empty() {
             String::new()

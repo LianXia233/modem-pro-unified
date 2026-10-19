@@ -8,7 +8,7 @@
 
 use serde::Serialize;
 
-use super::super::at::{csv, to_i32};
+use super::super::at::{csv, to_i32, Prio};
 use super::super::vendor::Vendor;
 use super::band;
 use super::modem::Modem;
@@ -142,7 +142,7 @@ impl Modem {
     pub fn scan_cells(&self) -> CellScanResult {
         let mut cells = Vec::new();
         if matches!(self.vendor(), Vendor::Simcom) {
-            let resp = self.at_cmd("AT+CPSI?");
+            let resp = self.at_cmd_prio(Prio::Bulk, "AT+CPSI?");
             for line in resp.lines() {
                 if let Some(cell) = parse_cpsi_cell(line) {
                     cells.push(cell);
@@ -151,17 +151,19 @@ impl Modem {
         } else if self.is_fibocom_mtk() {
             // FM350 / RW350 系列（MTK 平台）没有 QENG / FENG：服务小区与邻小区
             // 都在 AT+GTCCINFO? 的行表里（手册 §11.1.15），发 QENG 只会白等超时
-            cells.extend(parse_gtccinfo_rows(&self.at_cmd("AT+GTCCINFO?")));
+            cells.extend(parse_gtccinfo_rows(
+                &self.at_cmd_prio(Prio::Bulk, "AT+GTCCINFO?"),
+            ));
         } else {
             for cmd in ["AT+QENG=\"servingcell\"", "AT+FENG=\"servingcell\""] {
-                let parsed = parse_cell_lines(&self.at_cmd(cmd));
+                let parsed = parse_cell_lines(&self.at_cmd_prio(Prio::Bulk, cmd));
                 if !parsed.is_empty() {
                     cells.extend(parsed);
                     break;
                 }
             }
             for cmd in ["AT+QENG=\"neighbourcell\"", "AT+FENG=\"neighbourcell\""] {
-                let parsed = parse_cell_lines(&self.at_cmd(cmd));
+                let parsed = parse_cell_lines(&self.at_cmd_prio(Prio::Bulk, cmd));
                 if !parsed.is_empty() {
                     cells.extend(parsed);
                     break;
@@ -186,7 +188,7 @@ impl Modem {
             }
         }
         let reg = self
-            .with_at(|p| p.command("AT+CGREG?", self.cmd_timeout))
+            .with_at_prio(Prio::Bulk, |p| p.command("AT+CGREG?", self.cmd_timeout))
             .map(|raw| super::regstate::parse(&raw, "+CGREG"))
             .unwrap_or_default();
         if reg.raw.is_some() {

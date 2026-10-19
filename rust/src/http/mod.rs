@@ -79,6 +79,12 @@ pub struct AppState {
     pub(crate) cache: Arc<cache::StateCache>,
     /// 异步任务注册表：慢操作提交 → 轮询，不占 HTTP 线程与串口队列（见 http/tasks.rs）
     pub(crate) tasks: Arc<tasks::Registry>,
+    /// 基于 sysfs 的链路流量采样器（1 秒一拍，**独立于前端**）。
+    ///
+    /// 与 `modem/traffic.rs`（AT 计数器）的分工见 `runtime/ifstat.rs` 的模块注释。
+    /// 这是页面速率/累计/曲线的主数据源：FM350-GL 的 `AT+GTSTATIS` 实测回 ERROR，
+    /// 只有 sysfs 的 rx/tx 是准的。
+    pub(crate) ifstat: Arc<crate::runtime::ifstat::IfStat>,
     /// 最近一次「有人在通过 HTTP 看」的时刻（Unix 秒）；0 = 从没有过。
     ///
     /// ## 为什么需要它
@@ -200,6 +206,7 @@ pub fn serve(
         cache: Arc::new(cache::StateCache::new()),
         tasks: Arc::new(tasks::Registry::new()),
         last_http_seen: std::sync::atomic::AtomicI64::new(0),
+        ifstat: Arc::new(crate::runtime::ifstat::IfStat::new()),
     });
     log::info!("流量配额台账：{}", state.quota.path());
     log::info!("IMEI 备份台账：{}", state.imei.path());
@@ -222,6 +229,33 @@ pub fn serve(
         let state = state.clone();
         move || schedule::tick(&state)
     });
+    // 链路流量采样（sysfs，固定 1000ms，**不看前端**）。
+    //
+    // pick 回调每 5 秒被调一次，返回「当前活跃模组的数据网卡」：
+    // 用 `netprov::pick_device` 从模组自己的 USB 设备推出来，而不是全局扫
+    // `eth0/wwan0` 这类固定名 —— 换机型、换枚举顺序、QMAP mux 都不会认错。
+    {
+        let stat = state.ifstat.clone();
+        let mgr = state.mgr.clone();
+        crate::runtime::ifstat::spawn(stat, move || {
+            // ① 优先：在跑的模组 → 按**它的 USB 设备**推网卡
+            //    （`pick_device` 会依次试 QMAP mux 口 / 强候选 / 同 USB 设备下的口，
+            //     并排除 eth0/eth1 这类板载口，最不容易认错）
+            if let Some(modem) = mgr.all().iter().find(|m| m.is_running()) {
+                let dev = crate::netprov::provision::pick_device(modem, &[]);
+                if !dev.is_empty() {
+                    return Some(dev);
+                }
+            }
+            // ② 回退：按**驱动**全局找数据口（rndis_host / qmi_wwan / cdc_mbim…）。
+            //
+            // 为什么需要这一层：模组还没登记进管理器时（服务刚起、串口正被别的
+            // 进程占着探测失败），① 拿不到东西 —— 但网卡其实早就在了。
+            // 此时仍要能统计，否则页面在启动头几十秒里流量全空。
+            crate::runtime::hostnic::detect_data_dev(&[])
+        });
+    }
+
     // 后台采样循环：信号/网络/流量/配额/日志（见 http/loops.rs 的三类判据）
     loops::spawn_all(&state);
     log::info!("后台循环已启动：{} 个采样线程", loops::thread_count(&state));

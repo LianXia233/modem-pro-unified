@@ -21,7 +21,7 @@ use serde::Serialize;
 
 use crate::error::{self, msg};
 
-use super::super::at::is_ok;
+use super::super::at::{is_ok, Prio};
 
 /// 一条短信。
 #[derive(Debug, Clone, Default, Serialize)]
@@ -881,7 +881,7 @@ impl super::Modem {
             note = Some(format!("内容超长，已分成 {} 条发出", parts.len()));
         }
 
-        self.with_at(|p| {
+        self.with_at_prio(Prio::Bulk, |p| {
             let t = self.cmd_timeout;
             p.command("AT+CMGF=1", t)?;
             if ucs2 {
@@ -911,7 +911,7 @@ impl super::Modem {
             Ok(())
         })?;
         // 字符集是全局状态：不切回来的话，之后读到的正文会是一串十六进制
-        let _ = self.at_cmd("AT+CSCS=\"IRA\"");
+        let _ = self.at_cmd_prio(Prio::Bulk, "AT+CSCS=\"IRA\"");
 
         Ok(SmsSendResult {
             modem_id: self.id,
@@ -938,7 +938,7 @@ impl super::Modem {
 
         let mut ucs2 = false;
         let total = parts.len();
-        self.with_at(|p| {
+        self.with_at_prio(Prio::Bulk, |p| {
             let t = self.cmd_timeout;
             p.command("AT+CMGF=0", t)?;
             // 分段发送中途失败时，要说清「已经成功几条、一共几条」——
@@ -971,7 +971,7 @@ impl super::Modem {
             Ok(())
         })?;
         // 短信模式是全局状态：不切回文本模式的话，后续按文本模式读的操作会失效
-        let _ = self.at_cmd("AT+CMGF=1");
+        let _ = self.at_cmd_prio(Prio::Bulk, "AT+CMGF=1");
 
         Ok(SmsSendResult {
             modem_id: self.id,
@@ -987,7 +987,7 @@ impl super::Modem {
         if index.trim().is_empty() || !index.trim().chars().all(|c| c.is_ascii_digit()) {
             return Err(msg("存储位置必须是数字"));
         }
-        let resp = self.with_at(|p| {
+        let resp = self.with_at_prio(Prio::Bulk, |p| {
             p.command(
                 &format!("AT+CMGD={}", index.trim()),
                 Duration::from_secs(10),
@@ -1008,8 +1008,9 @@ impl super::Modem {
         if index.trim().is_empty() || !index.trim().chars().all(|c| c.is_ascii_digit()) {
             return Err(msg("存储位置必须是数字"));
         }
-        let resp =
-            self.with_at(|p| p.command(&format!("AT+CMGR={}", index.trim()), self.cmd_timeout))?;
+        let resp = self.with_at_prio(Prio::Bulk, |p| {
+            p.command(&format!("AT+CMGR={}", index.trim()), self.cmd_timeout)
+        })?;
         if is_ok(&resp) {
             Ok(())
         } else {
@@ -1019,7 +1020,9 @@ impl super::Modem {
 
     /// 删全部短信（`AT+CMGD=1,4`）。
     pub fn delete_all_sms(&self) -> error::Result<()> {
-        let resp = self.with_at(|p| p.command("AT+CMGD=1,4", Duration::from_secs(30)))?;
+        let resp = self.with_at_prio(Prio::Bulk, |p| {
+            p.command("AT+CMGD=1,4", Duration::from_secs(30))
+        })?;
         if is_ok(&resp) {
             Ok(())
         } else {
@@ -1056,7 +1059,7 @@ impl super::Modem {
         if !valid_mem(&m) {
             return Err(msg(format!("不支持的存储区 {mem}（只认 SM / ME / MT）")));
         }
-        let resp = self.with_at(|p| {
+        let resp = self.with_at_prio(Prio::Bulk, |p| {
             p.command(
                 &format!("AT+CPMS=\"{m}\",\"{m}\",\"{m}\""),
                 Duration::from_secs(5),
@@ -1065,7 +1068,7 @@ impl super::Modem {
         if !is_ok(&resp) {
             return Err(msg(format!("切换存储区失败：{}", resp.trim())));
         }
-        let back = self.with_at(|p| p.command("AT+CPMS?", self.cmd_timeout))?;
+        let back = self.with_at_prio(Prio::Bulk, |p| p.command("AT+CPMS?", self.cmd_timeout))?;
         let st = parse_storage(&back).ok_or_else(|| msg("切换后回读存储区失败"))?;
         *self.sms_mem_active.lock().unwrap() = Some(st.current.to_uppercase());
         Ok(st)
