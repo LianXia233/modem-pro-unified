@@ -220,7 +220,13 @@ impl Modem {
 
         // 服务小区 / 数量：只读扫描缓存，**不触发扫描**（扫描要好几秒）
         let cells = self.cells_cached();
-        let serving = cells.serving.first().cloned();
+        let mut serving = cells.serving.first().cloned();
+        if serving.is_none() {
+            // 没扫过小区：概览页的「工作频段 / 物理频点」会是空的。
+            // 单独问一次服务小区（1 条命令、优先级 Data），比让用户先点
+            // 「扫描基站」才看得到频段合理得多。
+            serving = self.serving_cell_live();
+        }
 
         // 载波聚合：实时查一次（此前 `ca` / `ca_active` 是恒空占位）。
         // 指令按厂商挑，解析见 model/ca.rs。手册标的耗时 < 1s，
@@ -252,20 +258,58 @@ impl Modem {
             0
         };
 
+        // ---- 顶层汇总字段的兜底 ----
+        //
+        // 概览页读的是**顶层** `band` / `band_label` / `earfcn`（与 `/api/network`
+        // 同名字段），而它们的原始来源是 QNWINFO —— 广和通 MTK 平台（FM350/RW350）
+        // 不支持该指令，于是恒为 0/None，页面上「工作频段」「物理频点」永远是 `-`，
+        // 尽管同一份数据在服务小区里明明有（实机 `serving.band=1`、`earfcn=428910`）。
+        //
+        // 这里用服务小区兜底：有 QNWINFO 就用它（信息更全），没有就用小区值。
+        let serving_band = serving.as_ref().map(|c| c.band).unwrap_or(0);
+        let serving_tech = serving.as_ref().map(|c| c.tech.as_str()).unwrap_or("");
+        let band = f.band.filter(|b| *b > 0).unwrap_or(serving_band);
+        let band_label = f.band_label.or_else(|| {
+            let l = super::band::band_label(serving_tech, serving_band);
+            if l.is_empty() {
+                None
+            } else {
+                Some(l)
+            }
+        });
+        let band_text = f.band_text.or_else(|| {
+            band_label
+                .as_ref()
+                .map(|_| "取自服务小区（本机不支持 QNWINFO）".to_string())
+        });
+        let earfcn = if f.earfcn > 0 {
+            f.earfcn
+        } else {
+            serving.as_ref().map(|c| c.earfcn).unwrap_or(0)
+        };
+        let tech = f.tech.or_else(|| {
+            let t = serving_tech.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        });
+
         NetworkStatus {
             modem_id: self.id,
             queried_at: crate::logging::timestamp(),
             net_tech: f.net_tech,
             tech_label: f.tech_label,
-            tech: f.tech,
+            tech,
             mcc: f.mcc,
             mnc: f.mnc,
             plmn: f.plmn,
-            band_text: f.band_text,
+            band_text,
             duplex,
-            band: f.band.unwrap_or(0),
-            band_label: f.band_label,
-            earfcn: f.earfcn,
+            band,
+            band_label,
+            earfcn,
             operator: f.operator,
             cs_reg,
             ps_reg,

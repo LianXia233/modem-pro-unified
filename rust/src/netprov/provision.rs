@@ -128,8 +128,24 @@ pub fn provision_modem_with(
         .collect();
     let device = pick_device(modem, &occupied);
     if device.is_empty() {
-        rep.skipped
-            .push("没能确定这个模组的数据网卡（sysfs 里没有 net/ 子目录）".into());
+        // 两种完全不同的原因，不能都说成「sysfs 里没有 net/」——
+        // 实机上最常见的是**第二种**（用户已经手工配了 modem0 proto=static device=eth2），
+        // 而提示写成第一种会把人引去查驱动，白折腾。
+        let owned = usb_netifs_for_port(&modem.port());
+        let reason = if owned.is_empty() {
+            "没能确定这个模组的数据网卡（sysfs 里没有 net/ 子目录）"
+        } else {
+            // 有网卡，但都已在 existing 里 → 说明用户自己配过了，本程序不该再插一手
+            rep.skipped.push(format!(
+                "数据网卡 {} 已被现有接口占用（{}, 符合预期，不重复建）",
+                owned.join("/"),
+                occupied.join("/")
+            ));
+            ""
+        };
+        if !reason.is_empty() {
+            rep.skipped.push(reason.to_string());
+        }
     }
 
     // 350 系列（FM350 / RW350）的 USB 网卡不发 DHCP ⇒ 用模组上报的地址直接配 static

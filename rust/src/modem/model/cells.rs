@@ -138,6 +138,36 @@ impl CellScanResult {
 }
 
 impl Modem {
+    /// 只查**服务小区**（不扫邻区）。
+    ///
+    /// 与 [`Self::scan_cells`] 的分工：那个是「用户点了扫描基站」，会连邻区一起抓、
+    /// 顺带查 CA、写扫描缓存，耗时几秒；本函数只发**一条**服务小区指令。
+    ///
+    /// 存在的理由：概览页要显示「工作频段 / 物理频点(EARFCN)」，而这两项来自
+    /// 服务小区。早先只读 `cells_cached()`（扫描缓存），没扫过就恒为 `-` ——
+    /// 让用户为了看频段先去点一次「扫描基站」是不合理的。
+    ///
+    /// 优先级用 `Data`：它是页面数据完整性的一部分，不属于「冷门」。
+    pub fn serving_cell_live(&self) -> Option<CellInfo> {
+        if matches!(self.vendor(), Vendor::Simcom) {
+            let resp = self.at_cmd_prio(Prio::Data, "AT+CPSI?");
+            return resp.lines().find_map(parse_cpsi_cell);
+        }
+        if self.is_fibocom_mtk() {
+            // FM350 / RW350（MTK 平台）：没有 QENG，服务小区在 GTCCINFO 行表里
+            return parse_gtccinfo_rows(&self.at_cmd_prio(Prio::Data, "AT+GTCCINFO?"))
+                .into_iter()
+                .next();
+        }
+        for cmd in ["AT+QENG=\"servingcell\"", "AT+FENG=\"servingcell\""] {
+            let parsed = parse_cell_lines(&self.at_cmd_prio(Prio::Data, cmd));
+            if !parsed.is_empty() {
+                return parsed.into_iter().next();
+            }
+        }
+        None
+    }
+
     /// 实时扫描服务小区 + 邻小区。
     pub fn scan_cells(&self) -> CellScanResult {
         let mut cells = Vec::new();

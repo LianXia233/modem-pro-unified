@@ -898,16 +898,46 @@ pub fn usb_netifs_for_port(port: &str) -> Vec<String> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dev.join("net")) {
+
+    // ① USB **device** 层：/sys/bus/usb/devices/2-1/net/
+    //
+    //    少数固件把网卡挂在这一层，保留是为了兼容。
+    collect_net_names(&dev, &mut out);
+
+    // ② USB **interface** 层：/sys/bus/usb/devices/2-1/2-1:1.0/net/
+    //
+    //    ⚠️ **这才是常见位置**，早先漏了这一层，导致 RNDIS 模组永远
+    //    推不出数据网卡 —— 实机 FM350-GL：AT 口在 `2-1:1.6`，而
+    //    `eth2` 的 `net/` 挂在 `2-1:1.0`（另一个 interface）。只查 device 层
+    //    拿到空列表，`host_iface` 就为空，拨号页显示「状态未知」而实际
+    //    链路早就通了（eth2 有地址、默认路由也在走它）。
+    //
+    //    QMI 的 `wwan0` 同理（在 QMI interface 下）。
+    if let Ok(entries) = std::fs::read_dir(&dev) {
         for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if !name.is_empty() {
-                out.push(name);
+            let sub = e.path();
+            if sub.is_dir() {
+                collect_net_names(&sub, &mut out);
             }
         }
     }
+
     out.sort();
+    out.dedup();
     out
+}
+
+/// 把 `dir/net/*` 里的网卡名收进 `out`（目录不存在就是空操作）。
+fn collect_net_names(dir: &std::path::Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir.join("net")) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.is_empty() {
+            out.push(name);
+        }
+    }
 }
 
 /// 去重 + 收敛成最具体的那条类码（同一类里，别人比它具体 → 它是简写，去掉）。
@@ -1619,6 +1649,46 @@ impl Modem {
         } else if st.link_source.is_empty() && !st.host_ips.is_empty() {
             // 本程序拨的（状态机已经给出结论），且有地址
             st.link_source = "modemd".to_string();
+        }
+
+        // ④ 主机侧地址拆成 v4 / v6。
+        //
+        //    页面「IPv4 / IPv6 本机地址」读的是 `ipv4` / `ipv6` 两个字段，
+        //    而这条链路是 netifd 拉起来的、`dial_state` 里这两个字段没人填
+        //    （它们原本只在本程序自己拨号时写入）—— 于是页面明明有地址却显示
+        //    「未分配」。`host_ips` 里是网卡上的真实地址（含 /前缀长度），
+        //    在这里拆开填进去，前端一行不用改。
+        if st.host_ips.iter().any(|a| !a.trim().is_empty()) {
+            let take = |pred: &dyn Fn(&str) -> bool, cur: &mut String| {
+                if !cur.is_empty() {
+                    return;
+                }
+                if let Some(a) = st.host_ips.iter().find(|a| pred(a)) {
+                    *cur = a.split('/').next().unwrap_or(a).trim().to_string();
+                }
+            };
+            take(&|a| !a.contains(':'), &mut st.ipv4);
+            take(&|a| a.contains(':'), &mut st.ipv6);
+        }
+
+        // ⑤ 驱动/通信类型（RNDIS / QMI / MBIM…）。
+        //
+        //    同样只有「本程序自己拨号」时才填过，netifd 拉起的链路是空的。
+        //    走 `usb_type(false)`：命中 30 秒缓存就立即返回，未命中才探测一次
+        //    （探测内部用的 `usbnet()` 也有 30 秒缓存，不会每次轮询都发 AT）。
+        if st.kind.is_empty() {
+            let t = self.usb_type(false);
+            if t.kind != "unknown" && !t.kind.is_empty() {
+                st.type_name = if t.name.is_empty() {
+                    t.kind.to_ascii_uppercase()
+                } else {
+                    t.name.clone()
+                };
+                st.kind = t.kind.clone();
+            } else {
+                // 明确说「识别不出来」，比让页面显示 `-` 有用
+                st.type_name = "未能识别（设备未上报）".to_string();
+            }
         }
         st
     }

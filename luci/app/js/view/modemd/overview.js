@@ -600,8 +600,20 @@ return view.extend({
 		if (netRawBox) {
 			netRawBox.innerHTML = '';
 			if (net.raw_net_info) {
-				netRawBox.appendChild(E('div', { 'style': 'font-size:12px;color:var(--mp-neutral-500);margin-bottom:4px' }, '模组网络上报原文 (QNWINFO):'));
-				netRawBox.appendChild(E('div', { 'class': 'mp-code-box' }, net.raw_net_info));
+				/* `AT+QNWINFO` 是移远私有指令，广和通 MTK 平台（FM350/RW350）回 ERROR。
+				   裸着显示 ERROR 会让人以为模组坏了 —— 如实说明「本机不支持」，
+				   并指出频段信息其实已经从服务小区指令拿到了。 */
+				var rawTxt = String(net.raw_net_info).trim();
+				var unsupported = /^ERROR\b/i.test(rawTxt);
+				netRawBox.appendChild(E('div', { 'style': 'font-size:12px;color:var(--mp-neutral-500);margin-bottom:4px' },
+					unsupported ? '模组网络上报 (QNWINFO):' : '模组网络上报原文 (QNWINFO):'));
+				if (unsupported) {
+					netRawBox.appendChild(E('div', {
+						'style': 'font-size:12px;color:var(--mp-neutral-500);padding:6px 0'
+					}, '本机固件不支持 AT+QNWINFO（广和通 MTK 平台改用 AT+GTCCINFO?），上面的频段/频点取自服务小区指令'));
+				} else {
+					netRawBox.appendChild(E('div', { 'class': 'mp-code-box' }, rawTxt));
+				}
 			}
 		}
 
