@@ -2,6 +2,12 @@
 
 本项目采用 [语义化版本](https://semver.org/lang/zh-CN/)；版本号单一来源为仓库根 `VERSION`。
 
+> **文档状态（2026-10-20 起）**：提交 `66853b8` 删除了当时的全部 `docs/` 文件（5777 行）。
+> 现行权威文档只有 `docs/INTEGRATION.md`、`docs/BUILD.md`、`docs/API.md`、
+> `docs/UPSTREAM_AUDIT.md`、`docs/SUPPORT_MATRIX.md` 与索引 `docs/README.md`。
+> 本文件历史条目中提到的 `PORTING.md` / `PROGRESS.md` / `HANDOFF.md` / `PRIVACY.md` /
+> `DIAL_AUDIT.md` **均已被删除**，只是历史记录，不得作为当前设计依据。
+
 ## [未发布] - 2026-10-20
 
 ### 上游融合（一）：端口规则进发现流程 + 厂商数据通道指令
