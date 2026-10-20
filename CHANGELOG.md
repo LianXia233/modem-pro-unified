@@ -10,6 +10,29 @@
 
 ## [未发布]
 
+### 新增：MT5700M-CN 私有命令链（信号 / 流量 / URC）与 FM350 双卡预设
+
+参考 [LianXia233/luci-app-mt5700](https://github.com/LianXia233/luci-app-mt5700)（GPL-3.0，仅参考未拷贝）与两份厂商 AT 手册
+（MT5700M-CN V200R001C20、Fibocom FM350 v2.2），完整审计记录见
+`docs/UPSTREAM_AUDIT.md` §11：
+
+- **鼎桥信号三值**：`Modem::signal()` 对 `Vendor::TDTech` 先走私有链 ——
+  `AT^MONSC`（dB 直出）+ `AT^HCSQ?` 补缺项。新增 `parse_hcsq()`：
+  LTE `<rssi>,<rsrp>,<sinr>,<rsrq>`（RSRP 下标 2）、NR `<rsrp>,<sinr>,<rsrq>`（下标 1）；
+  SINR 下标 0..251 步长 0.2 dB（`0`=<-20、`251`=≥30），RSRP 步长 1 dB、RSRQ 步长 0.5 dB 三表分开；
+  **255=未知不与 0 混同**。此前 MT5700M 只有 `AT+QENG` / `AT+CESQ` 一条路，而这两条在它身上全回
+  ERROR，信号恒为空。
+- **鼎桥流量**：`AT^DSFLOWQRY`（6 字段 hex，取 total 组）；默认的 `QGDCNT` / `GTSTATIS`
+  在 MT5700M 全回 ERROR，`vendor/tdtech.rs` 覆写 `traffic_candidates()` 只发这一条。
+- **URC 过滤**：`^RSSI` / `^CERSSI` 进入 `PRIVATE_URC_PREFIXES`（`AT^CURC` 默认全开）。
+  `^HCSQ` 绝不能入表——它既是 URC 又是 `AT^HCSQ?` 应答，安全边界记录在 `urc.rs` 模块 doc。
+- **FM350 双卡**：`at_presets` 新增 `AT+GTDUALSIM=0` / `=1` / `?`（0=SIM1 默认、1=SIM2，
+  持久且立即生效）；4 条 FM350 的 `usb_at.note` 注明 `AT+GTUSBMODE` 40/41 同属 RNDIS 族
+  （40 少 AP LOG/META 口）。
+
+测试 754 → 759（`signal.rs` ×3、`traffic.rs` ×2；`urc.rs` 扩既有用例）。
+`AT^NDISSTATQRY` 连接态对账探活设计在案未实施（§11.4：手册口径 `<cid>,<stat>`，cid 在前）。
+
 ### 重构：拨号生命周期统一到一个协调器（AT 与 QMI/MBIM 共用意图、状态与退避）
 
 **问题（都有代码证据，详见 `docs/DIAL_STATE_MACHINE.md`）**：

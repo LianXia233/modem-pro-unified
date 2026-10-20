@@ -13,6 +13,11 @@
 //! 的索引函数：口径取 3GPP 区间下界（索引 1 = [-140,-139) dBm → -140 dBm），与
 //! 3GPP TS 27.007 §8.69 和《FM350 AT Commands》§11.1.15 一致。
 //!
+//! 鼎桥 MT5700/MT5710 又是例外：`AT+QENG` / `AT+CESQ` 全回 ERROR（quirks 记录），
+//! 信号三值走私有链 —— `AT^MONSC` 服务小区（新格式直接给 dB 值）为主，
+//! 缺项由 `AT^HCSQ?`（手册 §13.5 的分制式索引表）补，见
+//! [`Modem::tdtech_serving_signal`] 与 [`parse_hcsq`]。
+//!
 //! ⚠️ 与上游 Go 的 1 dB 差（有意保留，不改）：Go `module/cell/cell.go:573`
 //! `ParseCESQSignal` 按区间**上界**算（`rsrp = v-140`、`rsrq = (v-39)/2`），
 //! 本仓库取下界（`v-141` / `(v-40)/2`），因此同一个索引本仓库比上游低 1 dB。
@@ -27,6 +32,7 @@ use serde::Serialize;
 use crate::error::Result;
 
 use super::super::at::{csv, extract_all, extract_field, field_part, is_ok, Prio};
+use super::super::vendor::Vendor;
 use super::modem::Modem;
 
 /// 信号信息（含 5G NR 小区信号）。
@@ -81,10 +87,20 @@ impl Modem {
     /// 在 CESQ 取不到时兜底，而 LTE 的 SINR（`<rssnr_value>`，本身就是 dB）
     /// 只有这里有 —— CESQ 的 LTE 分支不带 SINR 格。
     ///
-    /// 鼎桥 MT5700（`^MONSC`）与芯讯通（`+CPSI`）同样不回 `+QENG`，但不必在这里
-    /// 加分支：`+QENG` 在它们上面只是回 ERROR / 无应答，解不出自然落到 CESQ，
-    /// 与扫小区（`cells.rs` 的 `Modem::serving_cell_live`）的分厂商分支不重复。
+    /// 鼎桥 MT5700（`^MONSC`）与芯讯通（`+CPSI`）同样不回 `+QENG`；芯讯通的
+    /// `+CPSI` 自己就带信号格，解不出自然落到 CESQ，不必在这里加分支。
+    /// 鼎桥则是**私有链优先**（见下一个分支）：手册连 `AT+CESQ` 都没收录
+    /// （quirks 记录 `+QENG` / `+CPSI` / `+QCSQ` / `+QNWINFO` 全回 ERROR），
+    /// 走通用分支只会白等两个超时。
     fn query_serving_signal(&self) -> (i32, i32, i32) {
+        // 鼎桥先走私有链：`AT+QENG` / `AT+CESQ` 在它身上全回 ERROR
+        // （quirks 记录），走通用分支只会白等两个超时。
+        if self.vendor() == Vendor::TDTech {
+            if let Some(v) = self.tdtech_serving_signal() {
+                return v;
+            }
+        }
+
         let fibo_mtk = self.is_fibocom_mtk();
         if !fibo_mtk {
             let qeng = self
@@ -124,6 +140,52 @@ impl Modem {
             }
         }
         out
+    }
+
+    /// 鼎桥 MT5700/MT5710 的信号三值：`AT^MONSC` 服务小区为主，
+    /// 缺项由 `AT^HCSQ?` 的索引表补。
+    ///
+    /// 为什么两条一起用（手册 §13.8 / §13.5）：
+    /// - `^MONSC` 新格式**直接给 dB 值**，NR 行带 RSRP/RSRQ/SINR 三值；
+    ///   但 LTE 行只有 RSRP/RSRQ（末位是 RSSI），**没有 SINR 格**；
+    /// - `^HCSQ?` 按制式补字段：LTE 行 `<rssi>,<rsrp>,<sinr>,<rsrq>`、
+    ///   NR 行 `<rsrp>,<sinr>,<rsrq>`，但全是**索引**（要换算），
+    ///   且 `255` = 未知或不可测。
+    ///
+    /// 因此「MONSC 为主、任何一项缺失才补发 HCSQ」：NR 驻网时通常一条
+    /// `^MONSC` 就够，LTE 驻网才多走一条 `^HCSQ?` 取 SINR。取数顺序与
+    /// 参考实现（luci-app-mt5700 `signalwatch.rs`：MONSC 为主 → HCSQ 兜底）
+    /// 一致；索引用本仓库的区间下界口径换算（A03 报告），
+    /// 与参考实现的 `raw-140` 有意差 1 dB。
+    fn tdtech_serving_signal(&self) -> Option<(i32, i32, i32)> {
+        let t = self.cmd_timeout;
+        let monsc = self
+            .with_at_prio(Prio::Signal, |p| p.command("AT^MONSC", t))
+            .unwrap_or_default();
+        let mut out = (0, 0, 0);
+        for line in monsc.lines() {
+            if let Some(cell) = super::cells::parse_monsc(line) {
+                out = (cell.rsrp, cell.rsrq, cell.sinr);
+                break;
+            }
+        }
+        if out.0 == 0 || out.1 == 0 || out.2 == 0 {
+            let hcsq = self
+                .with_at_prio(Prio::Signal, |p| p.command("AT^HCSQ?", t))
+                .unwrap_or_default();
+            if let Some(v) = parse_hcsq(&hcsq) {
+                if out.0 == 0 {
+                    out.0 = v.0;
+                }
+                if out.1 == 0 {
+                    out.1 = v.1;
+                }
+                if out.2 == 0 {
+                    out.2 = v.2;
+                }
+            }
+        }
+        valid(out.0, out.1, out.2)
     }
 }
 
@@ -263,6 +325,57 @@ pub fn nr_ss_sinr_index_db(idx: i32) -> Option<i32> {
         .then(|| (idx as f64 * 0.5 - 23.5).round() as i32)
 }
 
+/// `AT^HCSQ` 的 `<sinr>` 索引 → dB（鼎桥私有表，手册 §13.5.3）：
+/// `0` = 低于 -20 dB，步长 **0.2 dB**，`251` = ≥ 30 dB，`255` = 未知。
+///
+/// 与 CESQ 的 NR SINR 表（[`nr_ss_sinr_index_db`]，0.5 dB 步进）**不是一张表**，
+/// 不可复用。0.2 dB 步进取整到最接近的整 dB —— `SignalInfo` 是整数字段，
+/// 取最接近值比向零截断少偏 0.1 dB 的系统误差。
+pub fn hcsq_sinr_index_db(idx: i32) -> Option<i32> {
+    (0..=251)
+        .contains(&idx)
+        .then(|| (idx as f64 * 0.2 - 20.0).round() as i32)
+}
+
+/// 解析 `AT^HCSQ?` → `(rsrp, rsrq, sinr)`（鼎桥 MT5700/MT5710，手册 §13.5）。
+///
+/// 分制式字段表（手册 §13.5.3，`255` = 未知或不可测）：
+///
+/// | sysmode | 字段布局 | RSRP/SINR/RSRQ 下标 |
+/// | --- | --- | --- |
+/// | `"GSM"` | `<rssi>` | 无 RSRP 格 → `None` |
+/// | `"WCDMA"` | `<rssi>,<rscp>,<ecio>` | 无 RSRP 格 → `None` |
+/// | `"LTE"` | `<rssi>,<rsrp>,<sinr>,<rsrq>` | 2 / 3 / 4 |
+/// | `"NR"` | `<rsrp>,<sinr>,<rsrq>` | 1 / 2 / 3 |
+///
+/// RSRP（0..97，步长 1 dB）与 RSRQ（0..34，步长 0.5 dB）和 CESQ 同表，
+/// 走既有的索引函数（区间下界口径）；SINR 走 [`hcsq_sinr_index_db`]。
+/// GSM/WCDMA 行没有 RSRP 三值，返回 `None` 让调用方退下一路。
+pub fn parse_hcsq(resp: &str) -> Option<(i32, i32, i32)> {
+    let line = extract_all(resp, "^HCSQ").first()?.clone();
+    let f = csv(&line);
+    let mode = f.first()?.trim().to_ascii_uppercase();
+    let (i_rsrp, i_sinr, i_rsrq) = match mode.as_str() {
+        "LTE" => (2usize, 3usize, 4usize),
+        "NR" => (1usize, 2usize, 3usize),
+        _ => return None,
+    };
+    // 255 = 未知或不可测（与「0 = 低于量程」是两回事，不能混同）：
+    // RSRP 是「有没有信号」的判据，未知就让整份解析失败（None）；
+    // RSRQ / SINR 未知只当该格未上报（0），不牵连 RSRP。
+    let num = |i: usize| f.get(i).and_then(|s| s.trim().parse::<i32>().ok());
+    let rsrp = lte_rsrp_index_dbm(num(i_rsrp).filter(|v| *v != 255)?)?;
+    let rsrq = num(i_rsrq)
+        .filter(|v| *v != 255)
+        .and_then(lte_rsrq_index_db)
+        .unwrap_or(0);
+    let sinr = num(i_sinr)
+        .filter(|v| *v != 255)
+        .and_then(hcsq_sinr_index_db)
+        .unwrap_or(0);
+    valid(rsrp, rsrq, sinr)
+}
+
 fn at_i32(v: Option<&String>) -> Option<i32> {
     v.and_then(|s| s.parse::<i32>().ok())
 }
@@ -297,8 +410,9 @@ fn valid(rsrp: i32, rsrq: i32, sinr: i32) -> Option<(i32, i32, i32)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        lte_rsrp_index_dbm, lte_rsrq_index_db, nr_ss_rsrp_index_dbm, nr_ss_rsrq_index_db,
-        nr_ss_sinr_index_db, parse_cesq, parse_csq, parse_qeng_servingcell,
+        hcsq_sinr_index_db, lte_rsrp_index_dbm, lte_rsrq_index_db, nr_ss_rsrp_index_dbm,
+        nr_ss_rsrq_index_db, nr_ss_sinr_index_db, parse_cesq, parse_csq, parse_hcsq,
+        parse_qeng_servingcell,
     };
 
     #[test]
@@ -354,5 +468,41 @@ mod tests {
         assert_eq!(nr_ss_rsrq_index_db(65), Some(-11));
         assert_eq!(nr_ss_sinr_index_db(77), Some(15));
         assert_eq!(nr_ss_sinr_index_db(128), None);
+    }
+
+    #[test]
+    fn hcsq_sinr_table_is_0_2db_step() {
+        // 手册 §13.5.3：0 = 低于 -20 dB，步长 0.2 dB，251 = ≥ 30 dB
+        assert_eq!(hcsq_sinr_index_db(0), Some(-20));
+        assert_eq!(hcsq_sinr_index_db(100), Some(0));
+        assert_eq!(hcsq_sinr_index_db(251), Some(30));
+        assert_eq!(hcsq_sinr_index_db(252), None);
+    }
+
+    #[test]
+    fn hcsq_lte_and_nr_field_layouts() {
+        // 手册 §13.5.3 字段表：LTE 为 <rssi>,<rsrp>,<sinr>,<rsrq>（RSRP 下标 2）；
+        // NR 为 <rsrp>,<sinr>,<rsrq>（下标 1）。索引换算走下界口径：
+        // rsrp 85 → -141+85 = -56 dBm；rsrq 10 → (10-40)/2 = -15 dB；
+        // sinr 130 → 130*0.2-20 = 6 dB。
+        let lte = "\r\n^HCSQ: \"LTE\",20,85,130,10\r\n\r\nOK\r\n";
+        assert_eq!(parse_hcsq(lte), Some((-56, -15, 6)));
+        let nr = "\r\n^HCSQ: \"NR\",97,251,34\r\nOK\r\n";
+        assert_eq!(parse_hcsq(nr), Some((-44, -3, 30)));
+    }
+
+    #[test]
+    fn hcsq_unknown_and_unsupported_modes() {
+        // RSRP 255 = 未知 → 整份不可用（它是「有没有信号」的判据）
+        assert_eq!(parse_hcsq("\r\n^HCSQ: \"NR\",255,10,10\r\nOK\r\n"), None);
+        // RSRQ/SINR 255 = 未上报：只丢该项，不牵连 RSRP
+        assert_eq!(
+            parse_hcsq("\r\n^HCSQ: \"NR\",60,255,255\r\nOK\r\n"),
+            Some((-81, 0, 0))
+        );
+        // GSM/WCDMA 行没有 RSRP 格
+        assert_eq!(parse_hcsq("\r\n^HCSQ: \"GSM\",36,255\r\nOK\r\n"), None);
+        assert_eq!(parse_hcsq("\r\n^HCSQ: \"WCDMA\",30,30,58\r\nOK\r\n"), None);
+        assert_eq!(parse_hcsq("\r\nERROR\r\n"), None);
     }
 }

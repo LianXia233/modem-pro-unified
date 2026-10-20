@@ -66,6 +66,21 @@ impl VendorSpec for Spec {
                 "本固件支持的 L2P 与 cid 范围",
             ),
             of(
+                "广和通（MTK 平台 FM350）",
+                "AT+GTDUALSIM=0",
+                "切到 SIM1（默认，持久化+立即生效；=1 切 SIM2，双卡机型）",
+            ),
+            of(
+                "广和通（MTK 平台 FM350）",
+                "AT+GTDUALSIM=1",
+                "切到 SIM2（带 eSIM 的机型即 eSIM 卡；查询用 AT+GTDUALSIM?）",
+            ),
+            of(
+                "广和通（MTK 平台 FM350）",
+                "AT+GTDUALSIM?",
+                "当前工作卡（+GTDUALSIM:<sim_app>,<sub_app>,<sys_mode>）",
+            ),
+            of(
                 "锁网（广和通）",
                 "AT+QNWPREFCFG=\"mode_pref\"",
                 "组网模式偏好（当前值）",

@@ -2,8 +2,8 @@
 
 > 本表由 `rust/src/modem/modem_catalog.json`（92 个型号 / 13 家厂商）与
 > `rust/src/modem/vendor/datacall.rs`（厂商 × 平台的数据通道配方）**生成并人工核对**，
-> 最后更新：2026-10-21（百旺 QDC507 接入 + OpenVohive/Siriling 上游审计，
-> 见 `docs/UPSTREAM_AUDIT.md` §8–§9）。
+> 最后更新：2026-10-22（MT5700M 信号/流量私有命令链补齐、FM350 双卡预设，
+> 见 `docs/UPSTREAM_AUDIT.md` §11）。
 >
 > 图例：
 > - **USB / PCIe**：清单登记的数据形态（`qmi/ecm/mbim/rndis/ncm/gobinet/rmnet/auto`）。
@@ -12,6 +12,8 @@
 > - **验证状态**：`单测` = 仅有自动化测试（含 golden 命令行断言）；
 >   `实机` = 真机跑通拨号/断开的完整链路。**本表没有任何型号标为「实机」**，
 >   原因见文末「验证边界」。
+> - `mt5700m-cn` 清单厂商字段为 `huawei`（两家共线型号），但 ATI 识别会改判
+>   `tdtech`，其信号/流量/URC 口径按鼎桥私有命令执行（见 §2 表后注）。
 >
 > 平台列的含义：`qualcomm` 高通、`unisoc` 展锐、`mediatek` 联发科、`hisilicon` 海思/巴龙、
 > `lte` / `lte12` 高通 LTE 平台、`asrmicro` 翱捷。
@@ -136,6 +138,13 @@
 > 平台未识别（清单里查不到型号）时，一律走 `AT+CGACT`，不发任何私有指令
 > （`datacall.rs` 的 `plan()` 在 `platform.is_empty()` 时直接返回通用配方）。
 
+> **信号 / 流量 / URC 私有命令（2026-10-22 起，依据 `docs/UPSTREAM_AUDIT.md` §11）**：
+> MT5700M-CN（tdtech × hisilicon）不走通用信号命令（`AT+QENG` / `AT+CESQ` 在它身上
+> 全回 ERROR），改走私有链 —— 信号 `AT^MONSC`（dB 直出）+ `AT^HCSQ?` 补缺项
+> （SINR 下标 0..251 步长 0.2 dB），流量 `AT^DSFLOWQRY`（6 字段 hex，取 total 组），
+> `^RSSI` / `^CERSSI` 为默认开启的位图 URC（消费侧过滤，不关 `AT^CURC`）。
+> FM350 系列另新增 `AT+GTDUALSIM` 手动预设（0=SIM1 默认 / 1=SIM2 / `?` 查询）。
+
 ## 3. 协议职责边界
 
 | 形态 | 谁建立数据会话 | 谁拉网卡 | 谁配地址/路由 | 本项目实现 |
@@ -154,13 +163,16 @@
 
 ## 4. 验证边界（务必读）
 
-- **自动化**：`cargo test --locked` 共 **754 项**（2026-10-21）。
+- **自动化**：`cargo test --locked` 共 **759 项**（2026-10-22）。
   其中拨号生命周期相关的新增用例覆盖：两种后端的统一退避序列、退避在「错误变化 /
   成功」时的清零规则、自动连接的全部拒绝理由、连接代次对陈旧提交的拦截、
   原生后端状态写入与掉线回退、外部断链（重启/飞行模式）对在途拨号的作废；
   QMI 侧另有 IPv6 client Get Runtime Settings 回填（假设备端到端）与
   fibo_mhi / `pcie_mhi*` / `pcie_swip*` 识别用例。
   厂商配方字面量、平台回退、cid 替换、激活/挂断对称、端口规则与物理分组另有既有用例。
+  2026-10-22 新增（`docs/UPSTREAM_AUDIT.md` §11）：鼎桥 `AT^HCSQ` 解析 3 项
+  （LTE/NR 字段布局、SINR 0.2 dB 步长表、255=未知与不支持的制式）、
+  `AT^DSFLOWQRY` 解析 2 项（total 组 hex 取值、ERROR/短行拒绝）与鼎桥流量候选序断言。
 - **未做真机验证**：本次会话没有可用的 5G 模组与运营商网络，因此：
   - 表中所有型号的「实机」列均为空；
   - FM350-GL / RM520N-GL 等机型的 RNDIS/ECM 路径只做了指令级与状态机级验证；
@@ -175,7 +187,7 @@
 | L1 | 收录 | 进入 `modem_catalog.json`：型号、平台、USB/PCIe 形态、VID | **92 / 92** 型号（QModem `support_list` 91 + 有依据的 documented extension 1：`qdc507`；另有端口规则扩展 1 条：`rg501q-eu`） |
 | L2 | 识别 | 发现流程能认出厂商与型号：端口规则（`modem_ports.json` 19 条）+ 15 个厂商识别模块的 ATI/CGMM 关键字 + 清单型号串匹配；置信度不足时进 candidates、不误判 | **92 / 92**（VID 只当提示——`2c7c` 由移远与百旺共享，测试钉住不得据 VID 钉厂商） |
 | L3 | 后端 | 有数据通道配方：模组侧 AT（第 2 节指令表）或主机侧 QMI/MBIM 内置拨号器 | **92 / 92**（未登记厂商走 3GPP 通用 `AT+CGACT`；PPP 明确不支持） |
-| L4 | 自动化 | 配方 / 解析 / 状态机 / 端口规则有自动化测试守护 | **92 / 92**（按厂商 × 平台 + 逐型号清单测试，共 754 项） |
+| L4 | 自动化 | 配方 / 解析 / 状态机 / 端口规则有自动化测试守护 | **92 / 92**（按厂商 × 平台 + 逐型号清单测试，共 759 项） |
 | L5 | 实机 | 真机跑通「拨号 → 供址 → 上网 → 断开」完整链路 | **0 / 92**（本仓库无任何真机验证记录；QDC507 参考实现的 README 有实机段落，但其 `VALIDATION-RESULTS.json` 明示 `real_at_commands_sent: false`，只算 fixture 级证据） |
 
 升级路径：L4 → L5 只能靠真机。每在真机跑通一个型号，把第 1 节对应行的

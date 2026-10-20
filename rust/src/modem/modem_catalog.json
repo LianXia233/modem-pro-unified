@@ -1355,7 +1355,7 @@
       "modes": {
         "rndis": "AT+GTUSBMODE=41"
       },
-      "note": "Modem-Pro 只给了 rndis=41（mbim 那行是注释掉的）"
+      "note": "Modem-Pro 只给了 rndis=41（mbim 那行是注释掉的）；40 是同一 RNDIS 族的另一 profile（少 AP LOG/META 两个 USB 口，FM350 手册 13.1.1），非独立形态故不单列"
     },
     "pcie_at": {
       "note": "MTK 平台 PCIe 走驱动（Modem-Pro 里是 mtk_pcie），没有 AT 切换指令"
@@ -1374,7 +1374,7 @@
       "modes": {
         "rndis": "AT+GTUSBMODE=41"
       },
-      "note": "Modem-Pro 只给了 rndis=41（mbim 那行是注释掉的）"
+      "note": "Modem-Pro 只给了 rndis=41（mbim 那行是注释掉的）；40 是同一 RNDIS 族的另一 profile（少 AP LOG/META 两个 USB 口，FM350 手册 13.1.1），非独立形态故不单列"
     },
     "vid": "0e8d"
   },
@@ -1393,7 +1393,7 @@
       "modes": {
         "rndis": "AT+GTUSBMODE=41"
       },
-      "note": "Modem-Pro 只给了 rndis=41（mbim 那行是注释掉的）"
+      "note": "Modem-Pro 只给了 rndis=41（mbim 那行是注释掉的）；40 是同一 RNDIS 族的另一 profile（少 AP LOG/META 两个 USB 口，FM350 手册 13.1.1），非独立形态故不单列"
     },
     "pcie_at": {
       "note": "MTK 平台 PCIe 走驱动（Modem-Pro 里是 mtk_pcie），没有 AT 切换指令"
@@ -1415,7 +1415,7 @@
       "modes": {
         "rndis": "AT+GTUSBMODE=41"
       },
-      "note": "Modem-Pro 只给了 rndis=41（mbim 那行是注释掉的）"
+      "note": "Modem-Pro 只给了 rndis=41（mbim 那行是注释掉的）；40 是同一 RNDIS 族的另一 profile（少 AP LOG/META 两个 USB 口，FM350 手册 13.1.1），非独立形态故不单列"
     },
     "pcie_at": {
       "note": "MTK 平台 PCIe 走驱动（Modem-Pro 里是 mtk_pcie），没有 AT 切换指令"

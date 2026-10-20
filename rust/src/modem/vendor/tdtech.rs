@@ -149,6 +149,13 @@ impl VendorSpec for Spec {
         &["AT^CHIPTEMP?"]
     }
 
+    /// 流量：默认候选（`AT+QGDCNT?` / `AT+GTSTATIS?`）在鼎桥上全回 ERROR
+    /// （quirks 记录），只有私有的 `AT^DSFLOWQRY`（手册 §16.3，十六进制
+    /// last/total 两组）拿得到模组侧累计 —— 见 `model::traffic::parse_dsflowqry`。
+    fn traffic_candidates(&self) -> &'static [&'static str] {
+        &["AT^DSFLOWQRY"]
+    }
+
     fn mode_read(&self) -> (&'static str, &'static str) {
         // acqorder 双向映射（见 tdtech_acq_order / parse_syscfgex）
         ("AT^SYSCFGEX?", "syscfgex")

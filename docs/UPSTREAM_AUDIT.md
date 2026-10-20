@@ -318,6 +318,55 @@ OpenWrt 包集合：6 个内核驱动包（`gobinet` / `pcie_mhi` / `pcie_mhi_fb
 
 ---
 
+## 11. 追加审计（2026-10-22）：luci-app-mt5700 与两份厂商 AT 手册
+
+参考仓库 [LianXia233/luci-app-mt5700](https://github.com/LianXia233/luci-app-mt5700)
+HEAD `a9866e5`（v1.24.3，GPL-3.0，**只取事实依据、未拷贝代码**）。它是 MT5700M-CN
+（鼎桥 TD Tech，MTK/巴龙平台）专用管理套件：Rust/Tokio 后端 + 12 个 LuCI 页面。
+另有两份厂商 AT 手册作为字段定义的事实依据（IMA 知识库 PDF 经 `pdftotext -layout`
+提取，行号为提取后文本行号）：
+
+- **M5700 手册**：MT5700M-CN AT 命令手册 V200R001C20；
+- **FM350 手册**：Fibocom FM350 AT Commands v2.2。
+
+### 11.1 已被本仓库覆盖（核对通过，无需改动）
+
+| luci-app-mt5700 / 手册侧事实 | 来源 | 本仓库对应 |
+| --- | --- | --- |
+| MT5700M 拨号走华为 `AT^NDISDUP=1,<cid>` 分支 | 参考仓库后端拨号模块 | `vendor/datacall.rs` 的 `tdtech × hisilicon` 配方（清单厂商字段为 `huawei`，ATI 识别改判 `TDTech`，见 `vendor/mod.rs` 的排序说明） |
+| 锁频 `AT^LTEFREQLOCK` / `AT^NRFREQLOCK`、扫频 `AT^CELLSCAN` | M5700 手册 §13 | `vendor/tdtech.rs` 的 band 锁与 `cell_scan_cmd` |
+| USB 形态切换 `AT^SETMODE`（0=ECM / 4=NCM / 6=RNDIS / 7=MBIM） | M5700 手册 §11.8（L14740） | 未做通用 API：改 USB 形态会掉线重枚举，风险高于收益，记录在案 |
+| `AT^ICCID?` 无需 PIN 即可读 | M5700 手册 | ICCID 读取不依赖 PIN 状态 |
+
+### 11.2 本轮实改（4 项，均有测试守护）
+
+测试计数 **754 → 759**（`signal.rs` ×3、`traffic.rs` ×2；`urc.rs` 为扩充既有用例，不增计数）。
+
+| # | 改动 | 上游依据（手册行号 / 参考仓库路径） |
+| --- | --- | --- |
+| M1 | **鼎桥信号三值链**：`Modem::signal()` 对 `Vendor::TDTech` 先走私有链 —— `AT^MONSC` 逐行取服务小区 RSRP/RSRQ/SINR（`cells.rs::parse_monsc`），任一项为 0 时补发 `AT^HCSQ?` 用 `parse_hcsq` 填缺项。新增 `hcsq_sinr_index_db()`：SINR 下标 0..251 步长 **0.2 dB**（`0`=<-20、`251`=≥30），与 RSRP（步长 1 dB）、RSRQ（步长 0.5 dB）三套表分开；**255=未知，不与 0 混同**（RSRP 未知 → 整份放弃，RSRQ/SINR 未知 → 该单项 0） | M5700 手册 §13.5 `AT^HCSQ`（L16947）：LTE `<rssi>,<rsrp>,<sinr>,<rsrq>`（RSRP 下标 2）、NR `<rsrp>,<sinr>,<rsrq>`（下标 1）；SINR 表 L17129-17160。§13.8 `AT^MONSC` 直接给 dB 值。此前 MT5700M 只有 `AT+QENG`/`AT+CESQ` 一条路，而这两条在它身上**全回 ERROR**（quirks 记录），信号恒为空 |
+| M2 | **鼎桥流量查询**：`traffic.rs::parse()` 新增 `AT^DSFLOWQRY` 分支；`vendor/tdtech.rs` 覆写 `traffic_candidates()` 只发这一条（默认的 `QGDCNT`/`GTSTATIS` 在 MT5700M 全 ERROR）。解析取 6 字段里的 **total 组**（下标 4/5），时间 8 位 hex 秒、流量 16 位 hex 字节 | M5700 手册 §16.12（L23241）：应答 `<last_ds_time>,<last_tx_flow>,<last_rx_flow>,<total_ds_time>,<total_tx_flow>,<total_rx_flow>`（L23249），时间/流量均为 hex（L23292 起） |
+| M3 | **`^RSSI` / `^CERSSI` URC 过滤**：`urc.rs` 的 `PRIVATE_URC_PREFIXES` 与 `UrcKind` 新增这两条位图上报，避免混进行响应流 | M5700 手册 §11.1 `AT^CURC`（L13957）：可控上报**默认全部开启**（L13998），`^RSSI`/`^CERSSI` 在 bitmap 列表内（L14042/14121）。安全边界同步记录：`^HCSQ` **绝不能入表** —— 它既是 URC 又是 `AT^HCSQ?` 的应答，而 `signal.rs` 鼎桥分支就查它（+CPIN 陷阱同类） |
+| M4 | **FM350 双卡切换预设**：`vendor/fibocom.rs` 的 `at_presets` 新增 `AT+GTDUALSIM=0` / `=1` / `?` 三条（SIM1 默认 / SIM2 / 查询当前工作卡）；`modem_catalog.json` 4 条 FM350 的 `usb_at.note` 补「40 是同一 RNDIS 族另一 profile（少 AP LOG/META 口）」 | FM350 手册 §4.3（L1703）：`<sim_app>` 范围 (0,1)，0=SIM1（default）、1=SIM2；属性表 Persistent=Yes / Effect=Immediately（L1731-1734），应答 `+GTDUALSIM:<sim_app>,<sub_app>,<sys_mode>`（L1716）。§13.1.1 `AT+GTUSBMODE`（L8307）：40 = `RNDIS+AT+AP(GNSS)+META+DEBUG+NPT+ADB`，41 = 同左再加 `AP(LOG)+AP(META)` 且为 default（L8348-8349）——两者是同一 RNDIS 族，40 并不换协议族 |
+
+### 11.3 差距表（参考仓库有、本仓库无，逐条裁决）
+
+| 参考仓库能力 | 裁决 | 理由 |
+| --- | --- | --- |
+| `AT^NDISSTATQRY` 连接态自动对账（T5） | **本轮不做，设计记录在案** | 见 §11.4 |
+| EMMCHLCK 写锁定 | **不做** | M5700 手册未收录该命令；用户实机笔记有用法但参数语义未验证，维持「未验证不盲写」 |
+| 关闭 `^CURC` 上报降噪 | **不做** | 参考仓库同样不关，靠消费侧过滤（本仓库 `urc.rs` 即此策略）；关掉还会丢 `^RSSI` 推送 |
+| SRPD / 展锐 PCIe | **不做** | 与 §9.3 同结论 |
+| 12 个 LuCI 页面整体移植 | **不做** | 本仓库是 modemd + LuCI 前端架构，只取命令口径，不搬 UI |
+
+### 11.4 后续设计记录：`AT^NDISSTATQRY` 连接态对账（未实施）
+
+- **口径以手册为准**：M5700 手册 §16.4（L22546）查询应答是 **`<cid>,<stat>[,<err>...]`，cid 在前**，`stat=1` 为已连接；参考仓库 `parse_ndis_state` 把首字段当 `stat`，只在 cid=1 的巧合下不出错，是潜在 bug——本仓库若实施，**以手册口径为准**并在注释记录该差异。
+- **对账设计（已具备，待拨号状态机稳定后实施）**：双判据（`DialState.state` 与 NDISSTAT 实查）不一致时以模组实查为准纠偏；周期探活；严格 gating——扫频 / 锁频 / 用户手动停止期间避让，不抢数据面。
+- **为何本轮不做**：它写拨号状态机的权威状态源，与 2026-10-21 的 `DialerSupervisor` 统一改造耦合，须在其真机验证之后单独一轮。
+
+---
+
 ## 10. 上游致谢
 
 本项目在开发过程中参考了以下仓库（按对齐基准排序）：
@@ -328,6 +377,7 @@ OpenWrt 包集合：6 个内核驱动包（`gobinet` / `pcie_mhi` / `pcie_mhi_fb
 | [ouyangzq/luci-proto-modem-pro](https://github.com/ouyangzq/luci-proto-modem-pro) | `modem_pro` netifd 协议：IPv4 + IPv6 单接口承载、`accept_ra=2`、QMI 数据面、前缀漂移等实机注意事项 | 未声明 |
 | [FUjr/QModem](https://github.com/FUjr/QModem) | 模组知识底座：型号清单、USB 接口号白名单与端口规则、语音 PCM 接口排除、厂商 AT 方言与拨号脚本、发现退避策略 | MPL-2.0（附禁止商用附加条款） |
 | [LianXia233/luci-app-fm350](https://github.com/LianXia233/luci-app-fm350) | FM350 / RW350 系列模组的识别与 AT 方言、锁频/锁小区、IMEI MFG 块备份恢复口径 | 未声明 |
+| [LianXia233/luci-app-mt5700](https://github.com/LianXia233/luci-app-mt5700) | MT5700M-CN（鼎桥 TD Tech）私有 AT 命令族（`AT^MONSC` / `AT^HCSQ` / `AT^DSFLOWQRY` / `AT^RSSI` URC）与拨号口径；据此补齐鼎桥信号/流量链路（§11.2 M1–M3） | GPL-3.0（仅参考，未拷贝） |
 | [6106757-lab/openvohive](https://github.com/6106757-lab/openvohive) | QMI/MBIM 会话边界对照基准：WDS Start/Stop/Runtime、WDA Set Data Format、Bind Mux 的 TLV 编号与流程；据此修正 IPv6 运行时设置缺口（§8.4） | PolyForm Noncommercial 1.0.0（仅参考，未拷贝） |
 | [hchyhchyxh/luci-app-rg501q-eu](https://github.com/hchyhchyxh/luci-app-rg501q-eu) | RG501Q-EU（`2c7c:0800`）的 USB 接口号口径（AT 口 1.2/1.3、QMI 1.4）、不绑 option 驱动的端口规则；据此新增 `modem_ports.json` 条目 | Apache-2.0（仅事实依据，未拷贝） |
 | [ainuoyan/QDC507-Modem-Support](https://github.com/ainuoyan/QDC507-Modem-Support) | 百旺 QDC507（`2c7c:0125`）识别口径与移远方言 AT、`AT+QCFG="nwscanmodeex"` 位标志、通用 `CGACT` 拨号配方；据此新增 baiwang 厂商模块 | GPL-3.0（仅事实依据，未拷贝） |

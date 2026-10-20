@@ -23,6 +23,12 @@
 //! 同理，在线与否只能由注册态判据决定，绝不能拿 `+CPIN` URC 推断 ——
 //! 实测 `+CREG=1` 的 URC 会被误读成「已注册在线」。
 //!
+//! 同一条纪律也适用于鼎桥的 `^HCSQ`：它**既是主动上报也是 `AT^HCSQ?` 的
+//! 应答**（`Modem::signal` 的鼎桥分支就查它），入表会把信号查询变成永远
+//! 空应答 —— 所以表里只有 `^RSSI` / `^CERSSI`（本程序从不查询它们），
+//! 没有 `^HCSQ`。未被吞的 `^HCSQ` 行进应答流无害：各解析器都按精确前缀
+//! 取行，多余的 `^HCSQ` 行不会被误当成别的查询结果。
+//!
 //! ## 洪水阈值为什么只作用于 URC 行
 //!
 //! [`FLOOD_LINES_PER_SEC`] 只对**被判定为 URC 的行**计数，超限即丢弃，
@@ -72,6 +78,12 @@ const PRIVATE_URC_PREFIXES: &[(&str, UrcKind)] = &[
     // 新短信到达（`+CMTI: "SM",3`）。本程序只发 `AT+CMGL` / `AT+CPMS` /
     // `AT+CMGF`，没有任何一条的应答会长这样，进表安全。
     ("CMTI", UrcKind::SmsNew),
+    // 鼎桥 MT5700/MT5710 的信号类主动上报（手册 §11 `AT^CURC` 位图，
+    // 默认 mode=1 全开；quirks 记录实测每秒多行）。带 `^` 前缀入表 ——
+    // 匹配只剥一个前导 `+`，不剥 `^`。本程序从不查询这两个前缀
+    // （信号走 `AT^HCSQ?`，见下），进表安全。
+    ("^RSSI", UrcKind::TdRssi),
+    ("^CERSSI", UrcKind::TdRssi),
 ];
 
 /// USSD 应答（`+CUSD`）的形态判据：`rest` 是前缀之后的部分（含冒号）。
@@ -130,6 +142,9 @@ pub enum UrcKind {
     Cusd,
     /// `+CMTI:`（新短信到达存储位）。
     SmsNew,
+    /// `^RSSI:` / `^CERSSI:`（鼎桥信号类主动上报，`AT^HCSQ?` 的查询应答
+    /// **不是**这个前缀，两者互不遮挡）。
+    TdRssi,
 }
 
 /// 判定一行是否为「明确可吞」的 URC。
@@ -316,6 +331,9 @@ mod tests {
             ("+CMTI: \"SM\",3", UrcKind::SmsNew),
             ("+CMTI: \"ME\",12", UrcKind::SmsNew),
             ("CMTI: SM,3", UrcKind::SmsNew),
+            // 鼎桥信号类主动上报（手册 §11 AT^CURC 位图；quirks 记录每秒多行）
+            ("^RSSI: 12", UrcKind::TdRssi),
+            ("^CERSSI: 1,\"LTE\",-95,-14,120,15", UrcKind::TdRssi),
         ] {
             assert_eq!(classify_urc(line), Some(want), "{line}");
         }
@@ -372,6 +390,10 @@ mod tests {
         // `+CPIN` 的 URC 与 `AT+CPIN?` 应答同形，一律不吞
         assert_eq!(classify_urc("+CPIN: READY"), None);
         assert_eq!(classify_urc("+CPIN: NOT READY"), None);
+        // 鼎桥 `^HCSQ` 是主动上报也是 `AT^HCSQ?` 的应答（signal.rs 的鼎桥
+        // 分支就查它）—— 同 +CPIN 的道理，绝不入表，否则信号查询恒空
+        assert_eq!(classify_urc("^HCSQ: \"LTE\",20,85,130,10"), None);
+        assert_eq!(classify_urc("^HCSQ: \"NR\",97,251,34"), None);
         // 本程序查询过的广和通指令，响应行绝不能吞
         // （参考实现用 +GT 宽匹配吞掉 AT+GTDNS 响应的事故）
         for line in [

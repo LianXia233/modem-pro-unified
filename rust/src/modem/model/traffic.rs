@@ -252,6 +252,16 @@ pub fn parse(cmd: &str, resp: &str) -> Option<TrafficSample> {
             ..Default::default()
         });
     }
+    if cmd.starts_with("AT^DSFLOWQRY") {
+        let (tx, rx) = parse_dsflowqry(resp)?;
+        return Some(TrafficSample {
+            supported: true,
+            kind: KIND_COUNTER.to_string(),
+            tx_bytes: tx,
+            rx_bytes: rx,
+            ..Default::default()
+        });
+    }
     None
 }
 
@@ -280,6 +290,23 @@ pub fn parse_gtstatis(resp: &str) -> Option<(u64, u64)> {
     }
 }
 
+/// `^DSFLOWQRY: <last_ds_time>,<last_tx>,<last_rx>,<total_ds_time>,<total_tx>,<total_rx>`
+/// （鼎桥 MT5700/MT5710，手册 §16.3；时间 8 位十六进制秒、流量 16 位十六进制字节）。
+///
+/// 取 **`total` 组**（最后一次清零至今的累计）—— `last` 组只是「最后一次数据
+/// 会话」的量，不是累计量，拿它当累计会越用越少。字段全是十六进制，按手册
+/// 原样 `from_str_radix(_, 16)`；解析不出（含 ERROR 应答）返回 `None`，
+/// 让候选循环自然落空。
+pub fn parse_dsflowqry(resp: &str) -> Option<(u64, u64)> {
+    let line = extract_all(resp, "^DSFLOWQRY").first()?.clone();
+    let f = csv(&line);
+    if f.len() < 6 {
+        return None;
+    }
+    let hex = |s: &str| u64::from_str_radix(s.trim(), 16).ok();
+    Some((hex(&f[4])?, hex(&f[5])?))
+}
+
 /// 取一行里的所有非负整数（用于「按量纲定位」的数字型应答）。
 fn numbers_in(line: &str) -> Vec<u64> {
     csv(line)
@@ -291,7 +318,8 @@ fn numbers_in(line: &str) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        candidates, fmt_bps, numbers_in, parse_gtstatis, parse_qgdcnt, Vendor, KIND_COUNTER,
+        candidates, fmt_bps, numbers_in, parse_dsflowqry, parse_gtstatis, parse_qgdcnt, Vendor,
+        KIND_COUNTER,
     };
 
     #[test]
@@ -342,6 +370,24 @@ mod tests {
         assert_eq!(candidates(Vendor::Fibocom), &["AT+GTSTATIS?"]);
         assert_eq!(candidates(Vendor::Unknown), &["AT+QGDCNT?", "AT+GTSTATIS?"]);
         assert_eq!(candidates(Vendor::Simcom), &["AT+QGDCNT?", "AT+GTSTATIS?"]);
+        // 鼎桥：默认两条在它身上全 ERROR（quirks 记录），只留私有 DSFLOWQRY
+        assert_eq!(candidates(Vendor::TDTech), &["AT^DSFLOWQRY"]);
+    }
+
+    #[test]
+    fn dsflowqry_parses_total_group_as_hex() {
+        // 手册 §16.3 口径：时间 8 位 hex 秒、流量 16 位 hex 字节；取 total 组
+        let resp = "\r\n^DSFLOWQRY: 1A2B3C4D,1F4,3E8,1A2B3C4D,2710,64\r\n\r\nOK\r\n";
+        assert_eq!(parse_dsflowqry(resp), Some((0x2710, 0x64)));
+        // 单会话组与累计组不同时不能被 last 组蒙混
+        let resp2 = "\r\n^DSFLOWQRY: 10,FF,FF,20,100,200\r\nOK\r\n";
+        assert_eq!(parse_dsflowqry(resp2), Some((0x100, 0x200)));
+    }
+
+    #[test]
+    fn dsflowqry_rejects_error_and_short_lines() {
+        assert_eq!(parse_dsflowqry("\r\nERROR\r\n"), None);
+        assert_eq!(parse_dsflowqry("\r\n^DSFLOWQRY: 1,2,3\r\nOK\r\n"), None);
     }
 
     #[test]
