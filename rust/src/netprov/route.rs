@@ -170,7 +170,8 @@ mod tests {
     use super::*;
 
     // 取自实机（FM350 + 一条板载 WAN 同时在线的场景）
-    const V4: &str = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+    const V4: &str =
+        "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
 eth1\t00000000\t010200C0\t0003\t0\t0\t10\t00000000\t0\t0\t0\n\
 eth2\t00000000\t01002A0A\t0003\t0\t0\t20\t00000000\t0\t0\t0\n\
 eth2\t00000000\t01002A0A\t0003\t0\t0\t50\t00000000\t0\t0\t0\n\
@@ -201,7 +202,9 @@ br-lan\t000AA8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
         for r in parse_v4(V4) {
             assert_ne!(r.gateway, "");
         }
-        assert!(parse_v4(V4).iter().all(|r| r.metric != 0 || r.iface != "br-lan"));
+        assert!(parse_v4(V4)
+            .iter()
+            .all(|r| r.metric != 0 || r.iface != "br-lan"));
     }
 
     #[test]
@@ -234,8 +237,14 @@ br-lan\t000AA8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
     fn family_check_does_not_mask_the_other_family() {
         // 实机复现过的场景：eth2 的 v4 默认路由全删了，v6 默认路由还在。
         // has_default_via（混判）会误报 online；按族查必须分开：
-        assert!(parse_v6(V6).iter().any(|r| r.iface == "eth2"), "样例里 eth2 有 v6 默认路由");
-        assert!(!parse_v4(V4).iter().any(|r| r.iface == "wwan9"), "v4 样例里没有 wwan9");
+        assert!(
+            parse_v6(V6).iter().any(|r| r.iface == "eth2"),
+            "样例里 eth2 有 v6 默认路由"
+        );
+        assert!(
+            !parse_v4(V4).iter().any(|r| r.iface == "wwan9"),
+            "v4 样例里没有 wwan9"
+        );
         // 直接验证族过滤语义：v4 表里查不到的 iface，v4 族 = false
         let v4_table = parse_v4(V4);
         assert!(!v4_table.iter().any(|r| r.iface == "wwan9"));

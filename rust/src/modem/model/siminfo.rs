@@ -328,10 +328,11 @@ pub fn parse_qtemp(resp: &str) -> Vec<Sensor> {
 /// 12 路里没接的那几路固定报 0，混进列表会把「最高温」算错。
 pub fn parse_chiptemp(resp: &str) -> Vec<Sensor> {
     const NAMES: [&str; 12] = [
-        "sub3G", "sub6G", "MIMO", "TCXO", "peri1", "peri2",
-        "ap1", "ap2", "modem1", "modem2", "bbp1", "bbp2",
+        "sub3G", "sub6G", "MIMO", "TCXO", "peri1", "peri2", "ap1", "ap2", "modem1", "modem2",
+        "bbp1", "bbp2",
     ];
-    let Some(field) = extract_field(resp, "+CHIPTEMP").or_else(|| extract_field(resp, "^CHIPTEMP")) else {
+    let Some(field) = extract_field(resp, "+CHIPTEMP").or_else(|| extract_field(resp, "^CHIPTEMP"))
+    else {
         return Vec::new();
     };
     let vals = csv(&field);
@@ -694,8 +695,8 @@ mod tests {
 
     use super::{
         gtsen_sensor_name, operator_from_imsi, parse_cbc, parse_cclk, parse_cclk_tz,
-        parse_chiptemp, parse_cnum,
-        parse_gtsenrdtemp, parse_iccid, parse_imsi, parse_qtemp, roam_state, round1,
+        parse_chiptemp, parse_cnum, parse_gtsenrdtemp, parse_iccid, parse_imsi, parse_qtemp,
+        roam_state, round1,
     };
 
     #[test]
@@ -767,7 +768,10 @@ mod tests {
         // FM160 实测（上游证据）：报本地时间、+32 正确 → 减 8h 才是 UTC
         let (utc, off) = parse_cclk_tz("26/09/29,22:25:46+32").expect("fm160");
         assert_eq!(off, 8 * 60);
-        assert_eq!(utc, parse_cclk("26/09/29,22:25:46").expect("base") - 8 * 3600);
+        assert_eq!(
+            utc,
+            parse_cclk("26/09/29,22:25:46").expect("base") - 8 * 3600
+        );
         // 负偏移：-05 → 加 75 分钟
         let (_, off) = parse_cclk_tz("26/01/01,12:00:00-05").expect("neg");
         assert_eq!(off, -75);
@@ -776,7 +780,10 @@ mod tests {
         assert_eq!(off, 0);
         assert_eq!(utc, parse_cclk("26/01/01,12:00:00").expect("base"));
         // 垃圾后缀不猜
-        assert!(parse_cclk_tz("26/01/01,12:00:00xx").is_some(), "非 ±zz 原样返回");
+        assert!(
+            parse_cclk_tz("26/01/01,12:00:00xx").is_some(),
+            "非 ±zz 原样返回"
+        );
         assert_eq!(
             parse_cclk_tz("26/01/01,12:00:00xx").map(|(u, o)| (u, o)),
             parse_cclk("26/01/01,12:00:00").map(|u| (u, 0))

@@ -48,14 +48,7 @@ pub struct AtCmdSpec {
 }
 
 impl AtCmdSpec {
-    pub fn on(
-        key: &str,
-        label: &str,
-        cmd: &str,
-        parser: &str,
-        format: &str,
-        source: &str,
-    ) -> Self {
+    pub fn on(key: &str, label: &str, cmd: &str, parser: &str, format: &str, source: &str) -> Self {
         Self {
             key: key.into(),
             label: label.into(),
@@ -551,7 +544,9 @@ mod tests {
         assert!(p.in_catalog);
         assert!(!p.platform_variant.is_empty());
         let keys: Vec<&str> = p.commands.iter().map(|c| c.key.as_str()).collect();
-        for k in ["identity", "serving", "signal", "reg", "temp", "traffic", "usb_qmi"] {
+        for k in [
+            "identity", "serving", "signal", "reg", "temp", "traffic", "usb_qmi",
+        ] {
             assert!(keys.contains(&k), "缺 {k}: {keys:?}");
         }
         // 型号清单的切换指令优先于厂商通用条目

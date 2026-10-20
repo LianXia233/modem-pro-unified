@@ -155,8 +155,10 @@ pub fn provision_modem_with(
     // modem_pro 的 v4 也是跑 udhcpc（mp-client wrapper），而 FM350 的模组内
     // DHCP 服务器实测长期无响应（broadcast discover 无 offer）——
     // 不转换的话 modem_pro 模式在 350 系列上永远拿不到 v4 地址。
-    let static_ipv4 = if matches!(mode, crate::config::WanMode::Dhcp | crate::config::WanMode::ModemPro)
-        && crate::runtime::hostnic::quirk(&modem.model().unwrap_or_default()).0
+    let static_ipv4 = if matches!(
+        mode,
+        crate::config::WanMode::Dhcp | crate::config::WanMode::ModemPro
+    ) && crate::runtime::hostnic::quirk(&modem.model().unwrap_or_default()).0
     {
         // **实时查询优先**：拨号状态/缓存里的地址可能是上一条会话的
         // （重拨后地址会变，实测踩过），拿到新会话地址才算数；查不到

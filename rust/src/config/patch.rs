@@ -202,7 +202,12 @@ sms_memory = \"SM\"
 
     #[test]
     fn no_trailing_newline_is_preserved() {
-        let out = replace_value("[ui]\nrequire_luci_login = true", "ui", "require_luci_login", "false");
+        let out = replace_value(
+            "[ui]\nrequire_luci_login = true",
+            "ui",
+            "require_luci_login",
+            "false",
+        );
         assert!(out.ends_with("false"));
     }
 }
