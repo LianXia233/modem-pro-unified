@@ -2041,6 +2041,11 @@ impl Modem {
         f(&mut st);
     }
 
+    /// 外部模块追加一步过程记录（例如断开后的网卡清理）。
+    pub(crate) fn note_step(&self, name: &str, ok: bool, info: &str) {
+        self.dial_step(name, ok, info);
+    }
+
     /// 追加一步过程记录（页面按顺序显示，失败那一步一眼能看到）。
     fn dial_step(&self, name: &str, ok: bool, info: &str) {
         self.dial_update(|s| {

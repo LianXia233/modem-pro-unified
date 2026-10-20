@@ -165,6 +165,82 @@ pub fn is_primary_via(iface: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 从 `ip -4 route show default dev X` 的输出里，取出**每条**默认路由的参数，
+/// 用于逐条 `ip route del`。
+///
+/// 为什么要逐条：同一条默认路由可能有多个 metric（多 WAN 场景），`ip route del default`
+/// 一次只会删一条；而 `ip route flush dev X` 在 busybox 上不可用。
+pub fn default_route_specs(show: &str) -> Vec<Vec<String>> {
+    show.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && l.starts_with("default"))
+        .map(|l| l.split_whitespace().map(str::to_string).collect())
+        .filter(|parts: &Vec<String>| parts.len() >= 2)
+        .collect()
+}
+
+/// 断开后清理这块网卡上的旧默认路由与旧地址（best-effort，失败只记日志）。
+///
+/// ## 为什么必须清
+///
+/// 模组侧 `AT+CGACT=0` / 拨号器停了，只代表「会话没了」；内核里那条
+/// `default via … dev eth2` 与 `inet 10.x.x.x/24` 还在。用户看到的是：
+/// 页面「已断开」，流量却仍往一张没有承载的网卡上发（黑洞），
+/// 直到 DHCP 租约过期 —— 期间所有出网请求超时。
+///
+/// ## 边界
+///
+/// 只动**这台模组的数据网卡**（调用方传入 `usb_netifs_for_port` 的结果），
+/// 不碰 LAN/WAN 的其它接口；`ip` 不存在（非 OpenWrt）时静默跳过。
+pub fn flush_stale(dev: &str) -> Vec<String> {
+    let dev = dev.trim();
+    let mut done = Vec::new();
+    if dev.is_empty() {
+        return done;
+    }
+    #[cfg(unix)]
+    {
+        // ① 逐条删默认路由（先看有哪些）
+        if let Ok(out) = std::process::Command::new("ip")
+            .args(["-4", "route", "show", "default", "dev", dev])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for spec in default_route_specs(&text) {
+                let mut args = vec!["-4".to_string(), "route".to_string(), "del".to_string()];
+                args.extend(spec.iter().skip(1).cloned());
+                if std::process::Command::new("ip")
+                    .args(&args)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+                {
+                    done.push(format!("ip {}", args.join(" ")));
+                }
+            }
+        }
+        // ② 清掉这块网卡上的地址（含 DHCP 租约地址）
+        if std::process::Command::new("ip")
+            .args(["-4", "addr", "flush", "dev", dev])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            done.push(format!("ip -4 addr flush dev {dev}"));
+        }
+        if done.is_empty() {
+            log::debug!("清理 {dev} 的旧地址/路由：没有可清理项或 ip 不可用");
+        } else {
+            log::info!("已清理 {dev} 的旧地址/路由：{}", done.join("；"));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dev;
+    }
+    done
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,5 +335,25 @@ br-lan\t000AA8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
         assert_eq!(hex_le_to_ipv4("010200C0").as_deref(), Some("192.0.2.1"));
         assert_eq!(hex_le_to_ipv4("00000000").as_deref(), Some("0.0.0.0"));
         assert_eq!(hex_le_to_ipv4("bad"), None);
+    }
+
+    /// 一条网卡上可能有多条默认路由（不同 metric）；都要能被逐条删掉。
+    #[test]
+    fn splits_each_default_route() {
+        let show = "default via 10.42.0.1 dev eth2 proto dhcp src 10.42.0.2 metric 20\n\
+default via 10.42.0.1 dev eth2 proto dhcp src 10.42.0.2 metric 50\n\
+10.42.0.0/24 dev eth2 proto kernel scope link src 10.42.0.2\n";
+        let specs = default_route_specs(show);
+        assert_eq!(specs.len(), 2, "非 default 行必须忽略");
+        assert_eq!(specs[0][0], "default");
+        assert!(specs[0].contains(&"metric".to_string()));
+        assert_eq!(specs[1].last().map(String::as_str), Some("50"));
+    }
+
+    /// 空输出 / 只有非默认路由 ⇒ 没有可删项，不能 panic。
+    #[test]
+    fn empty_route_output_is_safe() {
+        assert!(default_route_specs("").is_empty());
+        assert!(default_route_specs("10.0.0.0/8 dev eth0\n").is_empty());
     }
 }

@@ -64,6 +64,7 @@
 | P9 | PPP 数据面 | QModem 无（`ppp` 只是认证命令） | 无 | 不实现，并在支持矩阵里明确标注 | 不适用 |
 | P10 | 拨号**失败退避** | Go `hostdial_run.go:39-45`（10s 起、翻倍、封顶 60s） | 固定 5 秒 | `retry_delay()`：5/10/20/40/60s，成功即清零；纯函数 + 测试 | 已实现 |
 | P11 | 清单形态核对（协议是否被型号支持） | Go `catalog.go:555-585` | 无 | `shape_note()`：清单里 USB/PCIe 形态都不含当前 kind 时写一步提示（不拦截），有测试 | 已实现 |
+| P12 | 断开后**清理旧地址/旧路由** | Go `hostdial_posix.go:108-139` | 只改状态：内核里的旧 `default` 与地址还在（黑洞） | `netprov::route::flush_stale()`：逐条删经该网卡的默认路由 + `ip -4 addr flush`；只动本模组网卡；`dial_disconnect` 调用并写步骤 | 已实现 |
 
 ### 2.3 文档与契约
 
@@ -94,6 +95,8 @@
 | `rust/src/modem/manager.rs` | 救援 / PCIe 补绑 / 形态核对接线 | `auto_bind_pcie`、`maybe_rescue`、`set_ttys` |
 | `rust/src/modem/model/modem.rs` | 多 tty 拓扑 | `ttys` 字段、`set_ttys`、`view().tty_list` |
 | `rust/src/runtime/store.rs` | `vid:pid@bus` 绑定键 | `at_port_bind_key_scoped` |
+| `rust/src/netprov/route.rs` | 断开清理 | `default_route_specs` / `flush_stale` + 2 项测试 |
+| `rust/src/http/handlers/dial_disconnect.rs` | 断开后清地址/路由 | 写一步「清理主机网卡旧地址/路由」 |
 | `rust/src/runtime/dialer/mod.rs` | 指数退避 | `retry_delay` + 失败计数 |
 | `rust/src/http/handlers/atport_bind.rs` | `bus_path` 参数 | 兼容旧键 |
 | `rust/web/index.html` | 绑定 UI 按设备物理路径 | 下拉值带 `bus_path` |
@@ -108,7 +111,7 @@
 
 | 命令 | 结果 |
 | --- | --- |
-| `cargo test --locked` | **730 passed / 0 failed**（基线 703，新增 27） |
+| `cargo test --locked` | **732 passed / 0 failed**（基线 703，新增 29） |
 | `cargo build --release --locked` | 通过（见构建报告） |
 | `cargo clippy --all-targets --locked` | 0 error；7 条 warning **全部在未改动文件**（`cells.rs` 死代码/文档格式、`params.rs` 无用赋值、`route.rs` 比较写法、`siminfo.rs` map 恒等、`dial.rs:1962` contains） |
 | `cargo fmt --check` | 仓库基线本就有 14 个文件 / 48 处不合规；本次改动文件已 `rustfmt` 过，另有一个独立的 `style: cargo fmt` 提交把全仓格式统一 |
