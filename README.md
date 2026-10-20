@@ -57,7 +57,7 @@ make package/modem-pro/compile V=s MODEM_PRO_HOST_RUST=1   # 宿主 rustup 直�
 - [docs/INTEGRATION.md](docs/INTEGRATION.md) — 架构分层、数据流、数据表与扩展指南。
 - [docs/BUILD.md](docs/BUILD.md) — 本机开发、SDK 构建、CI 与安装后验证。
 - [docs/API.md](docs/API.md) — HTTP / WebSocket 接口契约（由路由表导出）。
-- [docs/UPSTREAM_AUDIT.md](docs/UPSTREAM_AUDIT.md) — 上游源码审计、迁移矩阵、验证结果与真机待办。
+- [docs/UPSTREAM_AUDIT.md](docs/UPSTREAM_AUDIT.md) — 上游源码审计、迁移矩阵、验证结果、真机待办与上游致谢清单。
 - [docs/SUPPORT_MATRIX.md](docs/SUPPORT_MATRIX.md) — 逐型号支持矩阵与厂商数据通道指令。
 - [CHANGELOG.md](CHANGELOG.md) — 变更记录；[RELEASE_NOTES.md](RELEASE_NOTES.md) — 发版说明。
 
@@ -74,9 +74,18 @@ make package/modem-pro/compile V=s MODEM_PRO_HOST_RUST=1   # 宿主 rustup 直�
 | [ouyangzq/modem-pro](https://github.com/ouyangzq/modem-pro) | 模组侧守护进程 `modemd`：多模组管理、厂商指令方言、锁网/小区解析、短信与拨号托管等一整套真机打磨过的实现。本仓库的 HTTP/WS 接口、JSON 字段、AT 解析口径与配置项都以其为对齐基准。 |
 | [ouyangzq/luci-proto-modem-pro](https://github.com/ouyangzq/luci-proto-modem-pro) | `modem_pro` netifd 协议：**一张接口同时承载 IPv4 + IPv6** 的 `mp-client.sh` wrapper 与 LuCI 协议表单，并给出 `accept_ra=2`、QMI 数据面、前缀漂移等实机注意事项。 |
 | [LianXia233/luci-app-fm350](https://github.com/LianXia233/luci-app-fm350) | **350 系列模组**（广和通 FM350 / RW350）的真机参考：模组识别与 AT 方言、锁频/锁小区写法、IMEI 的 MFG 块备份与恢复等口径参考了该工程。 |
+| [FUjr/QModem](https://github.com/FUjr/QModem) | 模组知识底座：`modem_support.json` 型号清单、USB 接口号白名单与端口规则、语音 PCM 接口排除、12 家厂商 AT 方言与拨号脚本。本仓库的发现白名单 / 分组策略、厂商数据通道指令表、发现退避参数均以其源码为基准（逐条核对记录见 `docs/UPSTREAM_AUDIT.md`）。许可为 MPL-2.0 并附禁止商用附加条款。 |
 
 本仓库是在这些工程的基础上做「整合为单仓库 + 后端 Rust 重写」的工作，目标是与上述
 接口契约逐字兼容。上游仓库未声明开源许可证，本仓库的 [MIT 许可证](LICENSE) 仅覆盖本仓库自身的代码。
+
+### 关于厂商拨号器 C 源码
+
+内置 QMI / MBIM 拨号器是**本仓库的独立 Rust 实现**（`rust/src/runtime/dialer/`），
+**不包含、未拷贝任何厂商 C 源码**（quectel-CM / fibocom-dial / meig-cm / simcom-cm 等均未采用），
+因此不列入致谢。开发过程中仅将这些 C 实现作为协议行为的事实基准逐条对照
+（TLV 顺序、常量、流程），差异与取舍记录见 [docs/UPSTREAM_AUDIT.md](docs/UPSTREAM_AUDIT.md) §7
+与 [CHANGELOG.md](CHANGELOG.md) 的 [1.0.3] 条目。
 
 ## 许可证
 

@@ -156,3 +156,21 @@
 | 非 QMI 拨号 | 采用 **QModem 的厂商指令表**，不以 Go 版为准 | Go 版这条路径只有 `AT+CGACT`，无法解释「PDP active 但网卡无 carrier」；QModem 的指令有 14 家实测脚本可对照 |
 | 平台不明时的行为 | 走 3GPP 通用路径，不发私有指令 | 与项目既有红线「未取证就不发」一致；失败也不会伪装成功（仍要过 CGPADDR + 网卡就绪校验） |
 | 端口白名单严格度 | 白名单外**不选**，宁可这一轮不登记 | 选到 diag 口的代价是「能打开、全超时」，比晚一轮发现更糟 |
+
+---
+
+## 7. 上游致谢
+
+本项目在开发过程中参考了以下仓库（按对齐基准排序）：
+
+| 仓库 | 参考内容 | 许可 |
+| --- | --- | --- |
+| [ouyangzq/modem-pro](https://github.com/ouyangzq/modem-pro) | Go 原版 `modemd`：HTTP/WS 接口契约、JSON 字段、AT 解析口径、配置项、状态机、组网流程。本仓库以上游为逐字兼容基准（接口名对照结论见 CHANGELOG [1.0.3]） | 未声明 |
+| [ouyangzq/luci-proto-modem-pro](https://github.com/ouyangzq/luci-proto-modem-pro) | `modem_pro` netifd 协议：IPv4 + IPv6 单接口承载、`accept_ra=2`、QMI 数据面、前缀漂移等实机注意事项 | 未声明 |
+| [FUjr/QModem](https://github.com/FUjr/QModem) | 模组知识底座：型号清单、USB 接口号白名单与端口规则、语音 PCM 接口排除、厂商 AT 方言与拨号脚本、发现退避策略 | MPL-2.0（附禁止商用附加条款） |
+| [LianXia233/luci-app-fm350](https://github.com/LianXia233/luci-app-fm350) | FM350 / RW350 系列模组的识别与 AT 方言、锁频/锁小区、IMEI MFG 块备份恢复口径 | 未声明 |
+
+**厂商拨号器 C 源码（quectel-CM / fibocom-dial / meig-cm / simcom-cm 等）不在致谢范围**：
+内置 QMI / MBIM 拨号器是本仓库的独立 Rust 实现，未使用、未拷贝任何厂商 C 源码；
+C 实现仅在开发中作为协议行为基准逐条对照（TLV 顺序、常量、流程），
+据此修复的缺口与有意保留的差异记录见 [CHANGELOG.md](../CHANGELOG.md) 的 [1.0.3] 条目。

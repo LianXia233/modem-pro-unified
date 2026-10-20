@@ -10,6 +10,16 @@
 
 ## [1.0.3] - 2026-10-20
 
+### 文档：补齐上游致谢（只列参考过的仓库）
+
+README「致谢」段补入 [FUjr/QModem](https://github.com/FUjr/QModem)（模组知识底座：
+型号清单、端口白名单、PCM 接口排除、厂商 AT 方言、拨号脚本、退避策略；MPL-2.0
+附禁止商用附加条款），`docs/UPSTREAM_AUDIT.md` 新增 §7 上游致谢清单。致谢范围
+按仓库计：ouyangzq/modem-pro、ouyangzq/luci-proto-modem-pro、FUjr/QModem、
+LianXia233/luci-app-fm350；Rust crate 依赖与厂商拨号器 C 源码均不列入——内置
+QMI/MBIM 拨号器是本仓库的独立 Rust 实现，未使用、未拷贝任何厂商 C 源码，
+C 实现仅作为协议行为基准逐条对照（见 [1.0.3] 其余条目）。
+
 ### 修复：小窗页仍在调用已删除的 `/api/sms/auth`（接口名对照 modem-pro）
 
 把本仓 `ROUTES`（99 个路径）与 modem-pro `module/kernel/api.go` 的
