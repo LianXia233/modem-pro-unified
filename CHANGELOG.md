@@ -240,6 +240,23 @@ OpenVohive 批次的 v6 运行时回填并入既有端到端用例）；`cargo b
 `docs/SUPPORT_MATRIX.md` 同步更新：92 型号 / 13 厂商、qdc507 入表、
 新增「支持程度五级」（收录 / 识别 / 后端 / 自动化 / 实机；实机级 0）。
 
+### 文档：首页 README 与各文档现状对齐
+
+首页此前停留在「4 家厂商」与合并初期口径，与实际代码脱节。本次同步：
+
+- 开头改为 **13 家厂商 / 92 型号**口径（数字由 `modem_catalog.json` 统计得出），
+  并链接支持矩阵五级说明；
+- 「特色亮点」补两条：统一拨号生命周期协调器（链 `DIAL_STATE_MACHINE.md`）、
+  754 项自动化测试；
+- 「文档」节补 `DIAL_STATE_MACHINE.md` 条目，`UPSTREAM_AUDIT.md` /
+  `SUPPORT_MATRIX.md` 描述补 §8–§9 裁决与五级支持；
+- 「致谢」表补齐 `docs/UPSTREAM_AUDIT.md` §10 的 4 个参考仓库
+  （openvohive / luci-app-rg501q-eu / QDC507-Modem-Support / 5G-Modem-Support），
+  各标注许可与「仅参考未拷贝」；许可证段落改为「许可见上表与 §10」，
+  替换原来「上游仓库未声明开源许可证」的过期表述（QModem 为
+  MPL-2.0 + 禁止商用附加条款，openvohive 为 PolyForm Noncommercial 1.0.0，
+  另两个为 Apache-2.0 / GPL-3.0，均只作事实依据）。
+
 ## [1.0.3] - 2026-10-20
 
 ### 文档：补齐上游致谢（只列参考过的仓库）
