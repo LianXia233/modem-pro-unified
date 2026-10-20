@@ -191,15 +191,10 @@ fn handle_text(client: &Arc<WsClient>, state: &Arc<AppState>, text: &str) {
         // ⚠️ 下面几个都要占串口（发短信要等提示符、切模式要等回读），
         //    一律丢到独立线程：WS 读循环卡住会让这一路的心跳与推送全停。
         "sms_read" => {
-            let Some(modem) = modem_of(state, cmd.modem_id) else {
+            let Some(idx) = parse_index(&cmd.index) else {
                 return;
             };
-            let idx = match parse_index(&cmd.index) {
-                Some(v) => v,
-                None => return,
-            };
-            let state = state.clone();
-            std::thread::spawn(move || {
+            with_modem_async(state, cmd.modem_id, move |modem, state| {
                 if let Err(e) = modem.mark_sms_read(&idx.to_string()) {
                     log::warn!("标记短信已读失败（模组 {}）: {e}", modem.id);
                     return;
@@ -209,15 +204,10 @@ fn handle_text(client: &Arc<WsClient>, state: &Arc<AppState>, text: &str) {
             });
         }
         "sms_delete" => {
-            let Some(modem) = modem_of(state, cmd.modem_id) else {
+            let Some(idx) = parse_index(&cmd.index) else {
                 return;
             };
-            let idx = match parse_index(&cmd.index) {
-                Some(v) => v,
-                None => return,
-            };
-            let state = state.clone();
-            std::thread::spawn(move || {
+            with_modem_async(state, cmd.modem_id, move |modem, state| {
                 if let Err(e) = modem.delete_sms(&idx.to_string()) {
                     log::warn!("屏端删除短信失败（模组 {}）: {e}", modem.id);
                     return;
@@ -226,24 +216,16 @@ fn handle_text(client: &Arc<WsClient>, state: &Arc<AppState>, text: &str) {
             });
         }
         "mode_get" => {
-            let Some(modem) = modem_of(state, cmd.modem_id) else {
-                return;
-            };
-            let state = state.clone();
-            std::thread::spawn(move || {
+            with_modem_async(state, cmd.modem_id, move |modem, state| {
                 super::push::push_mode(&state, &modem, String::new());
             });
         }
         "mode_set" => {
-            let Some(modem) = modem_of(state, cmd.modem_id) else {
-                return;
-            };
             let value = cmd.value.trim().to_string();
             if value.is_empty() {
                 return;
             }
-            let state = state.clone();
-            std::thread::spawn(move || {
+            with_modem_async(state, cmd.modem_id, move |modem, state| {
                 // 下发 + 回读确认都在 set_mode_pref 里（模组异步生效，可能占串口几秒）
                 let msg = match modem.set_mode_pref(&value) {
                     Ok(pref) => format!("已切换到 {}", pref.value_text),
@@ -253,13 +235,9 @@ fn handle_text(client: &Arc<WsClient>, state: &Arc<AppState>, text: &str) {
             });
         }
         "sms_send" => {
-            let Some(modem) = modem_of(state, cmd.modem_id) else {
-                return;
-            };
             let number = cmd.number.trim().to_string();
             let text = cmd.text.clone();
-            let state = state.clone();
-            std::thread::spawn(move || {
+            with_modem_async(state, cmd.modem_id, move |modem, state| {
                 let err = modem.send_sms(&number, &text).err().map(|e| e.to_string());
                 super::push::push_sendsms(&state, &modem, &number, &text, err);
             });
@@ -267,11 +245,7 @@ fn handle_text(client: &Arc<WsClient>, state: &Arc<AppState>, text: &str) {
         "net_get" => {
             // 屏端是 Passive（不算"有人在看"），没人开网页时网络缓存是冷的，
             // 运营商名会一直空着 ⇒ 屏幕得自己开口要一次。
-            let Some(modem) = modem_of(state, cmd.modem_id) else {
-                return;
-            };
-            let state = state.clone();
-            std::thread::spawn(move || {
+            with_modem_async(state, cmd.modem_id, move |modem, state| {
                 super::push::push_network(&state, &modem);
             });
         }
@@ -303,6 +277,23 @@ fn modem_of(state: &AppState, id: u32) -> Option<Arc<crate::modem::model::Modem>
     state.mgr.get(id)
 }
 
+/// WS 指令的公共骨架：取模组 → 起独立线程干活。
+///
+/// 六个占串口的指令（sms_read / sms_delete / mode_get / mode_set / sms_send /
+/// net_get）都是这个形状。抽出来是为了让「取不到模组就静默返回」与
+/// 「必须离开 WS 读循环」这两条口径各自只有一处 —— 分叉一次，
+/// 某个指令就会在 WS 线程里同步占串口，把这一路的心跳与推送全卡住。
+fn with_modem_async<F>(state: &Arc<AppState>, id: u32, f: F)
+where
+    F: FnOnce(Arc<crate::modem::model::Modem>, Arc<AppState>) + Send + 'static,
+{
+    let Some(modem) = modem_of(state, id) else {
+        return;
+    };
+    let state = state.clone();
+    std::thread::spawn(move || f(modem, state));
+}
+
 /// 屏端给的短信存储位置（只认非负整数；空 / 带空格等都当无效）。
 fn parse_index(raw: &str) -> Option<u32> {
     let t = raw.trim();
@@ -327,6 +318,11 @@ fn snapshot(client: &Arc<WsClient>, state: &Arc<AppState>) {
 }
 
 /// 「跟随 LuCI 登录」在 WS 侧的同款闸门。
+///
+/// 与 HTTP 侧 [`super::auth::is_authorized`] 的差异只有两点，均有意的：
+/// 没有放行名单（升级连接本身不承载业务路径，放行名单按路径分流在这里无意义）；
+/// 本机判定用 TCP 对端地址（WS 不经 `gateway::proxy` 转发，`remote_addr` 是真的）。
+/// 会话校验本身共用 [`super::auth::session_valid`]，防止两边漂移。
 fn authorized(
     state: &AppState,
     headers: &HashMap<String, String>,
@@ -342,13 +338,7 @@ fn authorized(
     let sid = cookie(headers, auth::SESSION_COOKIE).or_else(|| query.get("luci_sid").cloned());
     match sid {
         None => false,
-        Some(sid) => match state.ubus.session_valid(&sid) {
-            Ok(valid) => valid,
-            Err(e) => {
-                log::warn!("ubus 会话校验不可用，放行本次 WebSocket 连接: {e}");
-                true
-            }
-        },
+        Some(sid) => auth::session_valid(state, &sid, "本次 WebSocket 连接"),
     }
 }
 

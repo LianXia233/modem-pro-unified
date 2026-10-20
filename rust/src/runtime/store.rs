@@ -1,10 +1,29 @@
-//! 按模组的运行期落盘：`quota.json`（与配置文件同目录）。
+//! 运行期台账落盘（全部与配置文件同目录）：
+//! `quota.json` / `imei.json` / `atport.json` / `atport_bind.json` / `schedule.json`。
 //!
-//! 为什么要落盘：配额的「本周期已用」是**跨重启**的账 —— 重启一次就把用量清零等于
-//! 配额形同虚设。config.toml 是 conffile（升级不覆盖、也不该被程序改写），
-//! 所以运行期数据单独放这一个文件。
+//! ## 为什么要单独落盘
 //!
-//! 写失败只记 warn 不阻断：配额不是核心链路，落不了盘也要让页面照常出数据。
+//! 配额的「本周期已用」、IMEI 原值备份、手动指定的 AT 口、定时任务「哪些槽位
+//! 已经跑过」都是**跨重启**的账 —— 重启一次就清零，等于这些功能形同虚设。
+//! config.toml 是 conffile（升级不覆盖、也不该被程序改写），所以运行期数据另放。
+//!
+//! ## 改任何一个 store 都要遵守的约定
+//!
+//! · **失败降级**：文件不存在 / 损坏 / 读不了都按「空台账」起步并记一条 warn，
+//!   绝不阻断启动；写失败同样只 warn（配额不是核心链路，落不了盘也要让页面出数）；
+//! · **并发**：每个 store 一把 `Mutex` 护住内存表，落盘时**不持锁做 IO** ——
+//!   写入路径一律是「加锁改内存 → drop 锁 → `flush()` 重新加锁拷快照」；
+//! · **键的类型**：`quota` / `imei` 用模组 id（`u32`，落盘转字符串，读回解析失败就跳过）；
+//!   `atport` 用**模组身份**（`imei:<imei>` / `model:<model>` / 未识别时的 `ports:<当前口>`）；
+//!   `atport_bind` 用 USB 设备身份（`vid:pid` 或 `vid:pid@<总线路径>`，见
+//!   [`at_port_bind_key_scoped`]）；**都不用端口号当键** —— 端口号正是要换的那个东西。
+//!
+//! ## 原子性（现状如此，不是目标态）
+//!
+//! `SchedStore` 与 `HostNicStore`（`runtime/hostnic.rs`）走 `.tmp` + `rename`；
+//! `quota` / `imei` / `atport` / `atport_bind` 是**直接覆盖写** —— 写一半掉电会留下
+//! 损坏文件，靠上面的「损坏按空台账」兜住（代价是丢一次账，不是起不来服务）。
+//! 统一成原子写属实机写盘行为变更，未做，见 docs/UPSTREAM_AUDIT.md 的取舍说明。
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -12,6 +31,51 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::modem::model::quota::QuotaSettings;
+
+/// 读一个 JSON 台账文件（约定见模块头的「失败降级」）。
+///
+/// 路径为空 / 文件不存在 / 解析失败一律 `None`：前两者是常态（没配路径、
+/// 首次启动），不记日志；解析失败与读取失败各记一条 warn。
+/// 键的解析与清洗**不在这里做** —— 每个 store 的键类型（u32 / 字符串）、
+/// 清洗口径（去空白 / 跳过坏项）不同，那部分留在调用方。
+/// 原子写一个 JSON 台账：先写 `<path>.tmp` 再 rename。
+///
+/// 写一半掉电只会留下 `.tmp`（下次被覆盖），正式文件始终完整 —— 代价是
+/// 断电丢最近一次改动，换来的是不留下解析不了的坏文件。
+/// 返回值 = rename 是否成功：调用方据此决定要不要清脏标记（不清则下次重试）。
+/// 失败只 warn，不向上抛：落不了盘也要让服务继续跑（模块头的降级约定）。
+pub fn write_json_atomic(path: &str, text: &str) -> bool {
+    let tmp = format!("{path}.tmp");
+    if let Err(e) = std::fs::write(&tmp, text.as_bytes()) {
+        log::warn!("写 {tmp} 失败: {e}");
+        return false;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        log::warn!("改名 {tmp} → {path} 失败: {e}");
+        return false;
+    }
+    true
+}
+
+pub fn load_json<T: serde::de::DeserializeOwned>(path: &str) -> Option<T> {
+    if path.trim().is_empty() {
+        return None;
+    }
+    match std::fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str::<T>(&text) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                log::warn!("解析 {path} 失败，按空台账继续: {e}");
+                None
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            log::warn!("读取 {path} 失败，按空台账继续: {e}");
+            None
+        }
+    }
+}
 
 /// 一个模组的配额台账。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -57,20 +121,11 @@ impl QuotaStore {
     /// 打开（文件不存在 / 损坏都按空台账起步，并记一条 warn）。
     pub fn new(path: String) -> Self {
         let mut inner: HashMap<u32, QuotaRecord> = HashMap::new();
-        if !path.trim().is_empty() {
-            match std::fs::read_to_string(&path) {
-                Ok(text) => match serde_json::from_str::<QuotaFile>(&text) {
-                    Ok(f) => {
-                        for (k, v) in f.modems {
-                            if let Ok(id) = k.parse::<u32>() {
-                                inner.insert(id, v);
-                            }
-                        }
-                    }
-                    Err(e) => log::warn!("解析 {path} 失败，按空台账继续: {e}"),
-                },
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => log::warn!("读取 {path} 失败，按空台账继续: {e}"),
+        if let Some(f) = load_json::<QuotaFile>(&path) {
+            for (k, v) in f.modems {
+                if let Ok(id) = k.parse::<u32>() {
+                    inner.insert(id, v);
+                }
             }
         }
         Self {
@@ -152,17 +207,10 @@ pub struct ImeiStore {
 impl ImeiStore {
     pub fn new(path: String) -> Self {
         let mut inner: HashMap<u32, ImeiBackup> = HashMap::new();
-        if !path.trim().is_empty() {
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                match serde_json::from_str::<ImeiFile>(&text) {
-                    Ok(f) => {
-                        for (k, v) in f.modems {
-                            if let Ok(id) = k.parse::<u32>() {
-                                inner.insert(id, v);
-                            }
-                        }
-                    }
-                    Err(e) => log::warn!("解析 {path} 失败，按空台账继续: {e}"),
+        if let Some(f) = load_json::<ImeiFile>(&path) {
+            for (k, v) in f.modems {
+                if let Ok(id) = k.parse::<u32>() {
+                    inner.insert(id, v);
                 }
             }
         }
@@ -228,9 +276,13 @@ struct AtPortFile {
 
 /// 手动指定的 AT 命令口（跨重启记住；`/api/at/port` 用）。
 ///
-/// 键是「模组身份」（`imei:<imei>` / `model:<model>` / 未识别时的 `ports:<口,口>`），
+/// 键是「模组身份」（`imei:<imei>` / `model:<model>` / 未识别时的 `ports:<当前口>`），
 /// **不是端口号** —— 端口号正是要换的那个东西；值是手动指定的命令口，
 /// 空串 = 用自动探测（见 `modem::discovery`）。
+///
+/// 与「按 USB 设备身份」的 [`AtPortBindStore`]（`atport_bind.json`）是两套键：
+/// 这台模组**身份读不出来时**（AT 口挑错 → IMEI/型号都读不到）只有后者能用，
+/// 所以发现流程里绑定优先于本 store（见 `modem::manager::apply_saved_at_port`）。
 pub struct AtPortStore {
     path: String,
     inner: Mutex<HashMap<String, String>>,
@@ -240,21 +292,12 @@ impl AtPortStore {
     /// 打开（文件不存在 / 损坏都按「没指定过」起步，并记一条 warn）。
     pub fn new(path: String) -> Self {
         let mut inner: HashMap<String, String> = HashMap::new();
-        if !path.trim().is_empty() {
-            match std::fs::read_to_string(&path) {
-                Ok(text) => match serde_json::from_str::<AtPortFile>(&text) {
-                    Ok(f) => {
-                        for (k, v) in f.modems {
-                            let k = k.trim();
-                            if !k.is_empty() {
-                                inner.insert(k.to_string(), v.trim().to_string());
-                            }
-                        }
-                    }
-                    Err(e) => log::warn!("解析 {path} 失败，按无指定继续: {e}"),
-                },
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => log::warn!("读取 {path} 失败，按无指定继续: {e}"),
+        if let Some(f) = load_json::<AtPortFile>(&path) {
+            for (k, v) in f.modems {
+                let k = k.trim();
+                if !k.is_empty() {
+                    inner.insert(k.to_string(), v.trim().to_string());
+                }
             }
         }
         Self {
@@ -420,22 +463,13 @@ impl AtPortBindStore {
     /// 打开（文件不存在 / 损坏都按「没绑过」起步，并记一条 warn）。
     pub fn new(path: String) -> Self {
         let mut data: HashMap<String, String> = HashMap::new();
-        if !path.trim().is_empty() {
-            match std::fs::read_to_string(&path) {
-                Ok(text) => match serde_json::from_str::<AtPortBindFile>(&text) {
-                    Ok(f) => {
-                        for (k, v) in f.binds {
-                            let key = k.trim();
-                            let port = v.trim();
-                            if !key.is_empty() && !port.is_empty() {
-                                data.insert(key.to_string(), port.to_string());
-                            }
-                        }
-                    }
-                    Err(e) => log::warn!("解析 {path} 失败，按无绑定继续: {e}"),
-                },
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => log::warn!("读取 {path} 失败，按无绑定继续: {e}"),
+        if let Some(f) = load_json::<AtPortBindFile>(&path) {
+            for (k, v) in f.binds {
+                let key = k.trim();
+                let port = v.trim();
+                if !key.is_empty() && !port.is_empty() {
+                    data.insert(key.to_string(), port.to_string());
+                }
             }
         }
         Self {
@@ -585,26 +619,17 @@ impl SchedStore {
     /// 打开并载入（文件不存在 / 损坏都按空台账起步；损坏记 warn）。
     pub fn new(path: String) -> Self {
         let mut tasks: Vec<crate::modem::model::schedule::Task> = Vec::new();
-        if !path.trim().is_empty() {
-            match std::fs::read_to_string(&path) {
-                Ok(text) => match serde_json::from_str::<SchedFile>(&text) {
-                    Ok(f) => {
-                        for mut t in f.tasks {
-                            if t.id.trim().is_empty() {
-                                continue;
-                            }
-                            // 与 API 写入同一套校验：坏任务宁可跳过也不带病运行
-                            if let Err(e) = crate::modem::model::schedule::validate_task(&mut t) {
-                                log::warn!("定时任务 {} 不合法，跳过: {e}", t.id);
-                                continue;
-                            }
-                            tasks.push(t);
-                        }
-                    }
-                    Err(e) => log::warn!("解析 {path} 失败，按空台账继续: {e}"),
-                },
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => log::warn!("读取 {path} 失败，按空台账继续: {e}"),
+        if let Some(f) = load_json::<SchedFile>(&path) {
+            for mut t in f.tasks {
+                if t.id.trim().is_empty() {
+                    continue;
+                }
+                // 与 API 写入同一套校验：坏任务宁可跳过也不带病运行
+                if let Err(e) = crate::modem::model::schedule::validate_task(&mut t) {
+                    log::warn!("定时任务 {} 不合法，跳过: {e}", t.id);
+                    continue;
+                }
+                tasks.push(t);
             }
         }
         let on = tasks.iter().filter(|t| t.enabled).count();
@@ -752,18 +777,11 @@ impl SchedStore {
             log::warn!("序列化定时任务台账失败");
             return;
         };
-        // 原子写：先写 .tmp 再改名，避免写一半被断电截断
-        let tmp = format!("{}.tmp", self.path);
-        if let Err(e) = std::fs::write(&tmp, text.as_bytes()) {
-            log::warn!("写 {tmp} 失败: {e}");
-            return;
+        // 原子写：rename 没成才保留脏标记，下一次 flush 重试
+        if write_json_atomic(&self.path, &text) {
+            guard.dirty = false;
+            guard.saved_at = crate::logging::unix_now();
         }
-        if let Err(e) = std::fs::rename(&tmp, &self.path) {
-            log::warn!("改名 {tmp} → {} 失败: {e}", self.path);
-            return;
-        }
-        guard.dirty = false;
-        guard.saved_at = crate::logging::unix_now();
     }
 }
 

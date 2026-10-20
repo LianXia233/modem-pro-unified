@@ -129,6 +129,61 @@ pub fn push_changes(state: &AppState, modem_id: u32, entries: &[ChangeEntry]) {
     state.ws.broadcast("changes", Some(modem_id), data);
 }
 
+/// 解析频段入参：`[78,3]`（JSON 数组被 merge_form 字符串化）/ `78:3` / `78,3` 都认。
+///
+/// 只收正数；非数字片段直接丢（宁可比页面少显示一个，也不把 junk 发给模组）。
+pub fn parse_bands(s: &str) -> Vec<i32> {
+    s.trim()
+        .trim_matches(|c| c == '[' || c == ']')
+        .split([':', ',', ' '])
+        .filter_map(|p| p.trim().parse::<i32>().ok())
+        .filter(|b| *b > 0)
+        .collect()
+}
+
+/// 锁频段三要素（tech / bands / unlock）+ 同一套入参校验。
+///
+/// `POST /api/lock/band` 与定时任务 `lock.band` 共用：两边口径必须一致，
+/// 否则会出现「页面锁得上、任务锁不上」这类只在一半入口生效的 Bug。
+pub fn band_lock_params(
+    params: &HashMap<String, String>,
+) -> crate::error::Result<(String, Vec<i32>, bool)> {
+    let tech = params
+        .get("tech")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let unlock = crate::http::request::bool_param(params, "unlock", false);
+    let bands = parse_bands(params.get("bands").map(|s| s.as_str()).unwrap_or(""));
+    if !unlock && bands.is_empty() {
+        return Err(crate::error::msg(
+            "要么给几个频段（bands），要么显式 unlock=true",
+        ));
+    }
+    Ok((tech, bands, unlock))
+}
+
+/// IMEI 改写 / 恢复的统一收尾：落备份 → 回状态 → 回包。
+///
+/// `/api/imei/set` 与 `/api/imei/restore` 在「成功之后该做什么」上必须一致：
+/// 备份不落盘，下一次恢复就找不回原值；状态不带 `warning`，用户就不知道
+/// 广和通 MTK 平台要重启模组才生效。收尾只有一处，两条入口就不会分叉。
+pub fn imei_done(
+    req: tiny_http::Request,
+    state: &AppState,
+    modem: &Modem,
+    outcome: crate::error::Result<(String, Option<String>, crate::runtime::store::ImeiBackup)>,
+) -> crate::error::Result<()> {
+    match outcome {
+        Ok((_, warning, bak)) => {
+            // 改写成功才落备份：失败时台账保持原样（可能还是空）
+            state.imei.put(modem.id, bak.clone());
+            let status = modem.imei_status(Some(&bak), warning.as_deref());
+            crate::http::response::ok(req, serde_json::to_value(status)?)
+        }
+        Err(e) => crate::http::response::fail(req, -1, &e.to_string()),
+    }
+}
+
 /// 「本平台不支持按 VID:PID 绑定命令口」的说明文案（Windows 用）。
 pub fn atport_bind_supported_msg() -> &'static str {
     "本平台不支持按 VID:PID 绑定命令口（Windows 请在「AT 指令」页的串口下拉里指定）"

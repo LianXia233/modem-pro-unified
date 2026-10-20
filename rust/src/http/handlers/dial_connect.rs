@@ -16,18 +16,26 @@ use crate::http::{request, response, AppState};
 use super::modem_by_query;
 use crate::modem::model::{DialRequest, DialState};
 
+/// 从请求参数构造 `DialRequest`（`cid/apn/pdp_type/reconnect/force`，缺省值同契约）。
+///
+/// 同步 `/api/dial/connect` 与异步任务 `dial.connect` 共用——两处口径必须一致，
+/// 否则同一份表单走两条路径会得到不同行为（比如某处默认值改了另一处没改）。
+pub(crate) fn dial_request_from_params(params: &HashMap<String, String>) -> DialRequest {
+    DialRequest {
+        cid: request::i64_param(params, "cid", 0) as i32,
+        apn: params.get("apn").cloned().unwrap_or_default(),
+        pdp_type: params.get("pdp_type").cloned().unwrap_or_default(),
+        reconnect: request::bool_param(params, "reconnect", false),
+        force: request::bool_param(params, "force", false),
+    }
+}
+
 pub fn handle(mut req: Request, state: &AppState, query: &HashMap<String, String>) -> Result<()> {
     let params = request::merge_form(query, &request::read_body(&mut req));
     let Some(modem) = modem_by_query(state, &params) else {
         return response::fail(req, -1, "modem not found");
     };
-    let dial_req = DialRequest {
-        cid: request::i64_param(&params, "cid", 0) as i32,
-        apn: params.get("apn").cloned().unwrap_or_default(),
-        pdp_type: params.get("pdp_type").cloned().unwrap_or_default(),
-        reconnect: request::bool_param(&params, "reconnect", false),
-        force: request::bool_param(&params, "force", false),
-    };
+    let dial_req = dial_request_from_params(&params);
     match modem.dial(&dial_req, state.dial_enabled(), state.cfg.dial.activate_ims) {
         Ok(st) => {
             push_dial(state, &st);

@@ -37,6 +37,8 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use crate::modem::model::fmt_bps;
+
 /// 采样间隔：**固定 1000ms**（用户硬性要求）。
 pub const SAMPLE_MS: u64 = 1000;
 
@@ -363,21 +365,6 @@ pub fn spawn(stat: Arc<IfStat>, pick: impl Fn() -> Option<String> + Send + 'stat
     });
 }
 
-/// 速率可读文本（`12.34 Mbps`）。
-///
-/// 单位换算口径（与前端的 `fmt.bpsRate` 保持一致）：
-/// `< 1000` → `bps`，`< 1e6` → `Kbps`，其余 → `Mbps`。
-pub fn fmt_bps(bps: u64) -> String {
-    let v = bps as f64;
-    if v >= 1_000_000.0 {
-        format!("{:.2} Mbps", v / 1_000_000.0)
-    } else if v >= 1_000.0 {
-        format!("{:.1} Kbps", v / 1_000.0)
-    } else {
-        format!("{bps} bps")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,14 +448,6 @@ mod tests {
         let v = st.view();
         assert_eq!(v.history.len(), HISTORY_POINTS);
         assert_eq!(v.history.last().unwrap().up_bps, 4_000);
-    }
-
-    #[test]
-    fn fmt_bps_units() {
-        assert_eq!(fmt_bps(0), "0 bps");
-        assert_eq!(fmt_bps(999), "999 bps");
-        assert_eq!(fmt_bps(1_500), "1.5 Kbps");
-        assert_eq!(fmt_bps(2_500_000), "2.50 Mbps");
     }
 
     #[test]

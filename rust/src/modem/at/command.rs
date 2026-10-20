@@ -8,6 +8,18 @@ use super::parser::has_terminator;
 use super::port::AtPort;
 
 impl AtPort {
+    /// 写字节并 flush（两个写入口共用，错误信息统一带串口路径）。
+    ///
+    /// flush 失败刻意忽略：`serialport` 的 flush 在部分后端是 no-op，
+    /// 且写已成功；真正该报的错由 `write_all` 负责。
+    fn write_bytes(&mut self, data: &[u8]) -> Result<()> {
+        self.inner
+            .write_all(data)
+            .map_err(|e| msg(format!("写串口 {} 失败: {e}", self.path)))?;
+        let _ = self.inner.flush();
+        Ok(())
+    }
+
     /// 发一条 AT 命令（自动补 \r），读回应答；遇到终结符或超时返回。
     pub fn command(&mut self, cmd: &str, timeout: Duration) -> Result<String> {
         self.command_cancellable(cmd, timeout, &|| false)
@@ -36,10 +48,7 @@ impl AtPort {
         let mut out = String::with_capacity(cmd.len() + 2);
         out.push_str(cmd);
         out.push('\r');
-        self.inner
-            .write_all(out.as_bytes())
-            .map_err(|e| msg(format!("写串口 {} 失败: {e}", self.path)))?;
-        let _ = self.inner.flush();
+        self.write_bytes(out.as_bytes())?;
         // 写完才记时刻：从「写完」算间隔，模组收到的两条命令间隔才真是 gap
         self.pacing.mark_sent();
         self.read_until_terminator(timeout, cancel)
@@ -50,11 +59,7 @@ impl AtPort {
     /// `AT+CMGS` 这类指令要分两步：先发命令等 `>` 提示符，再发正文 + Ctrl-Z，
     /// 中间不能插入别的东西，所以调用方得自己控制换行符。
     pub fn write_raw(&mut self, data: &str) -> Result<()> {
-        self.inner
-            .write_all(data.as_bytes())
-            .map_err(|e| msg(format!("写串口 {} 失败: {e}", self.path)))?;
-        let _ = self.inner.flush();
-        Ok(())
+        self.write_bytes(data.as_bytes())
     }
 
     /// 读到出现 `marker` 为止（等 `>` 这类提示符用），超时返回已收到的内容。

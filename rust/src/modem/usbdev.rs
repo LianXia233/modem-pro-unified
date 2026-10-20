@@ -11,6 +11,7 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 
+use super::sysfs;
 use super::vendor::Vendor;
 
 /// sysfs 里 USB 设备根目录（Linux/OpenWrt）。
@@ -358,7 +359,7 @@ pub fn list_modem_usb_devices() -> Vec<ModemUsbDevice> {
     // 串口 → USB 设备目录名（如 1-1），用于把 /dev/ttyUSB3 归到设备下
     let mut tty_by_dev: HashMap<String, Vec<String>> = HashMap::new();
     for port in super::ports_list() {
-        if let Some(dir) = usb_device_dir(&port) {
+        if let Some(dir) = sysfs::tty_usb_device_dir(&port) {
             if let Some(base) = dir.file_name().map(|s| s.to_string_lossy().to_string()) {
                 tty_by_dev.entry(base).or_default().push(port);
             }
@@ -377,8 +378,8 @@ pub fn list_modem_usb_devices() -> Vec<ModemUsbDevice> {
         let dir = Path::new(USB_DEVICES_ROOT).join(&name);
         // ⚠️ 判据是「能不能读到 idVendor/idProduct」，**不要**先用 is_dir() 过滤：
         // /sys/bus/usb/devices 下的条目全是符号链接，read_dir 的 is_dir() 对它们返回 false。
-        let vid = read_sysfs_id(&dir.join("idVendor"));
-        let pid = read_sysfs_id(&dir.join("idProduct"));
+        let vid = sysfs::read_hex_id(&dir.join("idVendor"));
+        let pid = sysfs::read_hex_id(&dir.join("idProduct"));
         if vid.is_empty() || pid.is_empty() {
             continue;
         }
@@ -386,8 +387,8 @@ pub fn list_modem_usb_devices() -> Vec<ModemUsbDevice> {
             vid: vid.clone(),
             pid: pid.clone(),
             bus_path: name.clone(),
-            product: read_sysfs_line(&dir.join("product")),
-            serial: read_sysfs_line(&dir.join("serial")),
+            product: sysfs::read_line(&dir.join("product")),
+            serial: sysfs::read_line(&dir.join("serial")),
             ttys: tty_by_dev.get(&name).cloned().unwrap_or_default(),
             ..ModemUsbDevice::default()
         };
@@ -399,13 +400,13 @@ pub fn list_modem_usb_devices() -> Vec<ModemUsbDevice> {
                     continue;
                 }
                 let idir = dir.join(&iname);
-                if !is_dir_or_symlink(&idir) {
+                if !sysfs::is_dir_or_symlink(&idir) {
                     continue;
                 }
-                if let Some(code) = usb_interface_code(&idir) {
+                if let Some(code) = sysfs::interface_code(&idir) {
                     dev.classes.push(code);
                 }
-                if let Some(drv) = interface_driver(&idir) {
+                if let Some(drv) = sysfs::interface_driver(&idir) {
                     drivers.push(drv);
                 }
             }
@@ -454,9 +455,9 @@ pub fn list_modem_usb_devices() -> Vec<ModemUsbDevice> {
 /// 只靠 AT 应答判断，不影响功能。
 #[cfg(unix)]
 pub fn identity_for_tty(tty: &str) -> Option<crate::modem::detect::UsbIdentity> {
-    let dir = usb_device_dir(tty)?;
-    let vid = read_sysfs_id(&dir.join("idVendor"));
-    let pid = read_sysfs_id(&dir.join("idProduct"));
+    let dir = sysfs::tty_usb_device_dir(tty)?;
+    let vid = sysfs::read_hex_id(&dir.join("idVendor"));
+    let pid = sysfs::read_hex_id(&dir.join("idProduct"));
     if vid.is_empty() || pid.is_empty() {
         return None;
     }
@@ -478,7 +479,7 @@ pub fn identity_for_tty(tty: &str) -> Option<crate::modem::detect::UsbIdentity> 
     Some(crate::modem::detect::UsbIdentity {
         vid,
         pid,
-        product: read_sysfs_line(&dir.join("product")),
+        product: sysfs::read_line(&dir.join("product")),
         bus_path: dir
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
@@ -509,8 +510,8 @@ pub fn option_bind_candidates() -> Vec<ModemUsbDevice> {
     let ports = super::ports_list();
     let mut tty_owner: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for p in &ports {
-        if let Some(base) =
-            usb_device_dir(p).and_then(|d| d.file_name().map(|s| s.to_string_lossy().to_string()))
+        if let Some(base) = sysfs::tty_usb_device_dir(p)
+            .and_then(|d| d.file_name().map(|s| s.to_string_lossy().to_string()))
         {
             tty_owner.insert(base, p.clone());
         }
@@ -522,8 +523,8 @@ pub fn option_bind_candidates() -> Vec<ModemUsbDevice> {
             continue;
         }
         let dir = Path::new(USB_DEVICES_ROOT).join(&name);
-        let vid = read_sysfs_id(&dir.join("idVendor"));
-        let pid = read_sysfs_id(&dir.join("idProduct"));
+        let vid = sysfs::read_hex_id(&dir.join("idVendor"));
+        let pid = sysfs::read_hex_id(&dir.join("idProduct"));
         if vid.is_empty() || pid.is_empty() {
             continue;
         }
@@ -541,8 +542,8 @@ pub fn option_bind_candidates() -> Vec<ModemUsbDevice> {
             vid,
             pid,
             bus_path: name.clone(),
-            product: read_sysfs_line(&dir.join("product")),
-            serial: read_sysfs_line(&dir.join("serial")),
+            product: sysfs::read_line(&dir.join("product")),
+            serial: sysfs::read_line(&dir.join("serial")),
             known: true,
             family: rule.model.clone(),
             vendor_cn: "端口规则登记（需补 option 驱动）".to_string(),
@@ -667,99 +668,7 @@ fn modprobe(module: &str) -> Result<(), String> {
     }
 }
 
-// ---------- sysfs 小工具 ----------
-
-#[cfg(unix)]
-fn read_sysfs_line(path: &std::path::Path) -> String {
-    match std::fs::read_to_string(path) {
-        Ok(s) => s.lines().next().unwrap_or("").trim().to_string(),
-        Err(_) => String::new(),
-    }
-}
-
-#[cfg(unix)]
-fn read_sysfs_hex(path: &std::path::Path) -> String {
-    let s = read_sysfs_line(path).to_lowercase();
-    if s.is_empty() || s.len() > 2 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return String::new();
-    }
-    format!("{s:0>2}")
-}
-
-#[cfg(unix)]
-fn read_sysfs_id(path: &std::path::Path) -> String {
-    let s = read_sysfs_line(path).to_lowercase();
-    if s.len() != 4 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return String::new();
-    }
-    s
-}
-
-/// 目录（或指向目录的符号链接）就算 true（sysfs 里两者混着来）。
-#[cfg(unix)]
-fn is_dir_or_symlink(path: &std::path::Path) -> bool {
-    std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
-}
-
-/// 读一个接口目录的类码，拼成 `02/06/00`（读不到返回 None）。
-#[cfg(unix)]
-fn usb_interface_code(dir: &std::path::Path) -> Option<String> {
-    let mut class = read_sysfs_hex(&dir.join("bInterfaceClass"));
-    let mut sub = read_sysfs_hex(&dir.join("bInterfaceSubClass"));
-    let mut proto = read_sysfs_hex(&dir.join("bInterfaceProtocol"));
-    if class.is_empty() {
-        class = read_sysfs_hex(&dir.join("bDeviceClass"));
-        sub = read_sysfs_hex(&dir.join("bDeviceSubClass"));
-        proto = read_sysfs_hex(&dir.join("bDeviceProtocol"));
-    }
-    if class.is_empty() {
-        return None;
-    }
-    Some(format!("{class}/{sub}/{proto}"))
-}
-
-/// 接口绑定的驱动名（没绑定返回 None）。
-#[cfg(unix)]
-fn interface_driver(iface_dir: &std::path::Path) -> Option<String> {
-    let real = std::fs::canonicalize(iface_dir.join("driver")).ok()?;
-    real.file_name().map(|s| s.to_string_lossy().to_string())
-}
-
-/// 从一个 sysfs 路径往上找含 idVendor 的目录（= USB 设备目录）。
-#[cfg(unix)]
-fn usb_ancestor_dir(path: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mut real = std::fs::canonicalize(path).ok()?;
-    for _ in 0..8 {
-        if real.join("idVendor").exists() {
-            return Some(real);
-        }
-        let parent = real.parent()?;
-        if parent == real {
-            break;
-        }
-        real = parent.to_path_buf();
-    }
-    None
-}
-
-/// 串口 → USB 设备目录（往上逐层找到含 idVendor 的那层）。
-#[cfg(unix)]
-fn usb_device_dir(port: &str) -> Option<std::path::PathBuf> {
-    let name = std::path::Path::new(port.trim())
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
-    if name.is_empty() || name == "." {
-        return None;
-    }
-    let link = std::path::Path::new("/sys/class/tty")
-        .join(&name)
-        .join("device");
-    usb_ancestor_dir(&link)
-}
-
 /// 驱动名里有没有 usb-serial 系（option / usbserial / qcserial / cdc_acm）。
-#[cfg(unix)]
 fn has_serial_driver_name(drivers: &[String]) -> bool {
     drivers
         .iter()

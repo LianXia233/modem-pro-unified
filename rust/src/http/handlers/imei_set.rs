@@ -26,13 +26,5 @@ pub fn handle(mut req: Request, state: &AppState, query: &HashMap<String, String
     };
 
     let backup = state.imei.get(modem.id);
-    match modem.set_imei(&imei, backup) {
-        Ok((_, warning, bak)) => {
-            // 改写成功才落备份：失败时台账保持原样（可能还是空）
-            state.imei.put(modem.id, bak.clone());
-            let status = modem.imei_status(Some(&bak), warning.as_deref());
-            response::ok(req, serde_json::to_value(status)?)
-        }
-        Err(e) => response::fail(req, -1, &e.to_string()),
-    }
+    super::imei_done(req, state, &modem, modem.set_imei(&imei, backup))
 }

@@ -8,6 +8,7 @@
 
 use serde::Serialize;
 
+use super::sysfs;
 use super::vendor::Vendor;
 
 /// 已知的 5G 模组 PCIe 驱动：绑上这些驱动的设备**就是**模组。
@@ -125,10 +126,10 @@ pub fn list_pci_modem_devices() -> Vec<PciDevice> {
             continue;
         }
         let dir = root.join(&name);
-        let vid = normalize_pci_id(&read_sysfs_line(&dir.join("vendor")));
-        let pid = normalize_pci_id(&read_sysfs_line(&dir.join("device")));
+        let vid = normalize_pci_id(&sysfs::read_line(&dir.join("vendor")));
+        let pid = normalize_pci_id(&sysfs::read_line(&dir.join("device")));
         let driver = pci_driver_of(&dir);
-        let cls = normalize_pci_id(&read_sysfs_line(&dir.join("class")));
+        let cls = normalize_pci_id(&sysfs::read_line(&dir.join("class")));
         if !pcie_looks_like_modem(&driver, &vid, &cls) {
             continue;
         }
@@ -192,10 +193,10 @@ pub fn reset_pci_device(bdf: &str) -> Result<(), String> {
     if !dev_dir.exists() {
         return Err(format!("没有这块 PCIe 设备（{bdf}）"));
     }
-    write_sysfs(&dev_dir.join("remove"), "1").map_err(|e| format!("摘除 {bdf} 失败：{e}"))?;
+    sysfs::write(&dev_dir.join("remove"), "1").map_err(|e| format!("摘除 {bdf} 失败：{e}"))?;
     log::info!("PCIe 设备 {bdf} 已摘除，等待后重新扫描");
     std::thread::sleep(std::time::Duration::from_secs(2));
-    write_sysfs(std::path::Path::new("/sys/bus/pci/rescan"), "1")
+    sysfs::write(std::path::Path::new("/sys/bus/pci/rescan"), "1")
         .map_err(|e| format!("重新扫描 PCIe 总线失败（设备可能没回来，必要时重启路由器）：{e}"))?;
     log::info!("PCIe 总线重新扫描完成（{bdf}）");
     Ok(())
@@ -220,7 +221,7 @@ pub fn bind_pci_driver(bdf: &str, driver: &str) -> Result<(), String> {
     if !bind.exists() {
         return Err(format!("驱动 {driver} 没装（找不到 {}）", bind.display()));
     }
-    write_sysfs(&bind, bdf).map_err(|e| format!("绑定 {bdf} 到 {driver} 失败：{e}"))?;
+    sysfs::write(&bind, bdf).map_err(|e| format!("绑定 {bdf} 到 {driver} 失败：{e}"))?;
     log::info!("PCIe 驱动已绑定：{bdf} → {driver}");
     Ok(())
 }
@@ -397,23 +398,6 @@ fn is_qmap_mux(name: &str) -> bool {
         Some(i) if i > 0 && i < n.len() - 1 => n[i + 1..].bytes().all(|b| b.is_ascii_digit()),
         _ => false,
     }
-}
-
-// ---------- sysfs 枚举（unix） ----------
-
-#[cfg(unix)]
-fn read_sysfs_line(path: &std::path::Path) -> String {
-    match std::fs::read_to_string(path) {
-        Ok(s) => s.lines().next().unwrap_or("").trim().to_string(),
-        Err(_) => String::new(),
-    }
-}
-
-#[cfg(unix)]
-fn write_sysfs(path: &std::path::Path, val: &str) -> Result<(), std::io::Error> {
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new().write(true).open(path)?;
-    f.write_all(val.as_bytes())
 }
 
 /// `/sys/class/net` 里有 `device` 软链（真物理网卡）的：名字 → 解析后的路径。

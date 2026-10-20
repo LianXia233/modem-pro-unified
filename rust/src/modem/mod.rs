@@ -12,6 +12,7 @@ pub mod model;
 pub mod pcidev;
 pub mod ports;
 pub mod quirk;
+pub mod sysfs;
 pub mod usbdev;
 pub mod variant;
 pub mod vendor;

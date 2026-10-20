@@ -20,12 +20,5 @@ pub fn handle(mut req: Request, state: &AppState, query: &HashMap<String, String
     };
 
     let backup = state.imei.get(modem.id);
-    match modem.restore_imei(backup) {
-        Ok((_, warning, bak)) => {
-            state.imei.put(modem.id, bak.clone());
-            let status = modem.imei_status(Some(&bak), warning.as_deref());
-            response::ok(req, serde_json::to_value(status)?)
-        }
-        Err(e) => response::fail(req, -1, &e.to_string()),
-    }
+    super::imei_done(req, state, &modem, modem.restore_imei(backup))
 }

@@ -15,6 +15,21 @@ use super::AppState;
 /// 会话 cookie 名。
 pub const SESSION_COOKIE: &str = "modemd_sess";
 
+/// ubus 会话校验 + 失败放行（`sid` 来自 Cookie 或 `?luci_sid=`）。
+///
+/// `ctx` 只进日志（如「本次请求」「本次 WebSocket 连接」），不参与判定。
+/// 放行语义必须与 WS 侧逐字一致——两处漂移会变成「HTTP 进不去、WS 进得去」
+/// 这类只影响半边的认证缺口，且极难在测试里发现。
+pub fn session_valid(state: &AppState, sid: &str, ctx: &str) -> bool {
+    match state.ubus.session_valid(sid) {
+        Ok(valid) => valid,
+        Err(e) => {
+            log::warn!("ubus 会话校验不可用，放行{ctx}: {e}");
+            true
+        }
+    }
+}
+
 /// 该请求是否通过闸门。
 pub fn is_authorized(state: &AppState, req: &Request) -> bool {
     if !state.cfg.require_luci_login() {
@@ -29,13 +44,7 @@ pub fn is_authorized(state: &AppState, req: &Request) -> bool {
     }
     match cookie(req, SESSION_COOKIE) {
         None => false,
-        Some(sid) => match state.ubus.session_valid(&sid) {
-            Ok(valid) => valid,
-            Err(e) => {
-                log::warn!("ubus 会话校验不可用，放行本次请求: {e}");
-                true
-            }
-        },
+        Some(sid) => session_valid(state, &sid, "本次请求"),
     }
 }
 

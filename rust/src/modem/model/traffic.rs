@@ -207,7 +207,10 @@ impl Modem {
     }
 }
 
-/// 速率可读文本（`12.34 Mbps`）。
+/// 速率的人读文案（bps → `2.50 Mbps`）。
+///
+/// `runtime/ifstat.rs`（主机侧网卡采样）与这里（模组侧计数器）展示的是
+/// 同一类数据，文案必须一致 —— 所以全仓只保留这一份，ifstat 直接复用。
 pub fn fmt_bps(bps: u64) -> String {
     let v = bps as f64;
     if v >= 1_000_000.0 {
@@ -287,7 +290,17 @@ fn numbers_in(line: &str) -> Vec<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{candidates, numbers_in, parse_gtstatis, parse_qgdcnt, Vendor, KIND_COUNTER};
+    use super::{
+        candidates, fmt_bps, numbers_in, parse_gtstatis, parse_qgdcnt, Vendor, KIND_COUNTER,
+    };
+
+    #[test]
+    fn fmt_bps_scales_units() {
+        assert_eq!(fmt_bps(0), "0 bps");
+        assert_eq!(fmt_bps(999), "999 bps");
+        assert_eq!(fmt_bps(1_500), "1.5 Kbps");
+        assert_eq!(fmt_bps(2_500_000), "2.50 Mbps");
+    }
 
     #[test]
     fn qgdcnt_with_and_without_cid() {

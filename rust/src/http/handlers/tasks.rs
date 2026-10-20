@@ -236,15 +236,10 @@ fn handle_post(
         }
         "lock.band" => {
             let m = modem.clone();
-            let tech = params
-                .get("tech")
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default();
-            let unlock = request::bool_param(&params, "unlock", false);
-            let bands = parse_bands(params.get("bands").map(String::as_str).unwrap_or(""));
-            if !unlock && bands.is_empty() {
-                return response::fail(req, -1, "要么给几个频段（bands），要么显式 unlock=true");
-            }
+            let (tech, bands, unlock) = match super::band_lock_params(&params) {
+                Ok(v) => v,
+                Err(e) => return response::fail(req, -1, &e.to_string()),
+            };
             tasks.submit(spec, move |t| {
                 t.progress("正在写入频段锁定（会重启射频）");
                 let v = m.set_band_lock(&tech, &bands, unlock)?;
@@ -281,13 +276,7 @@ fn handle_post(
         "dial.connect" => {
             let m = modem.clone();
             let st = state.clone();
-            let dial_req = crate::modem::model::DialRequest {
-                cid: request::i64_param(&params, "cid", 0) as i32,
-                apn: params.get("apn").cloned().unwrap_or_default(),
-                pdp_type: params.get("pdp_type").cloned().unwrap_or_default(),
-                reconnect: request::bool_param(&params, "reconnect", false),
-                force: request::bool_param(&params, "force", false),
-            };
+            let dial_req = super::dial_connect::dial_request_from_params(&params);
             let enabled = state.dial_enabled();
             let ims = state.cfg.dial.activate_ims;
             tasks.submit(spec, move |t| {
@@ -487,15 +476,6 @@ fn at_command(params: &HashMap<String, String>) -> Result<String> {
     Ok(cmd)
 }
 
-fn parse_bands(s: &str) -> Vec<i32> {
-    s.trim()
-        .trim_matches(|c| c == '[' || c == ']')
-        .split([':', ',', ' '])
-        .filter_map(|p| p.trim().parse::<i32>().ok())
-        .filter(|b| *b > 0)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,13 +489,6 @@ mod tests {
         assert!(at_command(&p).is_err());
         p.insert("cmd".to_string(), " AT+CSQ ".to_string());
         assert_eq!(at_command(&p).unwrap(), "AT+CSQ");
-    }
-
-    #[test]
-    fn bands_accept_json_and_colon() {
-        assert_eq!(parse_bands("[78,3]"), vec![78, 3]);
-        assert_eq!(parse_bands("78:3"), vec![78, 3]);
-        assert!(parse_bands("").is_empty());
     }
 
     #[test]

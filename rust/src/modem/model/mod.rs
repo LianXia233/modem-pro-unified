@@ -37,6 +37,7 @@ mod ussd;
 mod view;
 
 pub use addr::{is_link_local_v6, is_valid_ipv4, looks_v6, normalize_ipv6};
+// 速率人读文案：模组侧计数器与主机侧网卡采样共用一份（见 traffic.rs 的说明）
 pub use airplane::Airplane;
 pub use band::{
     band_label, bandwidth_text, lte_band_from_code, lte_band_from_earfcn, nr_band_from_arfcn,
@@ -85,6 +86,7 @@ pub use sim::{
 };
 pub use siminfo::{ModemStatus, RoamState, Sensor};
 pub use sms::{Sms, SmsPart, SmsStorage};
+pub use traffic::fmt_bps;
 pub use traffic::{TrafficSample, TrafficView, KIND_COUNTER, KIND_NONE, KIND_RATE};
 pub use urc::{kind_stats, urc_actions, KindStat, UrcAction};
 pub use usbnet::UsbNetMode;

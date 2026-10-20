@@ -1067,21 +1067,12 @@ pub struct HostNicStore {
 impl HostNicStore {
     pub fn new(path: String) -> Self {
         let mut inner: HashMap<String, HostNicPlan> = HashMap::new();
-        if !path.trim().is_empty() {
-            match std::fs::read_to_string(&path) {
-                Ok(text) => match serde_json::from_str::<HostNicFile>(&text) {
-                    Ok(f) => {
-                        for (k, v) in f.plans {
-                            let p = normalize_plan(&v);
-                            if !p.iface.trim().is_empty() {
-                                inner.insert(k.trim().to_string(), p);
-                            }
-                        }
-                    }
-                    Err(e) => log::warn!("解析 {path} 失败，按空台账继续: {e}"),
-                },
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => log::warn!("读取 {path} 失败，按空台账继续: {e}"),
+        if let Some(f) = super::store::load_json::<HostNicFile>(&path) {
+            for (k, v) in f.plans {
+                let p = normalize_plan(&v);
+                if !p.iface.trim().is_empty() {
+                    inner.insert(k.trim().to_string(), p);
+                }
             }
         }
         Self {
@@ -1145,14 +1136,7 @@ impl HostNicStore {
             log::warn!("序列化主机网卡台账失败");
             return;
         };
-        let tmp = format!("{}.tmp", self.path);
-        if let Err(e) = std::fs::write(&tmp, text.as_bytes()) {
-            log::warn!("写 {tmp} 失败: {e}");
-            return;
-        }
-        if let Err(e) = std::fs::rename(&tmp, &self.path) {
-            log::warn!("改名 {tmp} → {} 失败: {e}", self.path);
-        }
+        super::store::write_json_atomic(&self.path, &text);
     }
 }
 
