@@ -149,6 +149,11 @@ impl Modem {
     ///
     /// 优先级用 `Data`：它是页面数据完整性的一部分，不属于「冷门」。
     pub fn serving_cell_live(&self) -> Option<CellInfo> {
+        if self.vendor() == Vendor::TDTech {
+            // 鼎桥 MT5700：QENG 全回 ERROR，服务小区在 ^MONSC（手册 §13.9，
+            // 解析按 luci-app-mt5700 实机格式，LTE/NR 布局不同）
+            return parse_monsc(&self.at_cmd_prio(Prio::Data, "AT^MONSC"));
+        }
         if matches!(self.vendor(), Vendor::Simcom) {
             let resp = self.at_cmd_prio(Prio::Data, "AT+CPSI?");
             return resp.lines().find_map(parse_cpsi_cell);
@@ -171,7 +176,12 @@ impl Modem {
     /// 实时扫描服务小区 + 邻小区。
     pub fn scan_cells(&self) -> CellScanResult {
         let mut cells = Vec::new();
-        if matches!(self.vendor(), Vendor::Simcom) {
+        if self.vendor() == Vendor::TDTech {
+            // 鼎桥 MT5700：QENG 全回 ERROR。服务小区 ^MONSC、邻区 ^MONNC
+            // （手册 §13.9/13.10，解析按 luci-app-mt5700 实机格式）。
+            cells.extend(parse_monsc(&self.at_cmd_prio(Prio::Bulk, "AT^MONSC")));
+            cells.extend(parse_monnc_rows(&self.at_cmd_prio(Prio::Bulk, "AT^MONNC")));
+        } else if matches!(self.vendor(), Vendor::Simcom) {
             let resp = self.at_cmd_prio(Prio::Bulk, "AT+CPSI?");
             for line in resp.lines() {
                 if let Some(cell) = parse_cpsi_cell(line) {
@@ -768,6 +778,250 @@ fn band_no_of(label: &str) -> i32 {
 ///   （见 [`super::signal`]）；
 /// - `<rxlev>` 在三种制式下都与 `<rsrp>` 同表（手册明示），不重复取；
 /// - 邻区的 `<mcc>` / `<mnc>` 常为空，由 [`fill_neighbour_plmn`] 用服务小区补齐。
+
+// ====================== 鼎桥 MT5700 系列（^MONSC / ^MONNC / ^CELLSCAN）======================
+//
+// 三条鼎桥私有指令的解析。格式依据（按可信度排序）：
+//   1. luci-app-mt5700 的实机抓样（rpc.js parseMONSC，同一作者同型号）；
+//   2. 官方手册《MT5700M-CN 5G 系列模组 AT 命令手册》V200R001C20 §13.9/13.10/5.35。
+//
+// 与 QENG 解析的关键差异（写错的后果是整行解析失败）：
+//   · `^MONSC` 有**两种实测格式**（NR 与 LTE 的参数布局不同、4G 无 SINR 末位是 RSSI），
+//     还有第三种「旧编码格式」（无前导制式、信号字段要按编码表还原）；
+//   · PCI / TAC / Cell_ID 是**十六进制**，但部分固件按十进制上报 —— PCI 带越界回退
+//     （先 hex，越出 3GPP 上限且 dec 合法才用 dec），ARFCN 直接十进制；
+//   · `^CELLSCAN` 一行 15 个字段，band 是十六进制，测量值 99 = 无效，
+//     LTE 的 SINR 在第 14 列（LTERSINR）、NR 在第 13 列（5GRSINR）。
+
+/// PCI 十六进制解析（带越界回退，移植自 luci-app-mt5700 `parsePciHex`）。
+///
+/// 先按十六进制解析；仅当结果越出该制式上限、而十进制解释落在合法区间时才回退。
+fn td_pci_hex(raw: &str, max_allowed: i32) -> i32 {
+    let t = raw.trim().trim_start_matches("0x").trim_start_matches("0X");
+    if t.is_empty() {
+        return 0;
+    }
+    let hex = i32::from_str_radix(t, 16).unwrap_or(-1);
+    let dec = t.parse::<i32>().unwrap_or(-1);
+    if hex < 0 {
+        return if dec >= 0 { dec } else { 0 };
+    }
+    if dec < 0 {
+        return hex;
+    }
+    if hex > max_allowed && dec <= max_allowed {
+        dec
+    } else {
+        hex
+    }
+}
+
+/// TAC/LAC 解析：**十进制优先、失败回退十六进制**。
+///
+/// 为什么与 PCI 相反：TAC 的固件行为不一致 —— 手册写十六进制，但实机抓样里
+/// `12345` 是十进制（0x12345=74565 会差出一个数量级）。十进制优先对两边都安全：
+/// 合法 TAC 的十进制串（如 12345）按 dec；真正的 hex 串（如 1A2B）dec 失败转 hex。
+fn td_tac_dec_first(raw: &str) -> i32 {
+    let t = raw.trim();
+    if t.is_empty() {
+        return 0;
+    }
+    t.parse::<i32>()
+        .unwrap_or_else(|_| i32::from_str_radix(t, 16).unwrap_or(0))
+}
+
+/// 格式 B（旧编码）的信号还原表（移植自 luci-app-mt5700 的 convert*）。
+fn td_convert_rsrp(raw: i32) -> i32 {
+    if raw == 0 { -140 } else if raw >= 97 { -44 } else { -140 + raw }
+}
+fn td_convert_rsrq(raw: i32) -> i32 {
+    if raw == 0 { -19 } else if raw >= 34 { -3 } else { -19 + raw / 2 }
+}
+fn td_convert_sinr(raw: i32) -> i32 {
+    let v = if raw == 0 { -20 } else if raw >= 251 { 30 } else { -20 + raw / 5 };
+    v.clamp(-20, 30)
+}
+fn td_convert_rssi(raw: i32) -> i32 {
+    if raw == 0 { -120 } else if raw >= 96 { -25 } else { -121 + raw }
+}
+
+/// 解析一行 `^MONSC: …`（服务小区）。
+///
+/// 实测格式（luci-app-mt5700 抓样）：
+/// ```text
+/// NR : ^MONSC: NR,460,00,501234,1,C1A2B3C,80,12345,-64,-10,25
+///      NR,<mcc>,<mnc>,<arfcn>,<flag>,<cid_hex>,<pci_hex>,<tac_hex>,<rsrp>,<rsrq>,<sinr>
+/// LTE: ^MONSC: LTE,460,00,38400,D975244,8,24C8,-85,-10,-54
+///      LTE,<mcc>,<mnc>,<tac_hex>,<cid_hex>,<pci_hex>,<arfcn>,<rsrp>,<rsrq>,<rssi>
+/// 旧  : ^MONSC: <mcc>,<mnc>,<lac>,<cid>,<pci>,<ch>,<rsrp_raw>,<rsrq_raw>,<sinr_raw>,<sysmode>
+/// ```
+pub fn parse_monsc(line: &str) -> Option<CellInfo> {
+    let idx = line.find("^MONSC:")?;
+    let body = line[idx + "^MONSC:".len()..].trim();
+    if body.is_empty() {
+        return None;
+    }
+    let f: Vec<String> = body.split(',').map(|x| x.trim().to_string()).collect();
+    let first_is_num = f.first().map(|x| x.parse::<i32>().is_ok()).unwrap_or(false);
+    let mut cell = CellInfo {
+        serving: true,
+        raw: Some(line.trim().to_string()),
+        ..Default::default()
+    };
+    if !first_is_num {
+        let mode = f[0].trim_matches('"').to_ascii_uppercase();
+        if mode == "NONE" {
+            return None; // 无服务
+        }
+        cell.tech = normalize_tech(&mode);
+        if mode == "LTE" {
+            // LTE,<mcc>,<mnc>,<tac_hex>,<cid_hex>,<pci_hex>,<arfcn>,<rsrp>,<rsrq>,<rssi>
+            cell.mcc = f.get(1).cloned().unwrap_or_default();
+            cell.mnc = f.get(2).cloned().unwrap_or_default();
+            cell.tac = td_tac_dec_first(f.get(3).map(|x| x.as_str()).unwrap_or(""));
+            cell.cell_id = f.get(4).map(|x| x.trim().to_ascii_uppercase()).unwrap_or_default();
+            cell.pcid = td_pci_hex(f.get(5).map(|x| x.as_str()).unwrap_or(""), 503);
+            cell.earfcn = f.get(6).and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+            cell.rsrp = f.get(7).and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+            cell.rsrq = f.get(8).and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+            cell.rssi = f.get(9).and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+        } else {
+            // NR,<mcc>,<mnc>,<arfcn>,<flag>,<cid_hex>,<pci_hex>,<tac_hex>,<rsrp>,<rsrq>,<sinr>
+            cell.mcc = f.get(1).cloned().unwrap_or_default();
+            cell.mnc = f.get(2).cloned().unwrap_or_default();
+            cell.earfcn = f.get(3).and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+            cell.cell_id = f.get(5).map(|x| x.trim().to_ascii_uppercase()).unwrap_or_default();
+            cell.pcid = td_pci_hex(f.get(6).map(|x| x.as_str()).unwrap_or(""), 1007);
+            cell.tac = td_tac_dec_first(f.get(7).map(|x| x.as_str()).unwrap_or(""));
+            cell.rsrp = f.get(8).and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+            cell.rsrq = f.get(9).and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+            cell.sinr = f.get(10).and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+        }
+    } else {
+        // 旧编码格式（无前导制式）：信号字段要按编码表还原，制式在末位
+        if f.len() < 10 {
+            return None;
+        }
+        cell.mcc = f[0].clone();
+        cell.mnc = f[1].clone();
+        cell.tac = td_tac_dec_first(&f[2]);
+        cell.cell_id = f[3].trim().to_ascii_uppercase();
+        cell.pcid = f[4].trim().parse().unwrap_or(0);
+        cell.earfcn = f[5].trim().parse().unwrap_or(0);
+        cell.rsrp = td_convert_rsrp(f[6].trim().parse().unwrap_or(0));
+        cell.rsrq = td_convert_rsrq(f[7].trim().parse().unwrap_or(0));
+        cell.sinr = td_convert_sinr(f[8].trim().parse().unwrap_or(0));
+        let mode = f[9].trim().trim_matches('"').to_ascii_uppercase();
+        cell.tech = normalize_tech(&mode);
+    }
+    if cell.tech.is_empty() || !valid_plmn(&cell.mcc, &cell.mnc) {
+        return None;
+    }
+    let op = operator_name(&cell.mcc, &cell.mnc);
+    cell.operator = (!op.is_empty()).then_some(op);
+    if cell.band == 0 {
+        cell.band = band_from_earfcn(&cell.tech, cell.earfcn);
+    }
+    Some(cell)
+}
+
+/// 解析多行 `^MONNC: …`（邻区，格式与服务小区一致，手册 §13.10）。
+///
+/// 只取 LTE / NR 行 —— MT5700 是 5G 模组，GSM/WCDMA 邻区的参数布局（PSC/BSIC）
+/// 在 [`CellInfo`] 里没有对应字段，硬塞会填错。
+pub fn parse_monnc_rows(resp: &str) -> Vec<CellInfo> {
+    let mut out = Vec::new();
+    for line in resp.lines() {
+        let line = line.trim();
+        if !line.contains("^MONNC:") {
+            continue;
+        }
+        // 行前缀是 ^MONNC:，复用服务小区解析前先换成 ^MONSC:
+        let line = line.replacen("^MONNC:", "^MONSC:", 1);
+        let Some(mut c) = parse_monsc(&line) else { continue };
+        if c.tech != "LTE" && c.tech != "NR" {
+            continue;
+        }
+        c.serving = false;
+        c.raw = Some(line.to_string());
+        out.push(c);
+    }
+    out
+}
+
+/// 解析多行 `^CELLSCAN: …`（主动扫频，手册 §5.35；解析移植自 luci-app-mt5700
+/// `parseScanLine`，其字段序是实机验证的）。
+///
+/// 15 字段：`<rat>,<plmn>,<freq>,[pci],<band>,<lac>,<cid>,[rxlev],[bsic],[psc],
+/// [5GSCS],[5GRSRP],[5GRSRQ],[5GRSINR],[LTERSINR]`；band 十六进制；
+/// 测量值 99 = 无效；LTE 的 SINR 在第 14 列（×0.125），NR 在第 13 列（×0.5）。
+pub fn parse_cellscan_rows(resp: &str) -> Vec<CellInfo> {
+    const RAT_NAMES: [&str; 4] = ["GSM", "WCDMA", "LTE", "NR"];
+    const INVALID: i32 = 99;
+    let mut out = Vec::new();
+    for line in resp.lines() {
+        let Some(idx) = line.find("^CELLSCAN:") else { continue };
+        let body = line[idx + "^CELLSCAN:".len()..].trim();
+        if body.is_empty() || body.eq_ignore_ascii_case("STARTED") || body.eq_ignore_ascii_case("OK")
+            || body.eq_ignore_ascii_case("RUNNING")
+        {
+            continue;
+        }
+        let mut f: Vec<String> = body.split(',').map(|x| x.trim().to_string()).collect();
+        while f.len() < 15 {
+            f.push(String::new());
+        }
+        let Some(rat) = f[0].trim().parse::<usize>().ok().filter(|r| *r < 4) else {
+            continue;
+        };
+        let tech = RAT_NAMES[rat].to_string();
+        if tech != "LTE" && tech != "NR" {
+            continue; // GSM/WCDMA 行不进 CellInfo（同 parse_monnc_rows 的口径）
+        }
+        let dec = |v: &str| v.trim().parse::<i32>().ok();
+        // 测量值：99 视为无效；scale=1 原值，否则乘系数取整
+        let measure = |v: &str, scale: f64| -> i32 {
+            let n = dec(v).unwrap_or(INVALID);
+            if n == INVALID {
+                return 0;
+            }
+            (n as f64 * scale) as i32
+        };
+        let plmn = f[1].trim_matches('"').to_string();
+        // 频段：十六进制，1~512
+        let band = i32::from_str_radix(f[4].trim(), 16)
+            .ok()
+            .filter(|b| *b > 0 && *b <= 512)
+            .unwrap_or(0);
+        let mut c = CellInfo {
+            tech: tech.clone(),
+            serving: false,
+            raw: Some(line.trim().to_string()),
+            ..Default::default()
+        };
+        // PLMN 前 3 位 MCC、余下 MNC
+        if plmn.len() >= 5 {
+            c.mcc = plmn[..3].to_string();
+            c.mnc = plmn[3..].to_string();
+        }
+        c.earfcn = dec(&f[2]).unwrap_or(0);
+        c.pcid = dec(&f[3]).unwrap_or(0);
+        c.band = band;
+        c.cell_id = f[6].trim().to_ascii_uppercase();
+        c.rssi = dec(&f[7]).unwrap_or(0);
+        c.rsrp = measure(&f[11], 1.0);
+        c.rsrq = measure(&f[12], 0.5);
+        c.sinr = if rat == 2 { measure(&f[14], 0.125) } else { measure(&f[13], 0.5) };
+        let op = operator_name(&c.mcc, &c.mnc);
+        c.operator = (!op.is_empty()).then_some(op);
+        if !valid_plmn(&c.mcc, &c.mnc) {
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
 pub fn parse_gtccinfo_rows(resp: &str) -> Vec<CellInfo> {
     use super::signal::{
         lte_rsrp_index_dbm, lte_rsrq_index_db, nr_ss_rsrp_index_dbm, nr_ss_rsrq_index_db,
@@ -928,6 +1182,104 @@ pub fn mark_intra_frequency(serving: &[CellInfo], neighbours: &mut [CellInfo]) {
 
 #[cfg(test)]
 mod tests {
+    use super::{parse_cellscan_rows, parse_monsc, parse_monnc_rows};
+
+    // ---------- 鼎桥 MT5700（^MONSC / ^MONNC / ^CELLSCAN）----------
+
+    #[test]
+    fn monsc_nr_layout_matches_field_test() {
+        // luci-app-mt5700 实机抓样：NR,<mcc>,<mnc>,<arfcn>,<flag>,<cid_hex>,<pci_hex>,<tac_hex>,<rsrp>,<rsrq>,<sinr>
+        let c = parse_monsc("^MONSC: NR,460,00,501234,1,C1A2B3C,80,12345,-64,-10,25").expect("nr");
+        assert_eq!(c.tech, "NR");
+        assert_eq!(c.mcc, "460");
+        assert_eq!(c.mnc, "00");
+        assert_eq!(c.earfcn, 501234);
+        assert_eq!(c.cell_id, "C1A2B3C");
+        assert_eq!(c.pcid, 128, "PCI 十六进制 0x80 → 128");
+        assert_eq!(c.tac, 12345);
+        assert_eq!(c.rsrp, -64);
+        assert_eq!(c.rsrq, -10);
+        assert_eq!(c.sinr, 25);
+        assert!(c.serving);
+    }
+
+    #[test]
+    fn monsc_lte_layout_has_rssi_not_sinr() {
+        // LTE 布局：LTE,<mcc>,<mnc>,<tac_hex>,<cid_hex>,<pci_hex>,<arfcn>,<rsrp>,<rsrq>,<rssi>
+        // 套 NR 布局会全部错位（实测过的坑）
+        let c = parse_monsc("^MONSC: LTE,460,00,24C8,D975244,8,38400,-85,-10,-54").expect("lte");
+        assert_eq!(c.tech, "LTE");
+        assert_eq!(c.tac, 0x24C8);
+        assert_eq!(c.cell_id, "D975244");
+        assert_eq!(c.pcid, 8);
+        assert_eq!(c.earfcn, 38400);
+        assert_eq!(c.rsrp, -85);
+        assert_eq!(c.rsrq, -10);
+        assert_eq!(c.rssi, -54);
+        assert_eq!(c.sinr, 0, "LTE 无 SINR 字段");
+    }
+
+    #[test]
+    fn monsc_pci_hex_falls_back_to_decimal() {
+        // 固件按十进制上报 500 时：hex 解析 0x500=1280 越出 LTE 上限 503 → 回退十进制
+        let c = parse_monsc("^MONSC: LTE,460,00,24C8,D975244,1F4,38400,-85,-10,-54").expect("pci");
+        assert_eq!(c.pcid, 500, "0x1F4=500 恰好合法 → 用 hex");
+        // 真正越界：0x500 → 1280 > 503，dec=500 ≤ 503 → 回退
+        let c = parse_monsc("^MONSC: LTE,460,00,24C8,D975244,500,38400,-85,-10,-54").expect("pci2");
+        assert_eq!(c.pcid, 500);
+    }
+
+    #[test]
+    fn monsc_none_and_garbage() {
+        assert!(parse_monsc("^MONSC: NONE").is_none(), "无服务");
+        assert!(parse_monsc("+CME ERROR: 100").is_none());
+        assert!(parse_monsc("^MONSC: LTE").is_none(), "缺参数");
+    }
+
+    #[test]
+    fn monnc_rows_filter_non_lte_nr() {
+        let resp = "^MONNC: LTE,460,00,24C8,D975244,8,38400,-90,-12,-60\r\n\
+                    ^MONNC: NR,460,00,501234,1,C1A2B3C,80,12345,-70,-8,18\r\n\
+                    ^MONNC: GSM,460,00,3,1234,A1B2,45\r\nOK";
+        let v = parse_monnc_rows(resp);
+        assert_eq!(v.len(), 2, "GSM 行不进（CellInfo 无对应字段）");
+        assert!(v.iter().all(|c| !c.serving));
+        assert_eq!(v[0].tech, "LTE");
+        assert_eq!(v[1].tech, "NR");
+    }
+
+    #[test]
+    fn cellscan_row_is_15_fields() {
+        // 一行 15 字段（手册 §5.35）；LTE 的 SINR 在 f[14]（LTERSINR）
+        let line = "^CELLSCAN: 2,46001,38400,128,29,12AB,34CD,-78,0,0,,-80,-12,-9,-6";
+        let v = parse_cellscan_rows(line);
+        assert_eq!(v.len(), 1);
+        let c = &v[0];
+        assert_eq!(c.tech, "LTE");
+        assert_eq!(c.mcc, "460");
+        assert_eq!(c.mnc, "01");
+        assert_eq!(c.earfcn, 38400);
+        assert_eq!(c.pcid, 128);
+        assert_eq!(c.band, 0x29, "band 十六进制");
+        assert_eq!(c.rsrp, -80);
+        assert_eq!(c.rsrq, -6, "RSRQ ×0.5：-12×0.5=-6");
+        assert_eq!(c.sinr, 0, "LTE 的 SINR 取 f[14]（-6×0.125≈0 取整）");
+    }
+
+    #[test]
+    fn cellscan_skips_state_lines_and_invalid_measures() {
+        let resp = "^CELLSCAN: STARTED\r\n^CELLSCAN: RUNNING\r\n\
+                    ^CELLSCAN: 3,46000,501234,80,29,,1A2B,,-99,0,1,-110,-8,25,\r\nOK";
+        let v = parse_cellscan_rows(resp);
+        assert_eq!(v.len(), 1, "STARTED/RUNNING/OK 行跳过");
+        let c = &v[0];
+        assert_eq!(c.tech, "NR");
+        assert_eq!(c.rsrp, -110);
+        assert_eq!(c.sinr, 12, "NR 的 SINR 取 f[13]（×0.5：25×0.5=12）");
+        assert_eq!(c.rsrq, -4, "-8×0.5=-4");
+    }
+
+
     use super::{
         band_from_earfcn, mark_intra_frequency, operator_name, parse_cell_line, parse_cell_lines,
         parse_cpsi_cell, parse_gtccinfo_rows,

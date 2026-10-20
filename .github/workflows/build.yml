@@ -283,6 +283,13 @@ jobs:
           mkdir -p output
           find bin/packages -type f \( -name "${PKG}-*.apk" -o -name "${PKG}_*.ipk" \) \
             -exec cp -v {} output/ \;
+          # apk-filogic 与 apk-mainline 的包文件名相同（版本号不含架构），两个
+          # artifact 在 Release 步骤 merge-multiple 合并时会**互相覆盖**——实测
+          # v1.0.1 的 Release 只剩 filogic 那份。按矩阵 id 加架构后缀区分。
+          for f in output/${PKG}-*.apk; do
+            [ -e "$f" ] || continue
+            mv -v "$f" "${f%.apk}_${{ matrix.id }}.apk"
+          done
           ls -lh output/
           if [ -z "$(ls -A output 2>/dev/null)" ]; then
             echo "没有产物：bin/packages 里找不到 modem-pro 包"

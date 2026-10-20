@@ -347,7 +347,7 @@ POST /api/at     {"modem_id":0,"cmd":"AT+CGSN"}
 {"code":0,"data":{"modem_id":0,"vendor":"quectel","vendor_name":"移远 Quectel","presets":[{"group":"查询","cmd":"AT+CGSN","desc":"IMEI"},{"group":"设置（谨慎）","cmd":"AT+QNWPREFCFG=\"policy_band\",\"<lte_band>\"","desc":"LTE 频段（策略表）","tpl":true}]},"msg":"ok"}
 ```
 
-`tpl:true` = 带 `<…>` 占位符的模板，选中后必须先替换再发。清单规模：通用 3GPP 28 条；移远 18 / 广和通 18 / 芯讯通 6 / 美格 7 / 鼎桥 10 / 展锐 38（同名覆盖、展锐另抑制通用 `AT+CGCONTRDP`）。广和通 MTK 平台（FM350 / RW350 系列）额外带三条：`AT+GTSENRDTEMP=0`（各路温度，量纲 0.001 ℃）、`AT+EMBIND?` / `AT+EMBIND=?`（USB 数据通道绑定体检；读形式在该平台回 `phone failure`，勿用 `AT+GTEMP?`）。
+`tpl:true` = 带 `<…>` 占位符的模板，选中后必须先替换再发。清单规模：通用 3GPP 28 条；移远 18 / 广和通 18 / 芯讯通 6 / 美格 7 / 鼎桥 22（MT5700 系列，指令出自官方手册 V200R001C20，含扫频/CA/发射功率/拨号状态等） / 展锐 38（同名覆盖、展锐另抑制通用 `AT+CGCONTRDP`）。广和通 MTK 平台（FM350 / RW350 系列）额外带三条：`AT+GTSENRDTEMP=0`（各路温度，量纲 0.001 ℃）、`AT+EMBIND?` / `AT+EMBIND=?`（USB 数据通道绑定体检；读形式在该平台回 `phone failure`，勿用 `AT+GTEMP?`）。
 
 ### GET /api/at/sched[?modem_id=N]
 串口访问调度的实时状态（排障用）。口径见本文「串口访问调度」一节。

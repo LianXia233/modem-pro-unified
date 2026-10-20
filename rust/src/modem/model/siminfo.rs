@@ -213,6 +213,8 @@ impl Modem {
             Vendor::Quectel => parse_qtemp(&resp),
             Vendor::Simcom => parse_cpmutemp(&resp).into_iter().collect(),
             Vendor::Fibocom => parse_gtsenrdtemp(&resp),
+            // 鼎桥 MT5700：^CHIPTEMP 一条 12 路传感器（手册 §17.1）
+            Vendor::TDTech => parse_chiptemp(&resp).into_iter().collect(),
             // 有指令但没解析器（或根本不该问）的厂商：宁可空，也不瞎猜
             _ => Vec::new(),
         }
@@ -319,6 +321,36 @@ pub fn parse_qtemp(resp: &str) -> Vec<Sensor> {
 }
 
 /// `+CPMUTEMP: <temp>` → 单个传感器。
+/// `^CHIPTEMP: <sub3G>,<sub6G>,<MIMO>,<TCXO>,<peri1>,<peri2>,<ap1>,<ap2>,
+/// <modem1>,<modem2>,<bbp1>,<bbp2>` → 12 路传感器（MT5700 手册 §17.1）。
+///
+/// 单位 **0.1 ℃**（luci-app-mt5700 实机口径）。`0` 视为未上报跳过 ——
+/// 12 路里没接的那几路固定报 0，混进列表会把「最高温」算错。
+pub fn parse_chiptemp(resp: &str) -> Vec<Sensor> {
+    const NAMES: [&str; 12] = [
+        "sub3G", "sub6G", "MIMO", "TCXO", "peri1", "peri2",
+        "ap1", "ap2", "modem1", "modem2", "bbp1", "bbp2",
+    ];
+    let Some(field) = extract_field(resp, "+CHIPTEMP").or_else(|| extract_field(resp, "^CHIPTEMP")) else {
+        return Vec::new();
+    };
+    let vals = csv(&field);
+    NAMES
+        .iter()
+        .enumerate()
+        .filter_map(|(i, name)| {
+            let tenth = vals.get(i)?.trim().parse::<i32>().ok()?;
+            if tenth == 0 {
+                return None; // 未上报
+            }
+            Some(Sensor {
+                name: (*name).to_string(),
+                celsius: tenth / 10,
+            })
+        })
+        .collect()
+}
+
 pub fn parse_cpmutemp(resp: &str) -> Option<Sensor> {
     let field = extract_field(resp, "+CPMUTEMP")?;
     let celsius = csv(&field).first()?.parse::<i32>().ok()?;
@@ -661,7 +693,8 @@ mod tests {
     }
 
     use super::{
-        gtsen_sensor_name, operator_from_imsi, parse_cbc, parse_cclk, parse_cclk_tz, parse_cnum,
+        gtsen_sensor_name, operator_from_imsi, parse_cbc, parse_cclk, parse_cclk_tz,
+        parse_chiptemp, parse_cnum,
         parse_gtsenrdtemp, parse_iccid, parse_imsi, parse_qtemp, roam_state, round1,
     };
 
@@ -708,6 +741,21 @@ mod tests {
         assert_eq!(parse_cbc("+CBC: 0\r\nOK"), None);
         assert_eq!(parse_cbc("+CBC: 0,0\r\nOK"), None);
         assert_eq!(parse_cbc("ERROR"), None);
+    }
+
+    #[test]
+    fn chiptemp_is_tenth_celsius_and_skips_zeros() {
+        // 12 路（手册 §17.1 顺序），0.1℃；0 = 未上报要跳过
+        let resp = "^CHIPTEMP: 412,0,385,517,0,0,602,0,0,448,0,531\r\nOK";
+        let v = parse_chiptemp(resp);
+        assert_eq!(v.len(), 6, "12 路里 6 路为 0（未上报）");
+        assert_eq!(v[0].name, "sub3G");
+        assert_eq!(v[0].celsius, 41, "412 × 0.1℃ = 41 ℃");
+        assert_eq!(v[1].name, "MIMO", "跳过 0 后索引重排：第 2 个非零是 MIMO");
+        assert_eq!(v[1].celsius, 38);
+        assert!(v.iter().all(|s| s.celsius > 0));
+        // 应答头不带 + 前缀（^ 形态）也能取
+        assert!(parse_chiptemp("ERROR").is_empty());
     }
 
     #[test]

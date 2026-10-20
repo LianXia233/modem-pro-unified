@@ -12,6 +12,7 @@
 //! 界面会照原话显示，不假装扫到了东西。
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use crate::modem::vendor::Vendor;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -147,13 +148,27 @@ impl Modem {
         };
         let (resp, stopped) =
             self.at_cmd_cancel(Prio::Bulk, cmd, wait, &|| flag.load(Ordering::Relaxed));
-        let cells = parse_cnwsearch(&resp);
-        let note = if !cells.is_empty() {
-            String::new()
-        } else if stopped {
-            "已按你的要求停止扫描，没有取到小区结果".to_string()
+        // 鼎桥的 ^CELLSCAN 与芯讯通的 +CNWSEARCH 响应格式完全不同，分开解析
+        let (cells, note) = if self.vendor() == Vendor::TDTech {
+            let cells = crate::modem::model::cells::parse_cellscan_rows(&resp);
+            let note = if !cells.is_empty() {
+                String::new()
+            } else if stopped {
+                "已按你的要求停止扫描，没有取到小区结果".to_string()
+            } else {
+                "本固件没有返回可解析的小区结果（AT^CELLSCAN，支持无卡扫描）".to_string()
+            };
+            (cells, note)
         } else {
-            "本固件没有返回可解析的小区结果（AT+CNWSEARCH）".to_string()
+            let cells = parse_cnwsearch(&resp);
+            let note = if !cells.is_empty() {
+                String::new()
+            } else if stopped {
+                "已按你的要求停止扫描，没有取到小区结果".to_string()
+            } else {
+                "本固件没有返回可解析的小区结果（AT+CNWSEARCH）".to_string()
+            };
+            (cells, note)
         };
         (cells, cmd.to_string(), note)
     }

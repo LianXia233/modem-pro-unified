@@ -4,6 +4,29 @@
 
 ## [1.0.1] - 2026-10-20
 
+### 1.0.0-11：MT5700 系列专项（鼎桥方言全量接入）
+
+以官方手册《MT5700M-CN 5G 系列模组 AT 命令手册》V200R001C20 + 同作者
+[luci-app-mt5700](https://github.com/LianXia233/luci-app-mt5700) 的**实机验证解析**
+为依据，把 MT5700/MT5710 的支持从「只有识别」补到全功能：
+
+- **小区/信号解析（此前完全缺失）**：`^MONSC`（服务小区，NR/LTE 两种布局 +
+  旧编码格式 B + PCI 十六进制带越界回退）、`^MONNC`（邻区，多行）——
+  此前 MT5700 的小区页/信号数据完全解析不出来；
+- **主动扫频**：`AT^CELLSCAN`（手册 §5.35，支持无卡扫描）接入 `/api/netscan`，
+  15 字段行解析（band 十六进制、99=无效、LTE/NR 的 SINR 列不同）；
+- **锁网方言**：`Dialect::Tdtech`（`AT^SYSCFGEX?` 探测）——锁频段
+  （`^LTEFREQLOCK=3,0,<num>,<band>…` / `AT^NRFREQLOCK=…`，写后自动切飞行模式，
+  手册明文语义）、锁状态读、解锁；锁小区因需 `<band>` 参数（UI 只有 earfcn/pci）
+  按「未验证拒绝盲写」口径明确拒绝；
+- **温度**：`^CHIPTEMP?` 12 路传感器（0.1 ℃，未上报的 0 跳过）接入 `/api/modem/status`；
+- **AT 指令面**：`^VERSION` / `^MONSSC` / `^C5GOPTION?` / `^LENDC` / `^CASCELLINFO?` /
+  `^TXPOWER?` / `^NTXPOWER?` / `^MCS?` / `^RRCSTAT` / `^DHCP` / `^DCONNSTAT?` 等 11 条
+  手册指令进预设（全部标注手册章节号）；
+- 识别关键字补 `MT5710`（同族）；
+- 新增 11 个单测（MONSC 双布局 + 格式 B + PCI 回退、CELLSCAN 15 字段、
+  FREQLOCK 读解析、CHIPTEMP）。
+
 ### 1.0.0-10：待办清零 —— CCLK 时区按 3GPP 修正 + 路由判定按地址族
 
 上一轮（1.0.0-9）留下的三件待办，本轮全部用实机做完。

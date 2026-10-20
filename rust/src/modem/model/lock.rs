@@ -128,6 +128,10 @@ pub enum Dialect {
     Qnw,
     Simcom,
     Fibocom,
+    /// 鼎桥 TD Tech（MT5700/MT5710，巴龙平台）：`^LTEFREQLOCK` / `^NRFREQLOCK` /
+    /// `^SYSCFGEX`。语法出自官方手册 V200R001C20 §13.2/13.12/13.13，
+    /// 写后**需切飞行模式才生效**（手册原文），且锁持久化、受 NV 使能控制。
+    Tdtech,
 }
 
 /// 频段锁定的**报文形状**（决定读应答怎么解、写命令怎么拼）。
@@ -140,6 +144,10 @@ enum BandShape {
     /// 位置参数，一条命令写全部技术域：
     /// `AT+GTACT=<rat>,<ctrl…>,<gsm…>,<lte…>,<nr…>`（广和通 MTK）。
     Positional,
+    /// 鼎桥频段锁：`AT^LTEFREQLOCK=3,0,<num>,<band>…`（锁 Band）/
+    /// `AT^NRFREQLOCK=…`（NR），`=?` 读支持范围，`?` 读当前锁。
+    /// 写后必须切飞行模式（CFUN=0/1）才生效 —— 手册 13.12 备注 1。
+    TdFreq,
 }
 
 /// 方言描述（名称 / 显示名 / 说明 / 探测记录）。
@@ -161,6 +169,7 @@ impl Dialect {
             Dialect::Qnw => "qnw",
             Dialect::Simcom => "simcom",
             Dialect::Fibocom => "fibocom",
+            Dialect::Tdtech => "tdtech",
         }
     }
 
@@ -169,6 +178,7 @@ impl Dialect {
             Dialect::Qnw => "高通 QNW（AT+QNWPREFCFG / AT+QNWLOCK）",
             Dialect::Simcom => "芯讯通（AT+CSYSSEL / AT+CNMP）",
             Dialect::Fibocom => "广和通 MTK（AT+GTACT / AT+EMMCHLCK）",
+            Dialect::Tdtech => "鼎桥巴龙（AT^LTEFREQLOCK / AT^NRFREQLOCK / AT^SYSCFGEX）",
         }
     }
 
@@ -177,6 +187,7 @@ impl Dialect {
             Dialect::Qnw => "AT+QNWPREFCFG=\"mode_pref\"",
             Dialect::Simcom => "AT+CSYSSEL=\"lte_band\"",
             Dialect::Fibocom => "AT+GTACT?",
+            Dialect::Tdtech => "AT^SYSCFGEX?",
         }
     }
 
@@ -185,6 +196,7 @@ impl Dialect {
             Dialect::Qnw => "+QNWPREFCFG:",
             Dialect::Simcom => "+CSYSSEL:",
             Dialect::Fibocom => "+GTACT:",
+            Dialect::Tdtech => "^SYSCFGEX:",
         }
     }
 
@@ -193,6 +205,7 @@ impl Dialect {
             Dialect::Qnw => &[Dialect::Qnw, Dialect::Simcom, Dialect::Fibocom],
             Dialect::Simcom => &[Dialect::Simcom, Dialect::Qnw, Dialect::Fibocom],
             Dialect::Fibocom => &[Dialect::Fibocom, Dialect::Qnw, Dialect::Simcom],
+            Dialect::Tdtech => &[Dialect::Tdtech, Dialect::Qnw, Dialect::Simcom, Dialect::Fibocom],
         }
     }
 
@@ -201,6 +214,8 @@ impl Dialect {
             Dialect::Qnw => "AT+QNWPREFCFG=\"mode_pref\"",
             Dialect::Simcom => "AT+CNMP?",
             Dialect::Fibocom => "AT+GTACT?",
+            // acqorder 就是「制式偏好」（tdtech_acq_order 双向映射）
+            Dialect::Tdtech => "AT^SYSCFGEX?",
         }
     }
 
@@ -220,6 +235,11 @@ impl Dialect {
             Dialect::Qnw => format!("AT+QNWPREFCFG=\"{}\"", self.band_key(tech)),
             Dialect::Simcom => format!("AT+CSYSSEL=\"{}\"", self.band_key(tech)),
             Dialect::Fibocom => "AT+GTACT?".to_string(),
+            // 锁状态查询（写是 =3,0,<num>,<band>…，见 set_tdfreq_band）
+            Dialect::Tdtech => match tech {
+                "NR" | "NRNSA" => "AT^NRFREQLOCK?".to_string(),
+                _ => "AT^LTEFREQLOCK?".to_string(),
+            },
         }
     }
 
@@ -228,6 +248,8 @@ impl Dialect {
             Dialect::Qnw => "AT+QNWPREFCFG=\"policy_band\"",
             Dialect::Simcom => "",
             Dialect::Fibocom => "AT+GTACT=?",
+            // 手册没给「运行期支持频段」查询 → 空策略，界面用出厂清单（declared）
+            Dialect::Tdtech => "",
         }
     }
 
@@ -236,6 +258,8 @@ impl Dialect {
             Dialect::Qnw => "+QNWPREFCFG:",
             Dialect::Simcom => "+CSYSSEL:",
             Dialect::Fibocom => "+GTACT:",
+            // TdFreq 不走 parse_prefcfg_value，无 head
+            Dialect::Tdtech => "",
         }
     }
 
@@ -245,6 +269,9 @@ impl Dialect {
             (Dialect::Qnw, _) => "AT+QNWLOCK=\"common/4g\"",
             (Dialect::Fibocom, _) => "AT+EMMCHLCK?",
             (Dialect::Simcom, _) => "",
+            // 锁小区状态与锁频段是同一条查询（operatetype 1/2 = 锁频点/锁小区）
+            (Dialect::Tdtech, "NR") => "AT^NRFREQLOCK?",
+            (Dialect::Tdtech, _) => "AT^LTEFREQLOCK?",
         }
     }
 
@@ -259,11 +286,11 @@ impl Dialect {
         matches!(self, Dialect::Qnw)
     }
 
-    /// 频段锁定走哪种报文形状（见 [`BandShape`]）。
     fn band_shape(self) -> BandShape {
         match self {
             Dialect::Qnw | Dialect::Simcom => BandShape::Keyed,
             Dialect::Fibocom => BandShape::Positional,
+            Dialect::Tdtech => BandShape::TdFreq,
         }
     }
 }
@@ -494,6 +521,11 @@ impl Modem {
             Dialect::Fibocom => parse_gtact_read(&resp)
                 .map(|g| gtact_rat_label(g.rat).to_string())
                 .unwrap_or_default(),
+            // 鼎桥：acqorder（手册 §13.2）就是制式偏好，tdtech_acq_order 双向映射
+            Dialect::Tdtech => crate::modem::model::mode::parse_syscfgex(&resp)
+                .and_then(|(acq, ..)| crate::modem::model::mode::tdtech_acq_order(&acq))
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
         }
     }
 
@@ -544,6 +576,12 @@ impl Modem {
                         _ => g.lte,
                     };
                 }
+            }
+            BandShape::TdFreq => {
+                // 鼎桥：`^LTEFREQLOCK: <operatetype>` + 每行 `[<band>,…]`（手册 §13.12/13.13）
+                let lock = parse_tdfreqlock_read(&resp);
+                bl.raw_value = lock.raw.clone();
+                bl.bands = lock.bands;
             }
         }
         bl.locked = band_lock_restricted(&bl.bands, &bl.capable);
@@ -600,8 +638,10 @@ impl Modem {
             .dialect
             .ok_or_else(|| msg("该厂商的固件不支持锁网指令"))?;
         let tech = normalize_tech(tech, d)?;
-        if d.band_shape() == BandShape::Positional {
-            return self.set_gtact_band(&tech, bands, unlock);
+        match d.band_shape() {
+            BandShape::Positional => return self.set_gtact_band(&tech, bands, unlock),
+            BandShape::TdFreq => return self.set_tdfreq_band(&tech, bands, unlock),
+            BandShape::Keyed => {}
         }
         let value = if unlock {
             self.policy_band_value(d, &tech)?
@@ -807,6 +847,27 @@ impl Modem {
                     }
                 )));
             }
+            return Ok(self.lock_status(true));
+        }
+        if d == Dialect::Tdtech {
+            // 锁小区/锁频点（operatetype 1/2）必须带 <band>（手册 §13.12 语法），
+            // 而 UI 接口只有 earfcn/pci —— band 要先从当前小区（^MONSC）查。
+            // 语法本身明确，但参数组合没有实机样例，按「未验证拒绝盲写」的口径来。
+            if lock_type != 0 {
+                return Err(msg(
+                    "鼎桥的锁频点/锁小区（^LTEFREQLOCK=<operatetype>…）必须带 <band> 参数，                     该组合暂未验证（band 需从 ^MONSC 当前小区取）。解除锁定（=0）可直接下发，                     频段锁在「锁频段」页操作。",
+                ));
+            }
+            // 解锁：=0 同时解除 Band/频点/小区（手册：0=关闭锁功能）
+            let cmd = format!(
+                "{0}=0",
+                if tech == "NR" { "AT^NRFREQLOCK" } else { "AT^LTEFREQLOCK" }
+            );
+            let resp = self.with_at_prio(Prio::Bulk, |p| p.command(&cmd, Duration::from_secs(10)))?;
+            if !is_ok(&resp) {
+                return Err(msg(format!("下发失败：{}", resp.trim())));
+            }
+            let _ = self.at_cmd_prio(Prio::Bulk, "AT+CFUN=1");
             return Ok(self.lock_status(true));
         }
         let kind = d.cell_kind(&tech);
@@ -1181,13 +1242,151 @@ fn parse_emmchlck(resp: &str, tech: &str) -> CellLock {
 fn join_bands(d: Dialect, bands: &[i32]) -> String {
     let sep = match d {
         Dialect::Qnw => ":",
-        Dialect::Simcom | Dialect::Fibocom => ",",
+        Dialect::Simcom | Dialect::Fibocom | Dialect::Tdtech => ",",
     };
     bands
         .iter()
         .map(|b| b.to_string())
         .collect::<Vec<_>>()
         .join(sep)
+}
+
+// ====================== 鼎桥频段锁（^LTEFREQLOCK / ^NRFREQLOCK）======================
+//
+// 语法出自官方手册《MT5700M-CN 5G 系列模组 AT 命令手册》V200R001C20 §13.12/13.13：
+//
+//   写：AT^LTEFREQLOCK=<operatetype>[,<forbidFlag>,<num>[,<band>[,<arfcn>[,<pci>]]]]
+//       operatetype：0=解除 1=锁频点 2=锁小区 3=锁 Band
+//   读：AT^LTEFREQLOCK? → `^LTEFREQLOCK: <operatetype>` + 每行 `[<band>,…]`
+//
+// 三条手册写明的语义，写路径必须遵守：
+//   1. 下发后**需切飞行模式（CFUN=0/1）才生效**；
+//   2. 锁持久化（重启仍有效）；
+//   3. 受 NV 使能控制（未使能时回 +CME ERROR，如实上报，不重试）。
+
+/// `AT^…FREQLOCK?` 的读结果。
+#[derive(Debug, Clone, Default)]
+pub struct TdFreqLock {
+    /// 0=解除 1=锁频点 2=锁小区 3=锁 Band
+    pub operatetype: i32,
+    /// 当前锁定的频段（Band 锁形态下）；锁频点/小区形态为空（参数是频点不是频段）。
+    pub bands: Vec<i32>,
+    /// 原始应答（排障用）。
+    pub raw: String,
+}
+
+/// 解析 `^LTEFREQLOCK?` / `^NRFREQLOCK?` 的多行应答。
+///
+/// 应答形态（手册）：
+/// ```text
+/// ^LTEFREQLOCK: 3
+/// 1,38450,0          ← Band 行（首个字段是 band；LTE 后面是 freq/pci）
+/// 41,...
+/// ```
+/// NR 版每行多一个 `<scstype>` 字段，解析只取第一段当 band，其余原样进 raw。
+pub fn parse_tdfreqlock_read(resp: &str) -> TdFreqLock {
+    let mut out = TdFreqLock::default();
+    for line in resp.lines() {
+        let line = line.trim();
+        if let Some(rest) = line
+            .strip_prefix("^LTEFREQLOCK:")
+            .or_else(|| line.strip_prefix("^NRFREQLOCK:"))
+        {
+            out.operatetype = rest.trim().parse().unwrap_or(-1);
+            continue;
+        }
+        // 频段行：首字段是整数（band）。手册里没有 `^` 前缀，但保守起见
+        // 也接受 `^…:` 开头的变体。
+        let body = line
+            .strip_prefix("^LTEFREQLOCK:")
+            .or_else(|| line.strip_prefix("^NRFREQLOCK:"))
+            .unwrap_or(line);
+        let first = body.split(',').next().unwrap_or("").trim();
+        if let Ok(b) = first.parse::<i32>() {
+            if b > 0 {
+                out.bands.push(b);
+            }
+        }
+    }
+    out.raw = resp.trim().to_string();
+    out
+}
+
+impl Modem {
+    /// 鼎桥锁 Band / 解除（`BandShape::TdFreq` 的写路径）。
+    ///
+    /// 与 GTACT 同一套「先离线再下发」的纪律：手册写明锁设置要切飞行模式才生效，
+    /// 这里就由我们代切（CFUN=0 → 下发 → CFUN=1），失败也要把模组拉回在线。
+    fn set_tdfreq_band(&self, tech: &str, bands: &[i32], unlock: bool) -> Result<LockStatus> {
+        let cmd_base = match tech {
+            "NR" | "NRNSA" => "AT^NRFREQLOCK",
+            _ => "AT^LTEFREQLOCK",
+        };
+        // 目标值：解锁 = operatetype 0；锁定 = 3,0,<num>,<band>…（forbidFlag 取 0）
+        let arg = if unlock {
+            "=0".to_string()
+        } else {
+            let mut v: Vec<i64> = bands.iter().copied().map(|b| b as i64).filter(|b| *b > 0).collect();
+            v.sort_unstable();
+            v.dedup();
+            if v.is_empty() {
+                return Err(msg("要么勾几个频段，要么显式解除锁定"));
+            }
+            format!("=3,0,{},{}", v.len(), v.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","))
+        };
+        let cmd = format!("{cmd_base}{arg}");
+
+        // 手册备注 1：切飞行模式才生效。首尾 best-effort，中间失败冒泡并拉回在线。
+        let _ = self.at_cmd_prio(Prio::Bulk, "AT+CFUN=0");
+        let resp = match self.with_at_prio(Prio::Bulk, |p| p.command(&cmd, Duration::from_secs(10))) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = self.at_cmd_prio(Prio::Bulk, "AT+CFUN=1");
+                return Err(e);
+            }
+        };
+        if !is_ok(&resp) {
+            let _ = self.at_cmd_prio(Prio::Bulk, "AT+CFUN=1");
+            // NV 未使能等固件侧拒绝：如实上报，不重试
+            return Err(msg(format!("下发失败：{}", resp.trim())));
+        }
+        let _ = self.at_cmd_prio(Prio::Bulk, "AT+CFUN=1");
+
+        // 回读确认：解锁看 operatetype==0；锁定看 band 集合一致（容忍顺序）
+        let back = parse_tdfreqlock_read(&self.at_cmd_prio(Prio::Bulk, &d_band_query(tech)));
+        if unlock {
+            if back.operatetype != 0 {
+                return Err(msg(format!(
+                    "已下发解锁但回读 operatetype={}",
+                    back.operatetype
+                )));
+            }
+        } else {
+            let want: Vec<i64> = bands.iter().copied().map(|b| b as i64).filter(|b| *b > 0).collect();
+            let got: Vec<i64> = back.bands.iter().copied().map(|b| b as i64).collect();
+            if back.operatetype != 3 || got != want {
+                return Err(msg(format!(
+                    "已下发但回读为「{}」（operatetype={}，目标 {}）",
+                    if got.is_empty() {
+                        "空".to_string()
+                    } else {
+                        got.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
+                    },
+                    back.operatetype,
+                    want.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
+                )));
+            }
+        }
+        Ok(self.lock_status(true))
+    }
+}
+
+/// 鼎桥锁状态的回读命令（与 `Dialect::band_cmd` 同口径，供解析函数旁使用）。
+fn d_band_query(tech: &str) -> String {
+    match tech {
+        "NR" | "NRNSA" => "AT^NRFREQLOCK?".to_string(),
+        _ => "AT^LTEFREQLOCK?".to_string(),
+    }
 }
 
 /// 解析芯讯通 `AT+CNMP?` 的当前模式（`+CNMP: <n>`）。
@@ -1313,6 +1512,34 @@ fn cache_fresh(ts: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::parse_tdfreqlock_read;
+
+    // ---------- 鼎桥频段锁（^LTEFREQLOCK / ^NRFREQLOCK）----------
+
+    #[test]
+    fn tdfreqlock_read_parses_band_rows() {
+        let resp = "^LTEFREQLOCK: 3\r\n1,38450,0\r\n41,,\r\nOK";
+        let l = parse_tdfreqlock_read(resp);
+        assert_eq!(l.operatetype, 3, "锁 Band 形态");
+        assert_eq!(l.bands, vec![1, 41]);
+        assert!(l.raw.contains("OK"));
+    }
+
+    #[test]
+    fn tdfreqlock_read_unlocked_is_operatetype_zero() {
+        let l = parse_tdfreqlock_read("^NRFREQLOCK: 0\r\nOK");
+        assert_eq!(l.operatetype, 0);
+        assert!(l.bands.is_empty(), "解除后无频段行");
+    }
+
+    #[test]
+    fn tdfreqlock_read_ignores_garbage_lines() {
+        let l = parse_tdfreqlock_read("^LTEFREQLOCK: 1\r\n+CME ERROR: 100\r\nabc\r\n");
+        assert_eq!(l.operatetype, 1);
+        assert!(l.bands.is_empty(), "abc 不是频段行");
+    }
+
+
     use super::{
         band_lock_restricted, band_value, gtact_family, gtact_lte_code, gtact_nr_code,
         gtact_nr_decode, gtact_rat_label, join_bands, normalize_cell_tech, normalize_tech,

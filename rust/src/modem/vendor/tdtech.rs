@@ -19,7 +19,9 @@ impl VendorSpec for Spec {
     }
 
     fn detect(&self, lines: &[String]) -> bool {
-        any_line(lines, &["MT5700"])
+        // 手册是《MT5700M-CN 5G 系列》（V200R001C20），清单里同族的 mt5710_cn
+        // 同属巴龙平台、指令面一致 —— 关键字一并认。
+        any_line(lines, &["MT5700", "MT5710"])
     }
 
     fn serving_cell_cmd(&self) -> &'static str {
@@ -67,6 +69,19 @@ impl VendorSpec for Spec {
                 "AT^DSAMBR=1",
                 "签约速率 AMBR（kbps，只支持 cid 1）",
             ),
+            // 以下出自官方手册《MT5700M-CN 5G 系列模组 AT 命令手册》V200R001C20
+            of("鼎桥 手册 §3.17", "AT^VERSION", "软件版本信息"),
+            of("鼎桥 手册 §5.35", "AT^CELLSCAN", "小区扫频（支持无卡扫描，多行结果）"),
+            of("鼎桥 手册 §13.22", "AT^MCS?", "上下行 MCS 查询"),
+            of("鼎桥 手册 §13.23", "AT^TXPOWER?", "GUL（2/3/4G）发射功率（NR 下回 ERROR）"),
+            of("鼎桥 手册 §13.24", "AT^NTXPOWER?", "NR 发射功率（每 5 字段一组，最多 4 载波）"),
+            of("鼎桥 手册 §13.27", "AT^MONSSC", "NSA 辅连接服务小区（单载波回 NONE）"),
+            of("鼎桥 手册 §13.17", "AT^C5GOPTION?", "5G 接入模式选项"),
+            of("鼎桥 手册 §11.7", "AT^LENDC", "NSA 下 LTE-NR DC 双连接状态"),
+            of("鼎桥 手册 §13.18", "AT^CASCELLINFO?", "LTE CA 辅小区信息（单载波回 ERROR）"),
+            of("鼎桥 手册 §13.21", "AT^RRCSTAT", "RRC 状态查询"),
+            of("鼎桥 手册 §16.6", "AT^DHCP", "查询模组侧 DHCP/IP（拨号后取地址）"),
+            of("鼎桥 手册 §16.8", "AT^DCONNSTAT?", "拨号连接状态（cid/APN/v4/v6/类型）"),
         ]
     }
 
@@ -81,7 +96,29 @@ impl VendorSpec for Spec {
             "AT^CHIPTEMP?",
             "AT^DSFLOWQRY",
             "AT^DSAMBR=1",
+            "AT^VERSION",
+            "AT^CELLSCAN",
+            "AT^MONSSC",
+            "AT^MCS?",
+            "AT^TXPOWER?",
+            "AT^NTXPOWER?",
+            "AT^C5GOPTION?",
+            "AT^LENDC",
+            "AT^CASCELLINFO?",
+            "AT^RRCSTAT",
+            "AT^DHCP",
+            "AT^DCONNSTAT?",
         ]
+    }
+
+    /// 主动扫频：手册 §5.35，**支持无卡扫描**（多行 `^CELLSCAN:` 结果）。
+    fn cell_scan_cmd(&self) -> Option<&'static str> {
+        Some("AT^CELLSCAN")
+    }
+
+    /// 温度：手册 §17.1，12 路传感器一条应答。
+    fn temperature_cmds(&self, _mtk_platform: bool) -> &'static [&'static str] {
+        &["AT^CHIPTEMP?"]
     }
 
     fn mode_read(&self) -> (&'static str, &'static str) {
