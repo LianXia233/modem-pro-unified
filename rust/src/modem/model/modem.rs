@@ -1,7 +1,11 @@
 //! 模组领域对象与厂商/型号识别。
 //!
-//! 简化模型：一个 AT 口 = 一个模组。同一模组的多个 ttyUSB 合并、数据网卡识别等
-//! 留待后续按迁移清单补上。
+//! 一台**物理模组** = 一个 [`Modem`]，但它可以有多个可作 AT 口的 tty（首选项在前、
+//! 其余作回退，见 [`Modem::set_ttys`]）：发现流程按 USB / PCIe 设备分组后每组只探
+//! 一口，手动切口时整口换掉并重排顺序。
+//!
+//! 上游依据：Go `module/kernel/core.go:41` 的 `Modem.TTYList`（对外就是一串口），
+//! 分组口径见 `module/netdev/ports_unix.go:112` 的 `GroupByUSBDevice`。
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
@@ -30,9 +34,11 @@ pub struct Modem {
     port: Mutex<String>,
     /// 这台物理设备上的全部**可作 AT 口**的 tty（首选项在前）。
     ///
-    /// 以前 `ModemView::tty_list` 只回当前口自己 —— 页面看不出「同一个模组还有哪些
-    /// 口可以切」。发现流程现在按 USB 设备分组（见 `discovery/plan.rs`），
-    /// 组内的首选 + 回退口就记在这里；切口（`repoint`）会把它同步成新的顺序。
+    /// 排序约定：下标 0 是首选（也是当前口），其后是回退候选；切口
+    /// （[`Self::repoint`]）把新口插到最前、其余保留。页面的「其它 tty」
+    /// 与「还能切哪个口」就靠这个顺序。
+    ///
+    /// 只承载拓扑，不改变当前口 —— 当前口由发现流程与 `repoint` 决定。
     ttys: Mutex<Vec<String>>,
     pub baud: u32,
     pub first_seen: Instant,
@@ -404,6 +410,9 @@ impl Modem {
     }
 
     /// 当前登记的全部 AT 候选口（首选项在前）。
+    ///
+    /// 拓扑为空（发现流程没写入过）时退化为「只有当前口」，保证列表不为空调；
+    /// 这样 `/api/modems` 的 `tty_list` 在旧路径下也永远有值。
     pub fn ttys(&self) -> Vec<String> {
         let list = self.ttys.lock().unwrap().clone();
         if list.is_empty() {
@@ -433,19 +442,14 @@ impl Modem {
         self.ident.lock().unwrap().clone()
     }
 
+    /// 模组视图（`/api/modems` 的单台条目）。
+    ///
+    /// tty 拓扑沿用 [`Self::ttys`] 的排序（当前口在前），不在这里另拼一份列表。
     pub fn view(&self) -> ModemView {
-        let port = self.port();
         ModemView {
             id: self.id,
-            at_port: port.clone(),
-            tty_list: {
-                let list = self.ttys.lock().unwrap().clone();
-                if list.is_empty() {
-                    vec![port]
-                } else {
-                    list
-                }
-            },
+            at_port: self.port(),
+            tty_list: self.ttys(),
             vendor: self.vendor().as_str(),
             vendor_name: self.vendor().label(),
             model: self.model(),
@@ -576,17 +580,18 @@ impl Modem {
             .unwrap_or_default()
     }
 
-    /// 识别厂商与型号（`ATI`；不识别的模组回落 `AT+CGMR`/`AT+CGMM`）。
+    /// 识别厂商与型号（`ATI`；不识别的模组回落 `AT+CGMR` / `AT+CGMM`）。
     ///
-    /// ATI 明确报错（如展锐回 `+CME ERROR: 4`）时，
-    /// 用 3GPP 标准指令的应答**重跑一遍**厂商识别，再取型号短名。
+    /// ATI 明确报错（如展锐回 `+CME ERROR: 4`）时，用 3GPP 标准指令的应答
+    /// **重跑一遍**厂商识别，再取型号短名。
+    ///
+    /// 全过程**只发只读指令**：识别在发现与切口路径上都会跑，写指令会把模组
+    /// 已有的上下文弄乱。取证口径是「设备自报 + USB 身份」两路，见 `modem::detect`。
     pub fn identify(&self) -> Result<()> {
         let ati = self
             .with_at_prio(Prio::Data, |p| p.command("ATI", self.cmd_timeout))
             .unwrap_or_default();
         let lines = split_at_lines(&ati);
-        // 识别用「设备自报 + USB 身份」两路取证，见 `modem::detect` 的优先级表。
-        // 注意：这里**只发只读指令**，且失败时退回 AT+CGMR / AT+CGMM（部分展锐固件 ATI 回 ERROR）。
         let mut evidence_lines = lines.clone();
         if lines.is_empty() || at_resp_is_error(&lines) {
             for alt in ["AT+CGMM", "AT+CGMR"] {
@@ -979,9 +984,13 @@ fn has_letter_and_digit(s: &str) -> bool {
 /// 广和通 **350 系列**（FM350 / RW350）：同一套 MTK 平台行为。
 ///
 /// 两者在主机侧完全同构：USB 网卡不发 DHCP、私有指令族是 `AT+GT*`、温度要
-/// `AT+GTSENRDTEMP=0`、小区只有 `AT+GTCCINFO?`。参考实现只钉了 FM350，
-/// 这里把 RW350 一起收进来 —— **判定只此一处**，不要在别处再写 `contains("FM350")`
-/// （之前 `hostnic::quirk` 与 `dial::host_nic_quirk` 各抄了一份，加 RW350 时就会漏）。
+/// `AT+GTSENRDTEMP=0`、小区只有 `AT+GTCCINFO?`。
+/// 依据 QModem `modem_support.json`：`fibocom` 的 `mediatek` 平台只有
+/// `0e8d:7126 / 0e8d:7127` 一组，与高通 / 展锐平台（FM150 / FM160 / FM650）**完全不同**。
+///
+/// ⚠️ **判定只此一处**：型号子串匹配（`contains("FM350")`）散在别处时，加一个
+/// RW350 就会漏一处。`runtime/hostnic::quirk` 与 `model::dial::host_nic_quirk`
+/// 都已改为调用本函数，新增调用点请照做。
 pub fn is_fibocom_350(model: &str) -> bool {
     let u = model.to_ascii_uppercase();
     u.contains("FM350") || u.contains("RW350")

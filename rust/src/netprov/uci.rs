@@ -9,6 +9,24 @@
 //! OpenWrt 上没有稳定的 libuci 开发包可链；而 `uci show` 的输出是稳定的
 //! `pkg.section.key='value'` 行格式，解析它只要几十行纯函数。
 //! 代价是每次组网要 fork 两个 `uci` —— 但组网循环 ≤15 秒一轮，可接受。
+//!
+//! ## 副作用（哪些调用会真的动手）
+//!
+//! | 调用 | 会动什么 |
+//! | --- | --- |
+//! | [`read_existing`] / [`parse_existing`] | **只读**，fork 两条 `uci show` |
+//! | [`interface_loaded`] | **只读**，fork 一条 `ifstatus` |
+//! | [`apply`] | **写** `/etc/config/network` 与 `/etc/config/firewall`（set × N + commit × 2） |
+//! | [`reload_network`] | **重建接口**，可能触发 DHCP、短暂断网 |
+//!
+//! ## 错误语义与回滚
+//!
+//! - 命令超时 / 非零退出 ⇒ 返回 `Err(msg(..))`，消息里带完整命令行，便于照抄复现；
+//! - `apply` **不回滚**：UCI 的 `set` 立即进 staging，只有 `commit` 这一步能整体放弃。
+//!   所以「逐条 set 成功才 commit」只能保证不落盘半套 `commit`，改不回已经 set 的项。
+//!   真要原子得先整段备份 —— 对组网这种低频操作太重，这里用「逐条记日志 + 失败即停」兜底；
+//! - `reload_network` 失败**不算组网失败**：接口已经写进 UCI，下次 reload 会用上。
+//!   编排层（`provision.rs`）只记 `warn` 不置 `ok=false`。
 
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
@@ -126,12 +144,15 @@ fn run(args: &[&str]) -> Result<String> {
     )))
 }
 
-/// 读 `network` + `firewall` 的现状。
+/// 读 `network` + `firewall` 的现状（**只读**，fork 两条 `uci show`）。
 ///
 /// 第二个返回值是**zone 名 → section 路径**（如 `wan` → `firewall.@zone[1]`）。
+///
 /// ⚠️ 不能假设 section 名就等于 zone 名：实机（ImmortalWrt 默认配置）的 wan zone 是
 /// **匿名 section** `firewall.@zone[1]`，`name='wan'` 只是它的一个选项 ——
 /// 拿 `firewall.wan.network` 去 `add_list` 会报 `Invalid argument`（实测踩过）。
+/// 上游同样要处理这个（依据 QModem `modem_dial.sh:690-708`：数字形式的 zone 名
+/// 要还原成 `firewall.@zone[N]` 才能写）。
 pub fn read_existing() -> Result<(
     Vec<ExistingIface>,
     std::collections::HashMap<String, String>,
@@ -287,11 +308,12 @@ fn fw_entry(line: &str) -> Option<(String, String, String)> {
     let raw = unquote(&line[eq + 1..]);
     match lhs.rfind('.') {
         None => Some((format!("firewall.{lhs}"), String::new(), raw)),
+        // 在**最后一个**点处切：切完 `key` 里不可能再有点，`section` 被空检查兜住
         Some(dot) => {
             let section = &lhs[..dot];
             let key = &lhs[dot + 1..];
-            if section.is_empty() || key.is_empty() || key.contains('.') {
-                return None;
+            if section.is_empty() || key.is_empty() {
+                return None; // 形如 `firewall..key` 的畸形行
             }
             Some((format!("firewall.{section}"), key.to_string(), raw))
         }
@@ -345,12 +367,23 @@ pub fn unquote(s: &str) -> String {
     t.to_string()
 }
 
-/// 把一组操作落盘（`uci set` × N + 一次 `commit`）。
+/// 把一组操作落盘（`uci set` × N + `commit network` + `commit firewall`）。
 ///
-/// **一次 commit**：逐条 set 之后统一提交，中间失败也不会留下半套配置 ——
-/// 但注意 UCI 的 set 是立即进 staging 的，所以「全部 set 成功才 commit」
-/// 只能保证 commit 这一步不分裂，不能回滚已经 set 的部分。真要原子性得先
-/// 备份整段，那对组网这种低频操作太重，这里用「逐条记日志 + 失败即停」兜底。
+/// 返回**成功下发的操作条数**（不含两次 commit）。
+///
+/// ## 为什么是「set × N + commit × 2」
+///
+/// `uci` 有三态：磁盘上的 `/etc/config/*`、staging（`/tmp/.uci/`）、内存里的树。
+/// `uci set` 只把改动落到 staging，`uci commit` 才把 staging 合并回磁盘 ——
+/// 所以这里逐条 `set` 攒着，最后对 `network` / `firewall` 各 commit 一次。
+///
+/// ## 错误语义与回滚（务必看清）
+///
+/// - 任一条命令失败 ⇒ 立即 `Err` 返回，**不再继续，也不 commit**；
+/// - ⚠️ 但**这不是回滚**：已 `set` 的项仍留在 `/tmp/.uci/`，下一轮 commit 时
+///   会被一起落盘。因为计划是纯函数、每轮算出的 op 相同，实际不会留下脏值；
+///   真要原子性只能整段备份，对组网这种低频操作太重，这里用「失败即停 +
+///   错误消息里带完整命令行」兜底。
 pub fn apply(ops: &[UciOp]) -> Result<usize> {
     if ops.is_empty() {
         return Ok(0);
@@ -397,6 +430,10 @@ fn op_args(op: &UciOp) -> Vec<String> {
 }
 
 /// 让 netifd 重新加载网络配置（改完 UCI 不 reload 不生效）。
+///
+/// ⚠️ **有副作用**：netifd 会重建接口、可能重新发起 DHCP，期间**上网会短暂中断**。
+/// 所以调用方只在「确有改动」或「接口根本没加载」时才调它
+/// （见 `provision.rs::provision_modem_with`）。
 ///
 /// 失败只返回错误、不中断组网：接口已经写进 UCI，下次 netifd 自己 reload
 /// 也会用上；而组网循环的职责是「把配置写对」。

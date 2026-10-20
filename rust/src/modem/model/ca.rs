@@ -29,10 +29,18 @@
 //! - NR 带宽：25/50/75/100/125/150/200/250/300/400/450/500/1000/2000 → 5…400 MHz
 //!   （数值 = MHz × 5）
 //!
-//! 移远 `+QCAINFO` 的格式本仓库没有官方手册可依，因此只做**保守解析**：
-//! 认 `PCC`/`SCC` 角色与 `"LTE BAND <n>"` / `"NR5G BAND n<n>"` 这类文本，
-//! 取不到就留空 —— **不猜列序、不编造数值**。解析不出来的厂商返回 `None`，
-//! 由调用方如实显示「未上报」，而不是拿空数组当「没有 CA」。
+//! 移远 `+QCAINFO` 的字段骨架上游是有的（依据 Go `module/cell/cell.go:36`）：
+//!
+//! ```text
+//! +QCAINFO: "PCC",627264,3,"NR5G BAND 78",521                       空闲态（无信号值）
+//! +QCAINFO: "PCC",2452,20,"LTE BAND 3",155,-95,-12,-65,14           连接态
+//! ```
+//!
+//! 即 `<角色>,<频点>,<带宽>,<频段串>,<PCID>[,<RSRP>,<RSRQ>[,<RSSI>],<SINR>]`；
+//! 但本仓库**没有这两家的官方手册**，所以仍按保守解析实现：只认 `PCC`/`SCC` 角色与
+//! `"LTE BAND <n>"` / `"NR5G BAND n<n>"` 这类文本，取不到就留空 —— 不猜列序、
+//! 不编造数值（带宽一项因此恒为 0，见 [`parse_qcainfo`] 里的注释）。
+//! 解析不出来的厂商返回 `None`，由调用方如实显示「未上报」，而不是拿空数组当「没有 CA」。
 
 use super::super::at::Prio;
 use super::network::CcInfo;
@@ -52,17 +60,6 @@ pub struct CaInfo {
     pub raw: String,
     /// 解析时用的指令（`AT+GTCAINFO?` / `AT+QCAINFO`…），日志里带上便于对账。
     pub cmd: String,
-}
-
-impl CaInfo {
-    /// 没有任何分量载波（模组回了空、或指令不被支持）时的说明。
-    pub fn empty_note(&self) -> &'static str {
-        if self.raw.is_empty() {
-            "模组对本机的 CA 查询指令没有应答（可能不支持，或当前未进入连接态）"
-        } else {
-            "模组应答里解析不出分量载波：空闲态下通常只上报主载波，进入连接态并\n由网络配置辅载波后才会出现 SCC"
-        }
-    }
 }
 
 // ---------------------------------------------------------------- 广和通
@@ -102,6 +99,8 @@ pub fn parse_gtccinfo(resp: &str) -> Option<CaInfo> {
             continue;
         }
         let band_code = fields[idx];
+        // PCID 这一列不取：`CcInfo` 没有该字段（界面只列角色/频段/带宽/频点），
+        // 但列序要靠它占位，所以保留读取并显式丢弃。
         let _pci = fields[idx + 1];
         let arfcn = fields[idx + 2];
         let bw_code = fields[idx + 3];
@@ -185,7 +184,9 @@ pub fn parse_qcainfo(resp: &str) -> Option<CaInfo> {
             } else {
                 format!("B{band}")
             },
-            // 高通的带宽列序没有手册可依，不猜：留 0 由界面按「未上报」渲染
+            // 上游把这一行的第 2 列当 <带宽>（Go module/cell/cell.go:36），
+            // 但本仓库没有厂商手册核对它的量纲（LTE 与 NR 的同一列取值差一个量级），
+            // 不猜：留 0，由界面按「未上报」渲染
             bandwidth: 0,
             earfcn: earfcn.unwrap_or(0),
         });
@@ -272,8 +273,8 @@ fn split_ca_prefix(line: &str) -> Option<(String, String)> {
 ///
 /// ⚠️ NR 那一侧是**十进制拼接**，不是减法：手册给的是
 /// `501`→n1、`509`→n9、`5010`→n10、`50512`→n512，即「`50` 后面直接接频段号」。
-/// 早期版本按 `code - 5000` 算，在 50512 上会得出 45512 —— 差了一个数量级，
-/// 是单测抓出来的（见 `gtccinfo_nr_band_encoding`）。
+/// 按 `code - 5000` 算会在 50512 上得出 45512（差一个数量级），
+/// 单测 `gtccinfo_nr_band_encoding` 就是钉这个的。
 fn decode_band(code: i32) -> Option<(i32, bool)> {
     if (101..=171).contains(&code) {
         return Some((code - 100, false));

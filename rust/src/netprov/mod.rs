@@ -10,8 +10,10 @@
 //! | 文件 | 职责 | 能不能单测 |
 //! | --- | --- | --- |
 //! | `mod.rs`（本文件） | **纯策略**：算「该有哪些接口、各自什么 proto/device/metric」，以及「UCI 该动哪些行」 | 全部可，无 IO |
-//! | `uci.rs` | **薄 IO**：跑 `uci` 读出现状、把 [`UciOp`] 落盘 | 仅 unix，无单测 |
-//! | `provision.rs` | **编排**：读现状 → 算计划 → diff → 应用 → 回报 | 集成测试 |
+//! | `uci.rs` | **薄 IO**：跑 `uci` 读出现状、把 [`UciOp`] 落盘 | 解析有单测；执行只在 unix 上有意义 |
+//! | `route.rs` | **只读 + 清理**：读 `/proc/net/*` 看默认路由；断开时清旧的 v4 地址/路由 | 解析有单测；`flush_stale` 会**真改内核** |
+//! | `v6.rs` | IPv6 取址方式的**判定 + 落地动作**（sysctl / RS / 默认路由） | 判定有单测；落地要真机 |
+//! | `provision.rs` | **编排**：读现状 → 算计划 → diff → 应用 → 回报 | 有单测 |
 //!
 //! ## 三条红线（配置注释里写明的口径，逐条照搬）
 //!
@@ -25,12 +27,25 @@
 //!
 //! ## proto 怎么定（2026-10-13 起的口径）
 //!
-//! 三种模式（`modem_pro` / `dhcp` / `both`）下 **qmi / ecm / ncm / rndis / mbim /
-//! 认不出的类型一律 modem_pro**，不再只认 QMI，MBIM 也不再例外 —— 它的会话建立
-//! 由 modemd 内置的 MBIM 拨号做，接口跟其它类型一样是一张 `modem<id>`。
+//! 依据 Go `module/netprov/netprov_proto.go:102-111`（`WanProtoForKindMode`）。
+//!
+//! 先按 `[net] wan_mode`（见 `config/wan_mode.rs`）分：
+//!
+//! | 模式 | 主接口 proto |
+//! | --- | --- |
+//! | `dhcp` | `dhcp`（地址/路由/DNS 由 netifd 的 DHCP 取） |
+//! | `modem_pro`（默认）/ `both` | `modem_pro` |
+//!
+//! 在**走 modem_pro 的那两种模式**下，qmi / ecm / ncm / rndis / mbim / 认不出的类型
+//! **一律 modem_pro** —— 不再只认 QMI，MBIM 也不再例外：它的会话建立由 modemd
+//! 内置的 MBIM 拨号做，接口跟其它类型一样是一张 `modem<id>`。
 //!
 //! **唯一的例外**：`host_dial` 关掉时 MBIM 退回 `proto=mbim` —— 那时没人拨号，
 //! 只能靠 netifd 的 `mbim.sh` / `umbim`。
+//!
+//! ⚠️ 与上游的一处偏差：`WanProtoForKindMode` 另有 `modemProtoOK` 参数
+//! （路由器上装没装 `luci-proto-modem-pro`），本仓库没有这个开关 ——
+//! 协议脚本 `files/lib/netifd/proto/modem_pro.sh` 随本包一起安装，视为恒真。
 
 pub mod provision;
 pub mod route;
@@ -42,10 +57,14 @@ use serde::Serialize;
 use crate::config::WanMode;
 use v6::V6Mode;
 
-/// 本程序会写的 proto 值 —— 只有这些才算「我们建的接口」。
+/// 本程序会写的**主接口** proto 值 —— 落在表里的同名接口才归我们管。
 ///
 /// 手工建的接口 proto 千奇百怪（`pppoe` / `static` / `qmi` / `3g`…），
-/// 一律不在表内 ⇒ 不动它。
+/// 一律不在表内 ⇒ 不动它（红线 1：手工配置优先）。
+///
+/// ⚠️ `static` / `none` **不在这张表里**：这两个值太常见，光看 proto 会把用户
+/// 手起的接口一并接管，所以它们只在 [`is_ours`] 里、配合「接口名是不是
+/// `modem<N>` / `modem<N>_6`」才被认领。
 pub const MANAGED_PROTOS: [&str; 4] = ["modem_pro", "dhcp", "dhcpv6", "mbim"];
 
 /// 主接口 proto 的取值（`host_dial` 关掉时 MBIM 的退路）。
@@ -126,10 +145,14 @@ pub fn is_managed_proto(proto: &str) -> bool {
     MANAGED_PROTOS.contains(&p)
 }
 
-/// 主接口该用什么 proto（纯策略）。
+/// 主接口该用什么 proto（纯策略，无 IO）。
 ///
-/// 模式 `dhcp` ⇒ `dhcp`；其余模式下 QMI/ECM/NCM/RNDIS/未知一律 `modem_pro`，
-/// MBIM 同理 —— 除非 `host_dial` 关掉（那时退回 `mbim`，见模块头）。
+/// 依据 Go `module/netprov/netprov_proto.go:102-111`（`WanProtoForKindMode`）。
+///
+/// 模式 `dhcp` ⇒ `dhcp`；`modem_pro` / `both` 下 QMI/ECM/NCM/RNDIS/未知一律
+/// `modem_pro`，MBIM 同理 —— 除非 `host_dial` 关掉（那时退回 `mbim`，见模块头）。
+///
+/// ⚠️ 只是**算**出该写什么，不写 UCI；落盘在 [`uci::apply`]。
 pub fn main_proto(kind: &str, mode: WanMode, host_dial: bool) -> &'static str {
     if !mode.uses_modem_pro() {
         return PROTO_DHCP;
@@ -213,19 +236,23 @@ pub fn plan_wan(
     static_ipv4: &str,
 ) -> WanPlan {
     let mut proto = main_proto(kind, mode, host_dial);
-    // 350 系列（FM350 / RW350）的 USB 网卡不发 DHCP —— 由调用方判定并给出
-    // 模组上报的地址后，这里把主接口改成 **proto=static + 该地址**（与参考实现同口径：
-    // RNDIS 点对点，模组地址可直接落在主机网卡上，不需要主机侧另配一个同网段地址）。
     let mut ipaddr = String::new();
     let mut netmask = String::new();
     let mut gateway = String::new();
+    // 350 系列（FM350 / RW350）的 USB 网卡不发 DHCP —— 由调用方判定并给出
+    // 模组上报的地址后，这里把主接口改成 **proto=static + 该地址**（与参考实现同口径：
+    // RNDIS 点对点，模组地址可直接落在主机网卡上，不需要主机侧另配一个同网段地址）。
+    //
     // 覆盖 dhcp 与 modem_pro 两种模式（与 provision.rs 的转换条件同口径）：
     // modem_pro 的 v4 也是 udhcpc，FM350 的模组内 DHCP 服务器长期无响应，
     // 不覆盖的话 modem_pro 模式在 350 系列上永远拿不到 v4。
+    //
+    // 依据 QModem `modem_dial.sh:1723-1750`（FM350 静态地址）；
+    // `both` 模式不覆盖 —— 那时要的就是 modem_pro 自己取址。
     let want_static =
         !static_ipv4.trim().is_empty() && matches!(mode, WanMode::Dhcp | WanMode::ModemPro);
     if want_static {
-        proto = "static";
+        proto = PROTO_STATIC;
         ipaddr = static_ipv4.trim().to_string();
         netmask = "255.255.255.0".to_string();
         gateway = derive_gateway(&ipaddr).unwrap_or_default();
@@ -245,11 +272,11 @@ pub fn plan_wan(
         dns: String::new(),
     }];
     if v6.mode.wants_sibling() && mode.wants_dhcpv6_sibling() {
+        let mut v6_mode = v6.mode;
+        let mut ip6addr = String::new();
         // `static` 模式没有可用地址时退回 dhcpv6：写个没有地址的 static 接口
         // 等于永远拿不到 v6（比不建还难排查）。调用方通常已在前面判过，
         // 这里再兜一层，纯策略函数不该产出「必然不通」的计划。
-        let mut v6_mode = v6.mode;
-        let mut ip6addr = String::new();
         if v6_mode == V6Mode::Static {
             match v6::usable_static_v6(v6.static_addr) {
                 Some(addr) => ip6addr = format!("{addr}/128"),
@@ -260,7 +287,9 @@ pub fn plan_wan(
             name: iface_name_v6(modem_id),
             proto: v6_mode.sibling_proto(),
             // ★ 绑**主接口**而不是裸网卡名：主接口是 modem_pro 时它的设备是
-            //   netifd 动态建出来的（wwan0_1 之类），裸名会绑错；参考实现同口径。
+            //   netifd 动态建出来的（wwan0_1 之类），裸名会绑错。
+            //   依据 QModem `modem_dial.sh:852-853`（`ifname` / `device` 都写
+            //   `@<主接口>`）；本仓库只写 `device`（新版 netifd 的键名）。
             device: format!("@{name}"),
             metric,
             auto: true,
@@ -381,30 +410,34 @@ pub struct ExistingIface {
     pub zones: Vec<String>,
 }
 
-/// 这个现状接口是不是「我们建的」⇒ 可以按计划改造。
+/// 这个现状接口是不是「我们建的」⇒ 可以按计划改造（纯策略，无 IO、不改 UCI）。
 ///
-/// 判据只看 proto：落在 [`MANAGED_PROTOS`] 里才算。用户手工建的 `pppoe` /
-/// `static` / `qmi` 接口一律不算 —— 那是红线 1（手工配置优先）。
+/// 两档判据：
+///
+/// 1. proto 落在 [`MANAGED_PROTOS`] 里 ⇒ 直接算我们的；
+/// 2. `static` / `none` 太常见，光看 proto 会把用户手起的接口一并接管，
+///    所以这两个值**额外**要求接口名是本程序命名空间（`modem<N>` / `modem<N>_6`）
+///    —— 那是红线 1（手工配置优先）。
+///
+/// `pppoe` / `qmi` / `3g` 之类一律落到 `_ => false`。
 pub fn is_ours(existing: &ExistingIface) -> bool {
     if is_managed_proto(&existing.proto) {
         return true;
     }
-    // 下面两种 proto 也是我们写的，但只认本程序命名空间里的接口名：
-    //
-    // · `static` —— 350 系列（FM350 / RW350）在 dhcp 模式下由我们写成 static；
-    //   判据要带 `ipaddr`、且只认主接口（`modem<N>`，不含 `_6` 兄弟接口），
-    //   否则用户手起的 static 接口会被接管。
-    // · `none` —— RA 模式的 v6 兄弟接口（只把设备拉起来，地址交给内核）。
-    //   只有 `modem<N>_6` 这种名字才归我们。
     match existing.proto.as_str() {
-        "static" => {
+        // 350 系列（FM350 / RW350）在 dhcp 模式下由我们写成 static；
+        // 判据要带 `ipaddr`、且只认主接口（`modem<N>`，不含 `_6` 兄弟接口），
+        // 否则用户手起的 static 接口会被接管。
+        PROTO_STATIC => {
             // 主接口看 `ipaddr`、v6 兄弟接口看 `ip6addr` —— 两种都是本程序写的
             // （350 系列 IPv4 / `wan_ipv6_mode=static` 的 /128），必须能被下一轮
             // 继续对齐（否则切回 dhcpv6 时旧地址永远清不掉）。
             is_our_iface_name(&existing.name)
                 && (!existing.ipaddr.is_empty() || !existing.ip6addr.is_empty())
         }
-        "none" => is_our_iface_name(&existing.name) && existing.name.ends_with("_6"),
+        // RA 模式的 v6 兄弟接口（只把设备拉起来，地址交给内核）。
+        // 只有 `modem<N>_6` 这种名字才归我们。
+        PROTO_NONE => is_our_iface_name(&existing.name) && existing.name.ends_with("_6"),
         _ => false,
     }
 }
@@ -601,6 +634,34 @@ fn push_if_set(ops: &mut Vec<UciOp>, section: &str, key: &str, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------- 断言样板 ----------
+    //
+    // `ops.contains(&UciOp::Set{...})` 每个断言要写 5 行、`section/key/value`
+    // 三处 `.into()`；同一个契约在十几个用例里反复出现。抽成 helper 后
+    // 断言只剩一行，改动 key 名时也只有一个地方要同步。
+
+    /// 断言 ops 里有一条 `section.key = value`。
+    fn assert_set(ops: &[UciOp], section: &str, key: &str, value: &str) {
+        assert!(
+            ops.iter().any(|o| matches!(
+                o,
+                UciOp::Set { section: s, key: k, value: v } if s == section && k == key && v == value
+            )),
+            "期望 {section}.{key}={value}，实际 ops：{:?}",
+            ops.iter().map(|o| o.describe()).collect::<Vec<_>>()
+        );
+    }
+
+    /// 断言 ops 里**没有**动过这个 key（空值不下发 / 网卡未知不写 device 一类口径）。
+    fn assert_no_set(ops: &[UciOp], key: &str) {
+        assert!(
+            !ops.iter()
+                .any(|o| matches!(o, UciOp::Set { key: k, .. } if k == key)),
+            "期望不写 {key}，实际 ops：{:?}",
+            ops.iter().map(|o| o.describe()).collect::<Vec<_>>()
+        );
+    }
 
     // ---------- 命名 ----------
 
@@ -829,16 +890,8 @@ mod tests {
             "10.42.0.16",
         );
         let ops = diff_plan(&cur, &p, FIREWALL_ZONE, "firewall.wan");
-        assert!(ops.contains(&UciOp::Set {
-            section: "modem0_6".into(),
-            key: "device".into(),
-            value: "@modem0".into()
-        }));
-        assert!(ops.contains(&UciOp::Set {
-            section: "modem0_6".into(),
-            key: "extendprefix".into(),
-            value: "1".into()
-        }));
+        assert_set(&ops, "modem0_6", "device", "@modem0");
+        assert_set(&ops, "modem0_6", "extendprefix", "1");
     }
 
     #[test]
@@ -1171,16 +1224,8 @@ mod tests {
             "10.42.0.16",
         );
         let ops = diff_plan(&[], &p, FIREWALL_ZONE, "firewall.wan");
-        assert!(ops.contains(&UciOp::Set {
-            section: "modem0".into(),
-            key: "ipaddr".into(),
-            value: "10.42.0.16".into()
-        }));
-        assert!(ops.contains(&UciOp::Set {
-            section: "modem0".into(),
-            key: "gateway".into(),
-            value: "10.42.0.1".into()
-        }));
+        assert_set(&ops, "modem0", "ipaddr", "10.42.0.16");
+        assert_set(&ops, "modem0", "gateway", "10.42.0.1");
 
         // 切回 dhcp：旧静态项要清掉，否则会跟着接口重新 ifup 进内核
         let back = plan_wan(
@@ -1302,11 +1347,7 @@ mod tests {
             },
         ];
         let ops = diff_plan(&cur, &p, FIREWALL_ZONE, "firewall.wan");
-        assert!(ops.contains(&UciOp::Set {
-            section: "modem1".into(),
-            key: "proto".into(),
-            value: "modem_pro".into()
-        }));
+        assert_set(&ops, "modem1", "proto", "modem_pro");
         assert!(ops.contains(&UciOp::Remove {
             section: "modem1_6".into()
         }));
@@ -1401,10 +1442,7 @@ mod tests {
             "",
         );
         let ops = diff_plan(&[], &p, FIREWALL_ZONE, "firewall.wan");
-        assert!(!ops.iter().any(|o| matches!(
-            o,
-            UciOp::Set { key, .. } if key == "metric"
-        )));
+        assert_no_set(&ops, "metric");
     }
 
     #[test]
@@ -1421,15 +1459,8 @@ mod tests {
             "",
         );
         let ops = diff_plan(&[], &p, FIREWALL_ZONE, "firewall.wan");
-        assert!(!ops.iter().any(|o| matches!(
-            o,
-            UciOp::Set { key, .. } if key == "device"
-        )));
-        assert!(ops.contains(&UciOp::Set {
-            section: "modem1".into(),
-            key: "proto".into(),
-            value: "modem_pro".into()
-        }));
+        assert_no_set(&ops, "device");
+        assert_set(&ops, "modem1", "proto", "modem_pro");
     }
 
     #[test]
@@ -1490,11 +1521,7 @@ mod tests {
 
         // 1) 新建接口：应写 dns
         let ops = diff_plan(&[], &p, FIREWALL_ZONE, "firewall.wan");
-        assert!(ops.contains(&UciOp::Set {
-            section: "modem0".into(),
-            key: "dns".into(),
-            value: "223.5.5.5 119.29.29.29".into()
-        }));
+        assert_set(&ops, "modem0", "dns", "223.5.5.5 119.29.29.29");
 
         // 2) 已配好同值：零写入（每轮组网循环不重复动手）
         let cur = vec![ExistingIface {
@@ -1516,11 +1543,7 @@ mod tests {
         let mut cur2 = cur.clone();
         cur2[0].dns = "8.8.8.8".into();
         let ops = diff_plan(&cur2, &p, FIREWALL_ZONE, "firewall.wan");
-        assert!(ops.contains(&UciOp::Set {
-            section: "modem0".into(),
-            key: "dns".into(),
-            value: "223.5.5.5 119.29.29.29".into()
-        }));
+        assert_set(&ops, "modem0", "dns", "223.5.5.5 119.29.29.29");
 
         // 4) 计划不强制（carrier 模式）：清掉现状里的 dns
         let mut p_off = plan_wan(

@@ -10,8 +10,17 @@
 //! `AT+CESQ` 不带 SINR 格，SINR 只能取服务小区行的 `<rssnr_value>`。
 //!
 //! CESQ 与 GTCCINFO 的信号格都是**阶梯索引**（不是 dBm / dB），换算统一走本模块
-//! 的索引函数：口径取 3GPP 区间下界（索引 1 = [-140,-139) dBm），与
+//! 的索引函数：口径取 3GPP 区间下界（索引 1 = [-140,-139) dBm → -140 dBm），与
 //! 3GPP TS 27.007 §8.69 和《FM350 AT Commands》§11.1.15 一致。
+//!
+//! ⚠️ 与上游 Go 的 1 dB 差（有意保留，不改）：Go `module/cell/cell.go:573`
+//! `ParseCESQSignal` 按区间**上界**算（`rsrp = v-140`、`rsrq = (v-39)/2`），
+//! 本仓库取下界（`v-141` / `(v-40)/2`），因此同一个索引本仓库比上游低 1 dB。
+//! 改它会让页面与历史曲线的所有信号值整体平移，属输出口径变更，见 A03 报告。
+//!
+//! 无效值哨兵：`AT+CSQ` 的 99 / 255、`AT+CESQ` 各格的 255 都表示「未上报」；
+//! 本模块把它们换算成 0，再由 `valid()` 按量纲滤掉 —— 前端
+//! （`rust/web/index.html` 的 `sampleFromPush`）用同一套区间判定。
 
 use serde::Serialize;
 
@@ -21,14 +30,23 @@ use super::super::at::{csv, extract_all, extract_field, field_part, is_ok, Prio}
 use super::modem::Modem;
 
 /// 信号信息（含 5G NR 小区信号）。
+///
+/// 字段名带 `nr_` 前缀是历史遗留（沿用 Go 上游 `SignalInfo` 的 JSON 契约）：
+/// 三格装的是**当前驻留制式**的服务小区信号，纯 LTE 驻网时也是它，不是只装 NR。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SignalInfo {
+    /// `AT+CSQ` 的 `<rssi>` 索引 0~31（对客户显示时按 `idx*2-113` 换算成 dBm）；
+    /// `99` / `255` = 未上报。
     pub rssi: i32,
+    /// `AT+CSQ` 的 `<ber>` 0~7（`99` = 未上报）；只在 2G 下有实际含义。
     pub ber: i32,
+    /// RSRP dBm（量纲 -156~-44）；`0` = 未上报。
     #[serde(rename = "nr_rsrp", skip_serializing_if = "is_zero")]
     pub nr_rsrp: i32,
+    /// RSRQ dB（量纲 -43~20）；`0` = 未上报。
     #[serde(rename = "nr_rsrq", skip_serializing_if = "is_zero")]
     pub nr_rsrq: i32,
+    /// SINR dB（量纲 -23~40）；`0` = 未上报。
     #[serde(rename = "nr_sinr", skip_serializing_if = "is_zero")]
     pub nr_sinr: i32,
 }
@@ -62,6 +80,10 @@ impl Modem {
     /// `AT+GTCCINFO?` 的行表；该行表的 `<rsrp>` / `<rsrq>` 与 CESQ 同表，
     /// 在 CESQ 取不到时兜底，而 LTE 的 SINR（`<rssnr_value>`，本身就是 dB）
     /// 只有这里有 —— CESQ 的 LTE 分支不带 SINR 格。
+    ///
+    /// 鼎桥 MT5700（`^MONSC`）与芯讯通（`+CPSI`）同样不回 `+QENG`，但不必在这里
+    /// 加分支：`+QENG` 在它们上面只是回 ERROR / 无应答，解不出自然落到 CESQ，
+    /// 与扫小区（`cells.rs` 的 `Modem::serving_cell_live`）的分厂商分支不重复。
     fn query_serving_signal(&self) -> (i32, i32, i32) {
         let fibo_mtk = self.is_fibocom_mtk();
         if !fibo_mtk {
@@ -106,6 +128,10 @@ impl Modem {
 }
 
 /// 解析 `AT+CSQ` → `(rssi, ber)`。
+///
+/// `rssi` 是**索引不是 dBm**：0~31 对应 -113 ~ -51 dBm（`idx*2-113`），
+/// `99` / `255` = 未上报；`ber` 0~7（`99` = 未上报）。换算留给展示层（前端与
+/// `metrics.rs` 的 `valid_signal` 各自按 `idx*2-113` 算），这里保留原始索引。
 pub fn parse_csq(resp: &str) -> (i32, i32) {
     let field = match extract_field(resp, "+CSQ") {
         Some(v) => v,
@@ -124,6 +150,13 @@ pub fn parse_csq(resp: &str) -> (i32, i32) {
 ///
 /// NR5G：`"servingcell","CONNECT","NR5G-SA","TDD",460,11,<cell>,702,<tac>,633984,78,100,<rsrp>,<rsrq>,<sinr>,…`
 /// LTE ：`"servingcell","NOCONN","LTE",<tdd>,460,11,<cell>,<pcid>,<earfcn>,<band>,<ul>,<dl>,<tac>,<rsrp>,<rsrq>,<rssi>,<sinr>,…`
+///
+/// ⚠️ 与上游口径不同：Go 走的是量纲定位（`module/cell/cell.go:530`
+/// `ParseServingCellSignal`，先整行解成 `CellInfo` 再取 RSRP/RSRQ/SINR），
+/// 这里是移远的**固定列下标**（NR 12/13/14，LTE 13/14/16）。
+/// 好处是对移远文档里的两种制式都准，代价是固件一旦挪列就整体取不到
+/// （那时会退到 `AT+CESQ`，见 `Modem::query_serving_signal`）；
+/// 不在本轮擅自改成量纲定位 —— 会改变所有机型的取值，见 A03 报告。
 pub fn parse_qeng_servingcell(resp: &str) -> Option<(i32, i32, i32)> {
     let line = extract_all(resp, "+QENG")
         .into_iter()
@@ -147,9 +180,16 @@ pub fn parse_qeng_servingcell(resp: &str) -> Option<(i32, i32, i32)> {
 
 /// 解析 `AT+CESQ`（3GPP TS 27.007 §8.69，含广和通扩展的第 7~9 格 SSB 测量值）。
 ///
+/// 依据 Go `module/cell/cell.go:573` `ParseCESQSignal`（同一份换算法）。
+///
 /// 字段序：`<rxlev>,<ber>,<rscp>,<ecno>,<rsrq>,<rsrp>,<ss_rsrq>,<ss_rsrp>,<ss_sinr>`。
 /// 前 6 格是 3GPP 标准量，第 7~9 格是广和通的 NR SSB 扩展；制式由「哪几格
 /// 不是 255」隐式给出：LTE 量有效走 LTE 表，否则走 NR 表。
+/// `<rxlev>` / `<rscp>` / `<ecno>` 在 LTE/NR 模组上恒为 99 / 255，不参与换算；
+/// 真正在 WCDMA 上要用它们（RSCP / EcIo）时，本函数已按「两项都为 0」提前退出。
+///
+/// 与上游的一处小差异：上游要求扩展格 `v > 0` 才换算，本实现允许 `v == 0`
+/// （0 换算后落在量纲外，会被 `valid()` 滤成 0，结果一致）。
 pub fn parse_cesq(resp: &str) -> Option<(i32, i32, i32)> {
     if !is_ok(resp) {
         return None;
@@ -227,7 +267,11 @@ fn at_i32(v: Option<&String>) -> Option<i32> {
     v.and_then(|s| s.parse::<i32>().ok())
 }
 
-/// 过滤物理范围外的哨兵值（与前端 `renderSignal` 校验一致）。
+/// 过滤物理范围外的哨兵值（区间与前端 `rust/web/index.html` 的 `sampleFromPush`
+/// 一致，否则曲线上的点会和面板上的数字对不上）。
+///
+/// 三个值中 `rsrp` 是「有没有信号」的判据：它为 0 就整份丢弃（`None`），
+/// 让调用方继续退到下一路查询；RSRQ / SINR 取不到时只把该项置 0，不牵连 RSRP。
 fn valid(rsrp: i32, rsrq: i32, sinr: i32) -> Option<(i32, i32, i32)> {
     let rsrp = if (-156..=-31).contains(&rsrp) {
         rsrp

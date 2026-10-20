@@ -785,7 +785,7 @@ mod tests {
             "非 ±zz 原样返回"
         );
         assert_eq!(
-            parse_cclk_tz("26/01/01,12:00:00xx").map(|(u, o)| (u, o)),
+            parse_cclk_tz("26/01/01,12:00:00xx"),
             parse_cclk("26/01/01,12:00:00").map(|u| (u, 0))
         );
         // 怪癖表：违规固件名单必须包含 RM520/EM05/MT5700/FM650（上游实测）

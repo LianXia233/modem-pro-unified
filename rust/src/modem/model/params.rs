@@ -1,6 +1,10 @@
 //! PDP 上下文与选网总览（`GET /api/params`）。
 //!
-//! 配置来自 `AT+CGDCONT?`，激活状态来自 `AT+CGACT?`，选网方式来自 `AT+COPS?`。
+//! 配置来自 `AT+CGDCONT?`，激活状态来自 `AT+CGACT?`，选网方式来自 `AT+COPS?`；
+//! 三条命令合并在**同一次端口占用**里发（见 [`Modem::read_params`]）。
+//!
+//! 写入侧的校验口径与 Go `module/kernel/data_validate.go` 对齐
+//!（`ValidAPN` / `ValidPLMN`），差异见 [`Modem::set_apn`] 的注释。
 
 use std::time::Duration;
 
@@ -29,6 +33,7 @@ pub struct ParamsStatus {
     pub modem_id: u32,
     /// **真实查询**时刻（命中缓存时是上一次问模组的时间，不是现在）
     pub queried_at: String,
+    /// 当前在用的 APN：第一个**已激活且非内部专用**的上下文（无则没有这个字段）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub apn: Option<String>,
     pub contexts: Vec<Context>,
@@ -102,12 +107,21 @@ impl Modem {
     }
 }
 
-/// PLMN 文本校验（手动选网要 5~6 位数字）。
+/// PLMN 文本校验（手动选网要 5~6 位数字：3 位 MCC + 2~3 位 MNC）。
+///
+/// 依据 Go `module/kernel/data_validate.go:43` 的 `ValidPLMN` —— 两边同口径。
 fn valid_plmn_text(p: &str) -> bool {
     p.len() >= 5 && p.len() <= 6 && p.chars().all(|c| c.is_ascii_digit())
 }
 
-/// APN 只允许字母 / 数字与 `. - _`（会拼进 `AT+CGDCONT`，必须卡死）。
+/// APN 只允许字母 / 数字与 `. - _`。
+///
+/// 依据 Go `module/kernel/data_validate.go:23` 的 `ValidAPN`（同口径）：
+/// 长度上限 100 是 3GPP 的规定；字符必须卡死是因为这个值会**原样拼进
+/// `AT+CGDCONT=<cid>,"<pdp>","<apn>"`** —— 放过一个 `"` 或 `,` 就等于把用户输入
+/// 拼进 AT 命令行（截断指令、甚至改写 cid）。`#` 同理。
+///
+/// 空串也不合法：空 APN 在多数固件上是「删掉这条定义」，不是「不改」。
 pub fn valid_apn(apn: &str) -> bool {
     let s = apn.trim();
     !s.is_empty()
@@ -153,12 +167,12 @@ impl Modem {
             })
             .unwrap_or(false);
 
-        let was_active;
+        // 幂等路径不读 was_active：配置没变就不该动已建立的会话，
+        // 「是不是激活着」在这里没有后续动作。
         if unchanged {
             steps.push(format!(
                 "cid {cid} 配置未变化（{pdp_type} {apn}），跳过重写（幂等）"
             ));
-            was_active = contexts.iter().any(|c| c.cid == cid && c.active);
         } else {
             let cmd = format!("AT+CGDCONT={cid},\"{pdp_type}\",\"{apn}\"");
             let resp = self.with_at_prio(Prio::Bulk, |p| p.command(&cmd, self.cmd_timeout))?;
@@ -184,7 +198,7 @@ impl Modem {
 
             // 之前激活着的就先断后连，让新 APN 立即生效
             let activated = self.at_cmd_prio(Prio::Bulk, "AT+CGACT?");
-            was_active = build_contexts(&defined, &activated)
+            let was_active = build_contexts(&defined, &activated)
                 .iter()
                 .any(|c| c.cid == cid && c.active);
             if was_active {

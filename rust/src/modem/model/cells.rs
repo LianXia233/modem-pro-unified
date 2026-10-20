@@ -2,9 +2,22 @@
 //!
 //! 各平台的服务小区来源不同：移远/广和通高通走 `+QENG` / `+FENG`（带标签形式），
 //! 芯讯通走 `+CPSI`，广和通 MTK 平台（FM350 / RW350）走 `AT+GTCCINFO?` 的
-//! **无标签行表**（见 [`parse_gtccinfo_rows`]）。
+//! **无标签行表**（见 [`parse_gtccinfo_rows`]），鼎桥 MT5700 走 `^MONSC` / `^MONNC`。
 //! 带标签的那几种字段顺序各固件不一致，因此信号值**按量纲定位**而不是硬编码下标；
 //! GTCCINFO 行表的列序则由手册按 `<rat>` + 角色钉死。
+//!
+//! 量纲定位的口径与上游一致：先找第一个落在 RSRP 量纲（-156 ~ -44 dBm）的字段当
+//! RSRP，再由它前后的量纲区分 RSRQ / RSSI / SINR（依据 Go `module/cell/cell.go:1027`
+//! `FindRSRPToken`、`:1044` `ApplySignalFields`；邻区的 RSRQ 双向试探见
+//! `:344` `parseNeighbourCell`）。
+//!
+//! 服务小区的字段骨架同样对齐上游（`module/cell/cell.go:221` `ParseServingCell`）：
+//! `<state>,<tech>,<duplex>,<MCC>,<MNC>,<CellID>,…`，cellID 之后 LTE 是
+//! `<PCID>,<EARFCN>,<band>,…`、NR 是 `<TAC>,<ARFCN>,…`，NR5G-SA/NSA 在 cellID 后多一格 PCI。
+//!
+//! 无效值口径：PLMN 全零或非数字视为无效（挡住 NR5G-NSA 未连接时的整行 0 占位），
+//! 信号值「未上报」统一用 0 表示（`signal.rs` 的 `valid()` 按量纲过滤），
+//! 不用负数哨兵 —— 前端按「0 = 未上报」渲染。
 
 use serde::Serialize;
 
@@ -16,25 +29,42 @@ use super::modem::Modem;
 /// 一个小区（服务小区或邻小区）。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct CellInfo {
+    /// 接入技术：`LTE` / `NR` / `WCDMA` / `GSM`（由 [`normalize_tech`] 归一化）。
     pub tech: String,
+    /// 连接状态（移远 `NOCONN` / `CONNECT`…）；拆分上报的固件里它在标记行上。
     pub state: String,
+    /// 移动国家码（3 位数字，如 `460`）。
     pub mcc: String,
+    /// 移动网络码（2~3 位数字）。
     pub mnc: String,
+    /// 小区 ID，十六进制字符串（去 `0x` 前缀、大写）。
     pub cell_id: String,
+    /// 物理小区 ID：LTE PCI 0~503、NR PCI 0~1007；`0` = 未上报。
     #[serde(skip_serializing_if = "is_zero")]
     pub pcid: i32,
+    /// 跟踪区码（LTE TAC / NR 的 TAC；WCDMA 下同位置是 LAC）。
     pub tac: i32,
+    /// 频点号：LTE EARFCN 0~65535、NR ARFCN 0~3279165；`0` = 未上报。
     pub earfcn: i32,
+    /// 频段号（`78` = n78 / B78）；`0` = 未上报（解析不出时按频点反推）。
     pub band: i32,
     /// 频段可读标签（`n78` / `B3`），由 `band` + `tech` 现算；未知时缺省。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub band_label: Option<String>,
+    /// 带宽 MHz；`0` = 未上报（只有部分固件给）。
     #[serde(skip_serializing_if = "is_zero")]
     pub bandwidth: i32,
+    /// 参考信号接收功率 dBm（量纲 -156~-44）；`0` = 未上报。
     pub rsrp: i32,
+    /// 参考信号接收质量 dB（量纲 -43~20）；`0` = 未上报。
     pub rsrq: i32,
+    /// 接收信号强度 dBm（量纲 -113~-25，比 RSRP 强）；`0` = 未上报。
     #[serde(skip_serializing_if = "is_zero")]
     pub rssi: i32,
+    /// 信噪比 dB（量纲 -23~40）；`0` = 未上报。
+    ///
+    /// LTE 制式下 `AT+CESQ` 不带这一格，广和通 MTK 平台只能取服务小区行的
+    /// `<rssnr_value>`（详见 [`parse_gtccinfo_rows`]）。
     pub sinr: i32,
     pub serving: bool,
     pub intra_cell: bool,
@@ -101,6 +131,8 @@ impl CellScanResult {
                 c.band_label = Some(band::band_label(&c.tech, c.band));
             }
         }
+        // serving / neighbours 是在上面的循环里克隆出来的**独立副本**，不是 `cells`
+        // 的切片视图，所以必须再填一遍 —— 只填 `cells` 会让两个分类列表丢标签。
         for c in serving.iter_mut().chain(neighbours.iter_mut()) {
             if c.band > 0 {
                 c.band_label = Some(band::band_label(&c.tech, c.band));
@@ -267,8 +299,9 @@ impl Modem {
 
     /// 最近一次扫描时间（不触发扫描；从没扫过就没有）。
     ///
-    /// 不能直接用 [`Self::cells_cached`]：它的空结果会把 `scanned_at` 填成"现在"，
-    /// 页面会把「没扫过」显示成「刚刚扫过」。
+    /// 不走 [`Self::cells_cached`]：那个函数为了渲染空态，会顺带补 `ca_cmds` /
+    /// `ca_note`，取一个时间戳不值得付这个代价；而且缓存缺失时它返回的是空壳
+    /// （`scanned_at` 空串），要拿「有没有扫过」这个信号还得再判一次空串。
     pub fn cell_scan_at(&self) -> Option<String> {
         self.cells_cache()
             .map(|c| c.scanned_at)
@@ -277,6 +310,10 @@ impl Modem {
 }
 
 /// 归一化接入技术：`NR5G-SA` / `NR5G-NSA` / `NR5G` → `NR`。
+///
+/// 依据 Go `module/cell/cell.go:980` `NormalizeTech`：下划线与空格写法一并归一
+/// （芯讯通 `+CPSI` 报 `NR5G_SA`），否则整行会因「未知制式」被丢掉。
+/// 认不出的 token 原样大写返回，由调用方决定是否丢弃。
 pub fn normalize_tech(tok: &str) -> String {
     let s = tok.trim().to_ascii_uppercase().replace(['_', ' '], "-");
     match s.as_str() {
@@ -295,6 +332,9 @@ pub fn is_tech_token(tok: &str) -> bool {
 }
 
 /// 是否为显式 NR SA/NSA token（此类报文在 cellID 之后多一格 PCI）。
+///
+/// 依据 Go `module/cell/cell.go:998` `IsNRSA`：只有这串报文是
+/// cellID,PCI,TAC,ARFCN 顺序，漏判会把 PCI 读成 TAC。
 pub fn is_nrsa_token(tok: &str) -> bool {
     let s = tok.trim().to_ascii_uppercase().replace(['_', ' '], "-");
     s == "NR5G-SA" || s == "NR5G-NSA"
@@ -381,6 +421,16 @@ pub fn find_rsrp_token(f: &[String], start: usize) -> Option<usize> {
 }
 
 /// 从 RSRP 所在下标起按量纲解析 RSRP/RSRQ/RSSI/SINR。
+///
+/// 依据 Go `module/cell/cell.go:1044` `ApplySignalFields`：
+///
+/// - RSRP = `f[idx]`（调用方已确认落在 -156~-44 dBm）；
+/// - RSRQ 只认紧随其后且落在 -43~20 dB 的值；
+/// - 再后一格落在 -113~-25 dBm 的当 RSSI（比 RSRP 强，据此与 SINR 区分），
+///   此时再下一格是 SINR；否则这一格直接当 SINR（NR 与部分固件不给 RSSI）。
+///
+/// 之所以不硬编码下标：不同固件在 band 之后附加的字段个数不一致
+/// （有的带上/下行带宽、有的带 RSSI），硬编码会串位。
 pub fn apply_signal_fields(cell: &mut CellInfo, f: &[String], idx: usize) {
     cell.rsrp = to_i32(&f[idx]).unwrap_or(0);
     if let Some(v) = f.get(idx + 1).and_then(|s| to_i32(s)) {
@@ -513,6 +563,15 @@ pub fn parse_serving_cell(rest: &str, raw: &str) -> Option<CellInfo> {
 }
 
 /// 解析邻小区（`neighbourcell intra|inter`）。
+///
+/// 依据 Go `module/cell/cell.go:344` `parseNeighbourCell`。字段顺序**同一厂商不同
+/// 平台都反着来**，所以只有前两格（EARFCN / PCID）按位置取，信号值全靠量纲：
+///
+/// - RM502Q-GL：`…,"LTE",2452,155,-15,-103,-70,-,21,…` → RSRQ,RSRP,RSSI,SINR；
+/// - RM500U-CNV：`…,"LTE",2452,155,-118,-12,0,0,255,…` → RSRP,RSRQ,…。
+///
+/// 因此 RSRQ 要在 RSRP **前/后各试一格**；一个 RSRP 都找不到时只填 RSRQ，
+/// 绝不硬凑一个假 RSRP（前端会显示「—」，比显示错的值好）。
 pub fn parse_neighbour_cell(rest: &str, raw: &str, intra: bool) -> Option<CellInfo> {
     let f = csv(rest);
     if f.len() < 2 || !is_tech_token(&f[0]) {
@@ -643,6 +702,15 @@ pub fn parse_cell_lines(resp: &str) -> Vec<CellInfo> {
 }
 
 /// 解析 `+CPSI` 服务小区上报（裸数字频段那套写法）。
+///
+/// 依据 Go `module/cell/cell.go:339` `ParseCPSICell` 的**写法①**：
+/// `<tech>,<state>,<PLMN>,<cellID>,<ARFCN>,<PCI>,<band>,<bw>,…`。
+/// 每一项都做范围校验，任一不合法就整行放弃（宁可不显示也不显示错的数据）。
+///
+/// ⚠️ 上游还有**写法②**（SIMCom SIM8200，频段带名字：`NR5G_BAND78` /
+/// `EUTRAN-BAND5`，且字段以频率名为锚点定位，见 `cell.go:429`
+/// `parseCPSIBandNameLayout`）—— 本文件未移植，那种行会整行落空，
+/// 表现是该机型「服务小区为空」。补它属新增解析分支，见 A03 报告的风险项。
 pub fn parse_cpsi_cell(line: &str) -> Option<CellInfo> {
     let colon = line.find("CPSI:")?;
     let f = csv(&line[colon + 5..]);
@@ -778,7 +846,6 @@ fn band_no_of(label: &str) -> i32 {
 ///   （见 [`super::signal`]）；
 /// - `<rxlev>` 在三种制式下都与 `<rsrp>` 同表（手册明示），不重复取；
 /// - 邻区的 `<mcc>` / `<mnc>` 常为空，由 [`fill_neighbour_plmn`] 用服务小区补齐。
-
 // ====================== 鼎桥 MT5700 系列（^MONSC / ^MONNC / ^CELLSCAN）======================
 //
 // 三条鼎桥私有指令的解析。格式依据（按可信度排序）：
@@ -792,7 +859,7 @@ fn band_no_of(label: &str) -> i32 {
 //     （先 hex，越出 3GPP 上限且 dec 合法才用 dec），ARFCN 直接十进制；
 //   · `^CELLSCAN` 一行 15 个字段，band 是十六进制，测量值 99 = 无效，
 //     LTE 的 SINR 在第 14 列（LTERSINR）、NR 在第 13 列（5GRSINR）。
-
+///
 /// PCI 十六进制解析（带越界回退，移植自 luci-app-mt5700 `parsePciHex`）。
 ///
 /// 先按十六进制解析；仅当结果越出该制式上限、而十进制解释落在合法区间时才回退。
@@ -858,15 +925,6 @@ fn td_convert_sinr(raw: i32) -> i32 {
         -20 + raw / 5
     };
     v.clamp(-20, 30)
-}
-fn td_convert_rssi(raw: i32) -> i32 {
-    if raw == 0 {
-        -120
-    } else if raw >= 96 {
-        -25
-    } else {
-        -121 + raw
-    }
 }
 
 /// 解析一行 `^MONSC: …`（服务小区）。

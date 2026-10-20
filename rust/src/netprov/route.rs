@@ -90,7 +90,7 @@ pub fn parse_v6(text: &str) -> Vec<DefaultRoute> {
         }
         let dst = f[0];
         let dst_prefix = f[1];
-        if dst.trim_matches('0') != "" || dst_prefix != "00" {
+        if !dst.trim_matches('0').is_empty() || dst_prefix != "00" {
             continue; // 不是默认路由
         }
         // metric 在第 5 列（0 基），十六进制

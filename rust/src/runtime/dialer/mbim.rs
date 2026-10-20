@@ -283,8 +283,25 @@ fn ipv6_at(b: &[u8], off: usize) -> Option<String> {
 
 /// 解析 `IP_CONFIGURATION` 应答。
 ///
-/// 头部 14 个 u32（56 字节），之后是按 offset 索引的数据区；
+/// 依据 MBIM 1.0 §10.5.29 的 `IP_CONFIGURATION_INFO`，头部 14 个 u32（56 字节），
+/// 之后是按 offset 索引的数据区（offset 相对 info buffer 起点）：
+///
+/// | 偏移 | 字段 |
+/// | --- | --- |
+/// | 4 | IPv4ConfigurationAvailable（位图） |
+/// | 8 | IPv6ConfigurationAvailable（位图） |
+/// | 12 / 16 | v4 地址条数 / 偏移 |
+/// | 20 / 24 | v6 地址条数 / 偏移 |
+/// | 28 | v4 网关偏移 |
+/// | 32 | v6 网关偏移（**有意不读**：v6 网关交给 netifd 按 RA 处理） |
+/// | 36 / 40 | v4 DNS 条数 / 偏移 |
+/// | 44 / 48 | v6 DNS 条数 / 偏移 |
+/// | 52 | v4 MTU |
+///
 /// 可用性位图：bit0 地址、bit1 网关、bit2 DNS、bit3 MTU。
+///
+/// 长度约定：`info` 短于 56 字节直接返回空结构；每个地址条目按 `b.get(off..off+n)`
+/// 取，越界返回 `None` 而不是 panic —— 设备把条数写大时只丢多余条目。
 pub fn parse_ip_configuration(info: &[u8]) -> IpConfig {
     const HDR: usize = 56;
     if info.len() < HDR {
@@ -297,7 +314,6 @@ pub fn parse_ip_configuration(info: &[u8]) -> IpConfig {
     let v6_count = u32_at(info, 20) as usize;
     let v6_addr_off = u32_at(info, 24) as usize;
     let v4_gw_off = u32_at(info, 28) as usize;
-    let v6_gw_off = u32_at(info, 32) as usize;
     let v4_dns_count = u32_at(info, 36) as usize;
     let v4_dns_off = u32_at(info, 40) as usize;
     let v6_dns_off = u32_at(info, 48) as usize;
@@ -336,7 +352,8 @@ pub fn parse_ip_configuration(info: &[u8]) -> IpConfig {
             }
         }
     }
-    let _ = v6_gw_off;
+    // v6 网关（偏移 32）有意不读：对 v6 由 netifd 按 RA 取网关，
+    // 模组给的地址在这里写进上层只会与 RA 结果打架。
     cfg
 }
 

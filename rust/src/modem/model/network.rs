@@ -1,7 +1,15 @@
 //! 网络注册 / 接入信息（`GET /api/network`、`GET /api/network/status`）。
 //!
-//! 汇总：制式/频段（`AT+QNWINFO`）、注册状态（`AT+CREG?`/`AT+CGREG?`）、
-//! 激活上下文（`AT+CGCONTRDP`，给出当前 APN 与 IPv4 地址）。
+//! 汇总六路数据，口径与 Go `module/kernel/net.go:35` 的 `NetworkStatus` 对齐：
+//!
+//! | 字段 | 来源 | 说明 |
+//! | --- | --- | --- |
+//! | 制式 / 频段 | `AT+QNWINFO`（移远私有） | 不支持时回落 `AT+COPS?`（只给 PLMN 与 `<AcT>`） |
+//! | 注册状态 | `AT+CREG?`（CS）/ `AT+CGREG?`（PS） | 两者都未注册才补查 `AT+C5GREG?` → `AT+CEREG?` |
+//! | 当前 APN / 地址 | `AT+CGCONTRDP` | 按 cid 归并（同一上下文的 v4 / v6 可能被拆成两行） |
+//! | 服务小区 | 扫描缓存，没扫过才实时补一条 | 扫描要好几秒，不放在本路径触发 |
+//! | 载波聚合 | 按厂商挑指令实时查（见 `model/ca.rs`） | |
+//! | 飞行模式 | `AT+CFUN?` | 4 = 飞行模式 |
 
 use serde::Serialize;
 
@@ -18,10 +26,13 @@ use super::traffic::TrafficView;
 /// 简版网络信息（`GET /api/network`）。
 #[derive(Debug, Clone, Serialize)]
 pub struct NetworkInfo {
+    /// 运营商（模组上报名为空时退回 PLMN）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operator: Option<String>,
+    /// `AT+COPS?` 的接入技术原值（如 `"NR5G"`）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub act: Option<String>,
+    /// `AT+COPS?` 的原始应答（排查框要显示它）
     pub raw: String,
 }
 
@@ -34,6 +45,9 @@ pub struct NetworkStatus {
     pub net_tech: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tech_label: Option<String>,
+    /// 归一化的接入技术：`nr` / `lte` / `wcdma` / `gsm`（认不出就没有这个字段）。
+    ///
+    /// 取值来自 QNWINFO 的制式串，或 `AT+COPS?` 的 `<AcT>`（见 [`cops_act_tech`]）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tech: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -55,10 +69,16 @@ pub struct NetworkStatus {
     pub earfcn: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operator: Option<String>,
+    /// CS（电路域，`AT+CREG?`）与 PS（分组域，`AT+CGREG?`）的注册状态。
+    ///
+    /// `stat` 按 3GPP TS 27.007：`0` 未注册未在搜索、`1` 已注册本地、`2` 搜索中、
+    /// `3` 注册被拒绝、`4` 未知、`5` 已注册且漫游（见 `model/regstate.rs`）。
+    /// 数据业务看 `ps_reg`。
     pub cs_reg: RegState,
     pub ps_reg: RegState,
     /// 5GS 域注册状态：5G SA 下 CREG/CGREG 会长期停在 0,0（看着像「未注册」），
-    /// 真正的注册状态在 `+C5GREG` 里。**只在 CS/PS 都报未注册时才补查**。
+    /// 真正的注册状态在 `+C5GREG` 里。**只在 CS/PS 都报未注册时才补查**
+    ///（依据 Go `module/kernel/net.go:667-678`，实测 RM502Q-GL 上只有它有值）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reg_5g: Option<RegState>,
     /// EPS 域注册状态（5GS 也拿不到时的兜底）。
@@ -67,18 +87,25 @@ pub struct NetworkStatus {
     /// 服务小区（取自基站扫描缓存；没扫过就没有）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serving: Option<super::cells::CellInfo>,
+    /// 服务小区条数（取自扫描缓存）。没扫过、但已实时补到一条时为 1
+    ///（与 Go `module/kernel/net.go:773` 同一口径，避免出现「有 serving 却显示 0」）。
     pub serving_count: usize,
     pub neighbour_count: usize,
     /// 上面这些缓存数据的扫描时间（没扫过就没有）
     #[serde(skip_serializing_if = "String::is_empty")]
     pub scanned_at: String,
-    /// 载波聚合的分量载波（PCC + SCC）。当前数据面**只从扫描缓存取**，
-    /// 没有实现实时 `AT+QCAINFO` 解析，所以通常为空（前端按空态渲染）。
+    /// 载波聚合的分量载波（PCC + SCC），**实时查询**（指令按厂商挑，解析见 `model/ca.rs`）。
+    ///
+    /// 不能复用扫描缓存：否则会出现「频段是实时的 n78、CA 却是几分钟前扫到的 B3」
+    /// 这种自相矛盾的展示（依据 Go `module/kernel/net.go:679-687`）。
+    /// 模组不支持时 `ca` 为空、`ca_active` 为 false，前端按空态渲染。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ca: Vec<CcInfo>,
     pub ca_active: bool,
+    /// 当前**在用**的 APN（`AT+CGCONTRDP`，取第一个有数据的上下文）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub apn: Option<String>,
+    /// PDP 分配的 IPv4 / IPv6（双栈时两个都有）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ipv4: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -171,6 +198,11 @@ impl Modem {
         //
         // 只在 QNWINFO 没给出 PLMN 时才多发这一条 —— 指令可用的厂商不增加
         // 往返。`AT+CSPPLMN?` 在该机型同样回 ERROR，没有第二条兜底路。
+        //
+        // ⚠️ 与 Go 的**有意差异**：Go 的兜底触发条件是 `net_tech` 为空、且走的是
+        // **服务小区指令**（`module/kernel/net.go:651` `applyServingNetInfo`）；
+        // 本仓库按「QNWINFO 没给 PLMN」触发、走 `AT+COPS?`（FM350 实机上
+        // QNWINFO 回 ERROR 而 COPS 有值），服务小区兜底另有一路（见下面的 `serving`）。
         let cops = if info.plmn.is_none() {
             self.with_at_prio(Prio::Data, |p| p.command("AT+COPS?", self.cmd_timeout))
                 .ok()
@@ -224,12 +256,12 @@ impl Modem {
         if serving.is_none() {
             // 没扫过小区：概览页的「工作频段 / 物理频点」会是空的。
             // 单独问一次服务小区（1 条命令、优先级 Data），比让用户先点
-            // 「扫描基站」才看得到频段合理得多。
+            // 「扫描基站」才看得到频段合理得多（依据 Go `module/kernel/net.go:157`
+            // 的 `ensureServingCell`；那边同样只补小区详情，不覆盖 QNWINFO 的制式/频段）。
             serving = self.serving_cell_live();
         }
 
-        // 载波聚合：实时查一次（此前 `ca` / `ca_active` 是恒空占位）。
-        // 指令按厂商挑，解析见 model/ca.rs。手册标的耗时 < 1s，
+        // 载波聚合：实时查一次（指令按厂商挑，解析见 model/ca.rs）。手册标的耗时 < 1s，
         // 相对本函数已有的 6~8 条 AT 是可接受的增量；查询失败只是这两项为空，
         // 不会连累其余字段。
         let ca = self.ca_status();
@@ -245,9 +277,22 @@ impl Modem {
             "none".to_string()
         };
 
+        // 扫描缓存没数、但上面实时补到了一条 ⇒ 记 1（口径见字段注释）
+        let serving_count = if cells.serving_count == 0 && serving.is_some() {
+            1
+        } else {
+            cells.serving_count
+        };
+
         // 飞行模式：CFUN 原值同时给页面（4 = 飞行模式）
         let air = self.airplane();
-        let duplex = f.net_tech.as_deref().map(duplex_of);
+        // 认不出双工时**不给这个字段**（空串也算一种值，前端会渲染成空白 pill）。
+        // 依据 Go `module/kernel/net.go:641`：那边只在非空时才写 `Duplex`。
+        let duplex = f
+            .net_tech
+            .as_deref()
+            .map(duplex_of)
+            .filter(|d| !d.is_empty());
         let cfun = if air.supported {
             if air.enabled {
                 4
@@ -277,6 +322,10 @@ impl Modem {
                 Some(l)
             }
         });
+        // ⚠️ 与 Go 的**有意差异**：Go 在这里填 `BandTextFor(tech, band)`
+        // （`module/kernel/net.go:186`，形如 `NR5G BAND 78`），本仓库填一句中文说明 ——
+        // 这一栏在页面上直接显示，写清「值来自服务小区、本机不支持 QNWINFO」
+        // 比再显示一个和 `band_label` 重复的串更有排查价值。
         let band_text = f.band_text.or_else(|| {
             band_label
                 .as_ref()
@@ -316,12 +365,11 @@ impl Modem {
             reg_5g,
             reg_eps,
             serving,
-            serving_count: cells.serving_count,
+            serving_count,
             neighbour_count: cells.neighbour_count,
             // 没扫过就是空串（cells_cached 的空结果不带时间戳）
             scanned_at: self.cell_scan_at().unwrap_or_default(),
-            // 实时 CA 查询（此前这两项是恒空占位）：指令按厂商挑，
-            // 解析见 model/ca.rs（广和通那段照官方手册 §11.1.16）
+            // 实时 CA 查询，解析见 model/ca.rs（广和通那段照官方手册 §11.1.16）
             ca: ca.as_ref().map(|c| c.ccs.clone()).unwrap_or_default(),
             ca_active: ca.as_ref().map(|c| c.ca_active).unwrap_or(false),
             apn,
@@ -337,7 +385,11 @@ impl Modem {
         }
     }
 
-    /// 当前激活上下文的 APN / 地址（`AT+CGCONTRDP`）。
+    /// 当前激活上下文的 APN / 地址（`AT+CGCONTRDP`，依据 Go `module/kernel/net.go:689`）。
+    ///
+    /// 与 Go 的差异：Go 的 APN 走 `QueryAPN`（`AT+CGDCONT?` + `AT+CGCONTRDP`）、
+    /// 地址走 `AT+CGPADDR` 两条指令；本仓库只用 `AT+CGCONTRDP` 一条 ——
+    /// 它同时带 APN 与地址，且实测展锐之外的大多数固件都支持。
     fn query_active_context(&self) -> (Option<String>, Option<String>, Option<String>) {
         let resp = self
             .with_at_prio(Prio::Data, |p| p.command("AT+CGCONTRDP", self.cmd_timeout))
@@ -441,8 +493,8 @@ pub fn parse_qnwinfo(resp: &str) -> QnwInfo {
     let f = csv(&field);
     out.tech = f.first().filter(|s| !s.is_empty()).cloned();
     if let Some(plmn) = f.get(1).filter(|s| !s.is_empty()) {
-        out.mcc = Some(plmn.chars().take(3).collect());
-        out.mnc = Some(plmn.chars().skip(3).collect());
+        out.mcc = Some(plmn_mcc(plmn));
+        out.mnc = Some(plmn_mnc(plmn));
         out.plmn = Some(plmn.clone());
     }
     out.band_text = f.get(2).filter(|s| !s.is_empty()).cloned();
@@ -576,11 +628,13 @@ fn operator_display(
 /// `0/1/3`=GSM；`8~10` 是 CDMA/EVDO 与 IoT 制式，本包不显示。
 ///
 /// ⚠️ **别照 FM350 AT 手册 v2.2 的表写**：那张表是 2021 年的，NG-RAN 还没入表，
-/// 它把 `11/12` 写成 eMTC/NB-IoT。实机（固件 <固件版本>）注册在
-/// NR n78 时 `AT+COPS?` 回 `+COPS:0,2,"46011",11` —— 此固件 `11` 就是 NG-RAN。
+/// 它把 `11/12` 写成 eMTC/NB-IoT。实机（FM350-GL）注册在 NR n78 时
+/// `AT+COPS?` 回 `+COPS:0,2,"46011",11` —— 此固件 `11` 就是 NG-RAN。
 ///
 /// 已知限制：NR NSA 下模组常以 LTE 注册，`<AcT>` 报 `7`，这里只能照报，
-/// 不猜「其实是 5G」。
+/// 不猜「其实是 5G」。（3GPP 的 `13` = EN-DC 双连接目前也走这条「不猜」的规矩，
+/// 与 Go `module/kernel/net.go:307` 的 `ratFromACT` 不同 —— 那边把 13 显示成
+/// 「5G NR (NSA)」。要不要跟，见 A05 报告的「风险与未决」。）
 fn cops_act_tech(act: i32) -> Option<&'static str> {
     match act {
         0 | 1 | 3 => Some("gsm"),
