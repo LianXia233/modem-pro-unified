@@ -58,7 +58,14 @@ const PROBE_WARMUP_SECS: u64 = 90;
 
 fn note_probe_failed(path: &str, young: bool) {
     let mut g = negative().lock().unwrap_or_else(|e| e.into_inner());
-    let tries = g.get(path).map(|n| n.tries + 1).unwrap_or(1);
+    // 预热期内每次失败都算「第一次」（上游 Go 版 `nonATNextProbe` 同口径：
+    // 年轻期清零 tries，出预热期从退避基值重新数）。不然刚插上的慢启动模组
+    // 会把 90 秒里攒下的高 tries 带出预热期，成年后第一次失败就直接 240s。
+    let tries = if young {
+        1
+    } else {
+        g.get(path).map(|n| n.tries + 1).unwrap_or(1)
+    };
     let backoff = Duration::from_secs(backoff_secs(tries, young));
     g.insert(
         path.to_string(),
@@ -205,6 +212,29 @@ mod tests {
         assert_eq!(backoff_secs(1, true), 15);
         assert_eq!(backoff_secs(6, true), 15);
         assert_eq!(backoff_secs(99, true), 15);
+    }
+
+    /// 年轻期的失败不计入 tries：出预热期后第一次失败仍从基值 15s 起
+    /// （上游 Go 版 `nonATNextProbe` 同口径：年轻期清零）。
+    #[test]
+    fn young_failures_do_not_leak_into_adult_backoff() {
+        let path = "/dev/ttyTEST_young";
+        note_probe_failed(path, true);
+        note_probe_failed(path, true);
+        note_probe_failed(path, true);
+        note_probe_failed(path, true);
+        {
+            let g = negative().lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(g[path].tries, 1, "年轻期每次失败都算第一次");
+        }
+        // 出预热期后第一次失败：tries 1→2，退避 30s（基值 15 的翻倍），
+        // 而不是被年轻期攒下的 4 次直接打到 120s。
+        note_probe_failed(path, false);
+        {
+            let g = negative().lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(g[path].tries, 2);
+        }
+        prune_negative(&BTreeSet::new());
     }
 
     /// `discover_new` 在没有串口的机器上必须返回空（CI/开发机）。
