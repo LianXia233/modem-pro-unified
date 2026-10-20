@@ -214,6 +214,32 @@ VID `2c7c`、实机 `2c7c:0125`、型号 `QDC507GLEFM21`、ECM + DHCP 供址、
   本项目同样不发（注释已记录依据）。
 - `wds_runtime` 注释改为精确描述（不再笼统写"与 quectel-CM 相同"）。
 
+### 对照 Siriling 多驱动补齐两处识别缺口（RMNET / GobiNet / MHI / PCIe）
+
+来源 [Siriling/5G-Modem-Support](https://github.com/Siriling/5G-Modem-Support)
+@ `b1d9a12`（GPL-3.0，只取事实依据）。逐条对照结论见
+`docs/UPSTREAM_AUDIT.md` §9。
+
+- **认 `fibo_mhi` 驱动**：`PCIE_MODEM_DRIVERS` / `pci_driver_is_mhi` 新增
+  `fibo_mhi`（广和通厂外树 MHI，模块名既不 `mhi*` 也不是 `pcie_mhi`，
+  原来会被当无线网卡漏掉）。
+- **认 Fibocom MHI 数据网卡名**：`is_likely_mhi_face` 新增 `pcie_mhi*` /
+  `pcie_swip*` 前缀（`mhi_netdev.c` 的 `interface_name`）。
+- `qmap_size()` 注释校正：qmi_wwan_q / qmi_wwan_f 只暴露**每网卡**
+  `qmap_size` 属性（USB ID 表取值，USB3 缺省 16 KiB），原注释所称的
+  「模块参数」在两份源码里均不存在，该路径降级为防御性保留。
+- siriling 自带的 fibocom-dial 与 §8 核对过的另一份拷贝 TLV 编号完全一致，
+  QMI 编号结论再获独立佐证。
+- SRPD / 展锐 PCIe（`sprd_pcie`、VID `0x16c3`、sipc 栈）无 QMI/MBIM 控制面，
+  **不做**（记录在案）；GobiNet / qmi_wwan_q / qmi_wwan_f / `rmnet_mhi0`
+  命名均为已覆盖项。
+
+**质量**：`cargo fmt --check` 干净；`cargo clippy --all-targets --locked` 0 warning；
+`cargo test --locked` **754 passed / 0 failed**（新增 1：Fibocom MHI 网卡名识别；
+OpenVohive 批次的 v6 运行时回填并入既有端到端用例）；`cargo build --locked` 通过。
+`docs/SUPPORT_MATRIX.md` 同步更新：92 型号 / 13 厂商、qdc507 入表、
+新增「支持程度五级」（收录 / 识别 / 后端 / 自动化 / 实机；实机级 0）。
+
 ## [1.0.3] - 2026-10-20
 
 ### 文档：补齐上游致谢（只列参考过的仓库）

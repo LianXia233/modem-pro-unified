@@ -16,12 +16,15 @@ use super::vendor::Vendor;
 ///   · `mhi_pci_generic` / `mhi_pci`  高通 MHI（SDX55/65/72/75 全系）
 ///   · `mtk_t7xx` / `t7xx_pci`        联发科 T7xx（FM350-GL PCIe 版 / T700 系）
 ///   · `pcie_mhi`                     某些 BSP 里的老名字
+///   · `fibo_mhi`                     广和通厂外树 MHI（Siriling/5G-Modem-Support
+///     `fibocom_MHI`，`obj-m := fibo_mhi.o`，PKG_NAME `pcie_mhi_fb`）
 ///
 /// ⚠️ 判据必须是「驱动」而不是「VID」（17cb 同时也是高通无线网卡 ath11k/ath12k 的 VID）。
 pub const PCIE_MODEM_DRIVERS: &[&str] = &[
     "mhi_pci_generic",
     "mhi_pci",
     "pcie_mhi",
+    "fibo_mhi",
     "mtk_t7xx",
     "t7xx_pci",
 ];
@@ -311,12 +314,12 @@ fn pci_driver_of(dir: &std::path::Path) -> String {
         .unwrap_or_default()
 }
 
-/// 高通 MHI 系驱动。
+/// 高通 / 广和通 MHI 系驱动（含厂外树 `fibo_mhi`）。
 // 仅 unix 路径与单测使用：非 unix 平台别报「未用」。
 #[cfg_attr(not(unix), allow(dead_code))]
 fn pci_driver_is_mhi(driver: &str) -> bool {
     let d = driver.trim().to_lowercase();
-    d.starts_with("mhi") || d == "pcie_mhi"
+    d.starts_with("mhi") || d == "pcie_mhi" || d == "fibo_mhi"
 }
 
 /// 是不是「模组专用」的 PCIe 驱动。
@@ -345,11 +348,22 @@ pub fn pcie_looks_like_modem(driver: &str, vid: &str, class: &str) -> bool {
 }
 
 /// 是不是「模组交出来的数据网卡」名（MHI / rmnet / wwan）。
+///
+/// 覆盖三种命名来源：
+///   · 树内 / 高通系：`wwan*`、`rmnet*`（移远厂外树 MHI 的数据口就叫
+///     `rmnet_mhi0`，`luci-app-pcimodem` 的 init 脚本写死这个名字）；
+///   · 树内 MHI：`mhi*`；
+///   · 广和通厂外树 MHI（`fibo_mhi`）：数据口叫 `pcie_mhi*` / `pcie_swip*`
+///     （`fibocom_MHI/src/devices/mhi_netdev.c` 的 `interface_name`）。
 // 仅 unix 路径与单测使用：非 unix 平台别报「未用」。
 #[cfg_attr(not(unix), allow(dead_code))]
 fn is_likely_mhi_face(name: &str) -> bool {
     let n = name.to_lowercase();
-    n.starts_with("wwan") || n.starts_with("rmnet") || n.starts_with("mhi")
+    n.starts_with("wwan")
+        || n.starts_with("rmnet")
+        || n.starts_with("mhi")
+        || n.starts_with("pcie_mhi")
+        || n.starts_with("pcie_swip")
 }
 
 /// 路径里有没有这个 PCI 地址（BDF 在 sysfs 路径里一定是完整的段）。
@@ -550,7 +564,9 @@ mod tests {
     fn pci_id_and_driver() {
         assert_eq!(normalize_pci_id("0x17CB"), "17cb");
         assert!(pci_driver_is_mhi("mhi_pci_generic"));
+        assert!(pci_driver_is_mhi("fibo_mhi")); // 广和通厂外树 MHI
         assert!(pci_driver_is_modem_driver("mtk_t7xx"));
+        assert!(pci_driver_is_modem_driver("fibo_mhi"));
         assert!(!pci_driver_is_modem_driver("ath11k"));
     }
 
@@ -564,6 +580,20 @@ mod tests {
         assert!(pcie_looks_like_modem("", "17cb", "0x0b40"));
         // 没绑驱动但 VID 不在表里 ⇒ 不是
         assert!(!pcie_looks_like_modem("", "1234", "0x0b40"));
+    }
+
+    #[test]
+    fn fibocom_mhi_faces_are_recognised() {
+        // 广和通厂外树 MHI 的数据网卡名（mhi_netdev.c 的 interface_name）
+        assert!(is_likely_mhi_face("pcie_mhi0"));
+        assert!(is_likely_mhi_face("pcie_swip0"));
+        // 移远厂外树 MHI / 树内命名照旧命中
+        assert!(is_likely_mhi_face("rmnet_mhi0"));
+        assert!(is_likely_mhi_face("wwan0"));
+        assert!(is_likely_mhi_face("mhi_wwan0"));
+        // 普通网卡不误判
+        assert!(!is_likely_mhi_face("eth0"));
+        assert!(!is_likely_mhi_face("pcie0"));
     }
 
     #[test]

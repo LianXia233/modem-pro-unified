@@ -371,7 +371,14 @@ fn resolve_pdn(device: &str, cfg: i64, qmap_mode: i64) -> i64 {
     }
 }
 
-/// 聚合窗口：驱动 `qmap_size`（父口上没有就看数据口），读不到交给缺省。
+/// 聚合窗口：驱动每网卡的 `qmap_size` 属性（父口上没有就看数据口），
+/// 读不到交给缺省。
+///
+/// 依据：`qmi_wwan_q` / `qmi_wwan_f` 都把窗口做成**每网卡** sysfs 属性
+/// （`DEVICE_ATTR(qmap_size)`），不是模块参数；取值来自驱动 USB ID 表
+/// （如 16 KiB / 31 KiB，USB3 缺省 16 KiB）。下面的模块参数路径是防御性
+/// 保留（当前核对的这两个驱动都没有该参数），命中不了也不影响——
+/// 最终值还会被 WDA Set Data Format 应答回读覆盖。
 fn qmap_size(parent: &str, device: &str) -> u32 {
     for dev in [parent, device] {
         if let Ok(s) = std::fs::read_to_string(format!("/sys/class/net/{dev}/qmap_size")) {
@@ -380,7 +387,7 @@ fn qmap_size(parent: &str, device: &str) -> u32 {
             }
         }
     }
-    // 部分驱动把参数挂在模块参数上（qmi_wwan_q / qmi_wwan_f）
+    // 防御：个别驱动分支可能把窗口挂成模块参数
     for p in [
         format!("/sys/class/net/{parent}/device/driver/module/parameters/qmap_size"),
         "/sys/module/qmi_wwan_q/parameters/qmap_size".to_string(),

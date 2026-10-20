@@ -277,7 +277,48 @@ Bind Mux Data Port（`0x00A2`）：`0x10` 端点（8 字节）、`0x11` mux id
 
 ---
 
-## 9. 上游致谢
+## 9. 追加审计（2026-10-21 续二）：Siriling 多驱动（RMNET / GobiNet / MHI / PCIe）
+
+参考仓库 [Siriling/5G-Modem-Support](https://github.com/Siriling/5G-Modem-Support)
+HEAD `b1d9a12`（各子包 GPL-3.0，**只取事实依据、未拷贝代码**）。它是一个
+OpenWrt 包集合：6 个内核驱动包（`gobinet` / `pcie_mhi` / `pcie_mhi_fb` /
+`qmi_wwan_q` / `qmi_wwan_f` / `sprd_pcie`）、2 个拨号工具
+（`quectel_cm_5G` / `fibocom-dial`）、若干 LuCI 应用。本轮把它与
+`rust/src/modem/pcidev.rs`、`rust/src/runtime/dialer/native/mod.rs`
+的驱动识别 / 网卡命名 / QMAP 窗口口径逐条对照。
+
+### 9.1 已被本仓库覆盖（核对通过，无需改动）
+
+| Siriling 侧事实 | 来源 | 本仓库对应 |
+| --- | --- | --- |
+| 移远厂外树 MHI 数据网卡叫 `rmnet_mhi`，`luci-app-pcimodem` init 脚本写死 `-i rmnet_mhi0` | `quectel_MHI/src/devices/mhi_netdev.c:615`；`luci-app-pcimodem/root/etc/init.d/pcimodem` | `is_likely_mhi_face` 的 `rmnet` 前缀 |
+| MHI 控制口节点名 `mhi_<通道名>`（`mhi_QMI0` 等） | 两个 MHI 驱动的 `device_create(..., "mhi_%s...")` | `pcie_qmi_control_candidates` 的 `mhi_*QMI*` 等 glob |
+| GobiNet 走自己的数据格式、拨号器显式跳过 WDA | `gobinet` 包（GobiUSBNet.c） | `ControlKind::GobiNet` + `find_gobinet` + `qmap_settings` 的 `handles_data_format` 门 |
+| `qmi_wwan_q` / `qmi_wwan_f` 的 QMAP 版本 5、每网卡 `qmap_size` 属性、USB3 缺省 16 KiB | `qmi_wwan_q.c` / `qmi_wwan_f.c` 的 `DEVICE_ATTR(qmap_size)`、`qmap_version = 5` | `QMAP_VERSION=0x05`；`qmap_size()` 先读每网卡属性；缺省 16 KiB |
+| fibocom-dial 的 WDS TLV 编号（`0x30` 技术偏好 / `0x14` APN / `0x17` `0x18` / `0x16` 认证 / `0x19` IP 族）、GetRuntimeSettings mask 四位、BindMux `0x10/0x11/0x13` | siriling 自带 `fibocom-dial/src/QMIThread.c` 与 `MPQMUX.h` | 与 §8.1–§8.3 结论**再次一致**（第二份独立拷贝），我方编号无需改动 |
+
+### 9.2 本轮实改（2 处识别缺口 + 1 处注释依据，均有测试）
+
+| # | 改动 | 上游依据 |
+| --- | --- | --- |
+| S1 | **认 `fibo_mhi` 驱动**：`PCIE_MODEM_DRIVERS` 与 `pci_driver_is_mhi` 新增 `fibo_mhi`——广和通厂外树 MHI 既不以 `mhi` 开头也不是 `pcie_mhi`，原来会被当成无线网卡漏掉 | `fibocom_MHI/src/Makefile` `obj-m := fibo_mhi.o`（PKG_NAME `pcie_mhi_fb`） |
+| S2 | **认 Fibocom MHI 数据网卡名**：`is_likely_mhi_face` 新增 `pcie_mhi*` / `pcie_swip*` 两个前缀 | `fibocom_MHI/src/devices/mhi_netdev.c:1249-1253` 的 `interface_name` |
+| S3 | **`qmap_size()` 注释校正**：原注释称 qmi_wwan_q / qmi_wwan_f 把窗口挂成**模块参数**，两处源码证明它们只暴露**每网卡**属性（取值来自 USB ID 表，如 16/31 KiB）；模块参数路径降级为「防御性保留」并注明最终值会被 WDA 应答回读覆盖 | `qmi_wwan_q.c:448` / `qmi_wwan_f.c:372` 的 `DEVICE_ATTR(qmap_size)`；`qmi_wwan_q.c:2141` 的 ID 表取值 |
+
+新增测试 `fibocom_mhi_faces_are_recognised`（网卡名）并扩充
+`pci_id_and_driver`（驱动名）。
+
+### 9.3 有意不做（范围外，记录在案）
+
+| 项 | 结论 |
+| --- | --- |
+| SRPD / 展锐 PCIe（`sprd_pcie` / `mcd`，VID `0x16c3`，sipc/sblock 通道栈） | **不做**：没有 QMI/MBIM 控制面，本仓库的原生拨号器（QMI/MBIM）与 AT 配方都不适用；强认只会让设备「可见但不可用」。真要做是独立后端，超出本次整合范围 |
+| `quectel_cm_5G` | 与已审计的 quectel-CM 同源，无新口径 |
+| 各 LuCI 应用（hypermodem / usbmodem / pcimodem / gobinetmodem / spdmodem） | 它们是「整套 UI」，本仓库是 modemd + LuCI 前端架构，无可借鉴契约；`pcimodem` 仅用于确认 `rmnet_mhi0` 命名（见 §9.1） |
+
+---
+
+## 10. 上游致谢
 
 本项目在开发过程中参考了以下仓库（按对齐基准排序）：
 
@@ -290,6 +331,7 @@ Bind Mux Data Port（`0x00A2`）：`0x10` 端点（8 字节）、`0x11` mux id
 | [6106757-lab/openvohive](https://github.com/6106757-lab/openvohive) | QMI/MBIM 会话边界对照基准：WDS Start/Stop/Runtime、WDA Set Data Format、Bind Mux 的 TLV 编号与流程；据此修正 IPv6 运行时设置缺口（§8.4） | PolyForm Noncommercial 1.0.0（仅参考，未拷贝） |
 | [hchyhchyxh/luci-app-rg501q-eu](https://github.com/hchyhchyxh/luci-app-rg501q-eu) | RG501Q-EU（`2c7c:0800`）的 USB 接口号口径（AT 口 1.2/1.3、QMI 1.4）、不绑 option 驱动的端口规则；据此新增 `modem_ports.json` 条目 | Apache-2.0（仅事实依据，未拷贝） |
 | [ainuoyan/QDC507-Modem-Support](https://github.com/ainuoyan/QDC507-Modem-Support) | 百旺 QDC507（`2c7c:0125`）识别口径与移远方言 AT、`AT+QCFG="nwscanmodeex"` 位标志、通用 `CGACT` 拨号配方；据此新增 baiwang 厂商模块 | GPL-3.0（仅事实依据，未拷贝） |
+| [Siriling/5G-Modem-Support](https://github.com/Siriling/5G-Modem-Support) | 多驱动（RMNET / GobiNet / MHI / PCIe）拨号工具与 LuCI 应用的差异清单（审计中） | GPL-3.0（仅参考，未拷贝） |
 
 **厂商拨号器 C 源码（quectel-CM / fibocom-dial / meig-cm / simcom-cm 等）不在致谢范围**：
 内置 QMI / MBIM 拨号器是本仓库的独立 Rust 实现，未使用、未拷贝任何厂商 C 源码；
