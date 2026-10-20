@@ -52,6 +52,16 @@ function pull() {
 		state.ready = true;
 		state.snapshot = snap;
 		state.modems = (snap && snap.modems) || [];
+		/* 保存的 id 已不在清单里（USB 重新枚举 / 模组重启后 id 会变）：跟着
+		   快照给的实际 id 或第一台走，否则后续所有按 id 的请求都 404，
+		   页面整页渲染失败（实测：id 0 → 1 之后 dial 页直接崩）。 */
+		if (state.modemId != null && state.modems.length &&
+		    !state.modems.some(function (m) { return m.id === state.modemId; })) {
+			state.modemId = (snap && snap.modem_id != null && state.modems.some(function (m) { return m.id === snap.modem_id; }))
+				? snap.modem_id
+				: state.modems[0].id;
+			try { window.sessionStorage.setItem('modemd.modemId', String(state.modemId)); } catch (e) {}
+		}
 		if (snap && snap.modem_id != null)
 			state.modemId = snap.modem_id;
 		state.lastUpdate = Date.now();
@@ -60,6 +70,16 @@ function pull() {
 	}).catch(function (e) {
 		busy = false;
 		state.err = e.message || String(e);
+		/* 保存的 id 拉不到快照（模组重启中 / 已重新枚举）：清掉保存值，
+		   立即不带 id 重试一次（后端回落到默认模组）。只清一次 ——
+		   防止真故障（无模组）时陷入高频重试循环。 */
+		if (state.modemId != null && /not found|未找到/i.test(state.err)) {
+			state.modemId = null;
+			try { window.sessionStorage.removeItem('modemd.modemId'); } catch (e2) {}
+			schedule.call(null);
+			window.setTimeout(pull, 0);
+			return;
+		}
 		notify();
 		schedule();
 	});

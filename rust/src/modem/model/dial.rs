@@ -1884,16 +1884,30 @@ impl Modem {
                     s.ipv6 = v6.to_string();
                 }
             }
-            // 主机侧网卡是本地枚举，顺手看看有没有新出现的（主机侧拨号器起来后才有地址）。
-            // 只在拨过号时做：idle 时枚举出来的只是板载口，写进状态会误导页面。
+            // 主机侧网卡只做「归属校验」：记录里的网卡必须是**这个模组 USB
+            // 设备下的**，不是就换成 USB 枚举里的（优先 QMAP mux 口）。
+            //
+            //    早先是 `pick_dial_iface(猜名快照)`—— 实机把 SoC 有线口 eth1
+            //    覆盖进了 host_iface，页面带着主路由的地址冒充模组链路。
+            //    另外这里也顺带把「空的就补上」覆盖了（主机侧拨号器起来后
+            //    网卡才出现；idle 时不进来，避免板载口混入）。
             if s.state != DIAL_CONNECTED && s.state != DIAL_DIALING {
                 return;
             }
-            if let Some(iface) = pick_dial_iface(&dial_iface_snapshot()) {
-                if iface.name != s.host_iface {
-                    s.host_iface = iface.name;
-                    s.host_ips = iface.addr;
-                }
+            let names = usb_netifs_for_port(&self.port());
+            if names.is_empty() {
+                return; // 模组 USB 下没有任何网卡：维持现状，不猜
+            }
+            let belongs = names.iter().any(|n| *n == s.host_iface);
+            if !belongs || s.host_iface.trim().is_empty() {
+                let pick = names
+                    .iter()
+                    .find(|n| crate::netprov::provision::qmap_mode(n) == 1)
+                    .unwrap_or(&names[0]);
+                s.host_iface = pick.clone();
+                s.host_ips = iface_addrs_cached(pick);
+            } else if s.host_ips.is_empty() {
+                s.host_ips = iface_addrs_cached(&s.host_iface);
             }
         });
     }
@@ -2210,20 +2224,30 @@ impl Modem {
             Err(e) => self.dial_step("读取本机地址（AT+CGPADDR）", false, &e.to_string()),
         }
 
-        // ④ 找主机侧网卡（纯本机枚举，不发 AT；只是提示）
-        if let Some(iface) = pick_dial_iface(&dial_iface_snapshot()) {
-            let mut note = iface.name.clone();
-            if !iface.strong {
-                note += "（按名字猜的，供参考）";
-            }
+        // ④ 找主机侧网卡：**只认这个模组 USB 设备下的网卡**，绝不按名字猜。
+        //
+        //    早先走 `pick_dial_iface(&dial_iface_snapshot())` 的名字匹配，
+        //    实机翻车：RNDIS 模组的数据口是 eth2（挂在模组 USB 接口上），
+        //    而名字匹配把 SoC 有线口 eth1 认了进去 —— 页面「主机网卡接口 /
+        //    已分配 IPv4」显示的是主路由 LAN 的 eth1 + 192.168.88.x，
+        //    与模组毫无关系。数据口一定挂在模组自己的 USB 接口上，
+        //    `usb_netifs_for_port` 按 sysfs 归属枚举，天然排除了板载口。
+        let usb_names = usb_netifs_for_port(&self.port());
+        let usb_pick = usb_names
+            .iter()
+            .find(|n| crate::netprov::provision::qmap_mode(n) == 1)
+            .or_else(|| usb_names.first());
+        if let Some(n) = usb_pick {
+            let mut note = n.clone();
             // 少数机型（FM350 系列）模组侧 DHCP 很慢/不稳：可能要手工配一次网卡 IP
             if let Some(quirk) = host_nic_quirk(self.model_raw().unwrap_or_default().as_str()) {
                 note += &format!("；⚠️ {quirk}");
             }
-            self.dial_step("主机侧网卡候选", true, &note);
+            let addrs = iface_addrs_cached(n);
+            self.dial_step("主机侧网卡（模组 USB 设备下）", true, &note);
             self.dial_update(|s| {
-                s.host_iface = iface.name;
-                s.host_ips = iface.addr;
+                s.host_iface = n.clone();
+                s.host_ips = addrs;
             });
         } else {
             self.dial_step(

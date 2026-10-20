@@ -151,15 +151,21 @@ pub fn provision_modem_with(
     // 350 系列（FM350 / RW350）的 USB 网卡不发 DHCP ⇒ 用模组上报的地址直接配 static
     // （参考实现同口径：RNDIS 点对点，地址可直接落在主机网卡上）。
     // 只在 dhcp 模式下改（modem_pro 由 netifd 协议自己取地址）；拿不到地址就维持原模式。
-    let static_ipv4 = if matches!(mode, crate::config::WanMode::Dhcp)
+    // 350 系列怪癖转换覆盖 **dhcp 与 modem_pro 两种模式**：
+    // modem_pro 的 v4 也是跑 udhcpc（mp-client wrapper），而 FM350 的模组内
+    // DHCP 服务器实测长期无响应（broadcast discover 无 offer）——
+    // 不转换的话 modem_pro 模式在 350 系列上永远拿不到 v4 地址。
+    let static_ipv4 = if matches!(mode, crate::config::WanMode::Dhcp | crate::config::WanMode::ModemPro)
         && crate::runtime::hostnic::quirk(&modem.model().unwrap_or_default()).0
     {
-        let ip = modem.dial_state_ipv4();
-        if ip.is_empty() {
-            modem.query_own_ipv4().unwrap_or_default()
-        } else {
-            ip
-        }
+        // **实时查询优先**：拨号状态/缓存里的地址可能是上一条会话的
+        // （重拨后地址会变，实测踩过），拿到新会话地址才算数；查不到
+        // 再退回状态缓存（离线排障时至少有迹可循）。
+        let ip = match modem.query_own_ipv4() {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => modem.dial_state_ipv4(),
+        };
+        ip
     } else {
         String::new()
     };

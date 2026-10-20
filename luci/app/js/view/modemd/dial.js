@@ -64,6 +64,8 @@ return view.extend({
 		var autoWan = dial.auto_wan;
 		var id = dial.modem_id != null ? dial.modem_id : (snap.modem_id != null ? snap.modem_id : 0);
 
+		/* RNDIS / ECM / NCM = AT 数据面（模组自带 USB 网卡，主机侧无需拨号器）*/
+		var atPlane = (st.kind === 'rndis' || st.kind === 'ecm' || st.kind === 'ncm');
 		var isConnected = st.state === 'connected';
 		var isDialing = st.state === 'dialing';
 		var statusText = st.state_text || st.state || '未拨号';
@@ -422,7 +424,11 @@ return view.extend({
 							E('span', { 'innerHTML': icons.chip('running', 17) }),
 							'内置原生拨号后端'
 						]),
-						E('span', { 'class': 'mp-badge ' + (hostDialer ? 'mp-badge-success' : 'mp-badge-muted') }, hostDialer ? hostDialer.backend : '未运行')
+						/* 徽标按数据面给准确语义（atPlane 在 render 顶部算好）：RNDIS/ECM/NCM 的
+   数据面是模组自带的 USB 网卡，主机侧**本来就不需要**拨号器 ——
+   「未运行」会让人以为坏了。 */
+E('span', { 'class': 'mp-badge ' + (hostDialer ? 'mp-badge-success' : (atPlane ? 'mp-badge-primary' : 'mp-badge-muted')) },
+  hostDialer ? hostDialer.backend : (atPlane ? '无需主机侧拨号器' : '未运行'))
 					]),
 					hostDialer ? E('div', { 'class': 'mp-kv-grid', 'style': 'grid-template-columns:1fr' }, [
 						rowKv('拨号架构', hostDialer.plan || hostDialer.backend),
@@ -432,7 +438,12 @@ return view.extend({
 						rowKv('DNS 服务器', (hostDialer.dns || []).join(', ') || '-'),
 						rowKv('QMAP 绑定', hostDialer.qmap ? ('mux_id=' + hostDialer.qmap.mux_id + ' · v' + hostDialer.qmap.qmap_version) : '未启用')
 					]) : E('div', { 'style': 'padding:20px 0;text-align:center;color:var(--mp-neutral-500);font-size:13px' },
-						'当前采用 AT/ECM/RNDIS 模式，或 QMI/MBIM 内置拨号器尚未建立会话。')
+						atPlane
+							? ('当前模组走 ' + (st.type_name || st.kind).toString().toUpperCase() +
+							   ' 数据面：数据链路就是模组自带的 USB 网卡，主机侧不需要拨号器 —— ' +
+							   'modemd 直接用 AT 建立数据会话（含 30 秒自动重拨守护）。' +
+							   '内置原生拨号后端只在 QMI / MBIM 模式下接管数据呼叫。')
+							: 'QMI / MBIM 模式：内置原生拨号器将在 15 秒内自动接管并建立数据呼叫。')
 				])
 			]),
 
@@ -468,6 +479,8 @@ return view.extend({
 						}, [ E('span', { 'innerHTML': icons.refresh(12) }), ' 新增 APN' ])
 					])
 				]),
+				/* 6 列在窄容器必然超宽：套滚动容器（与 cells 页同款），列不被压扁、超出横向滚 */
+				E('div', { 'class': 'mp-table-scroll' }, [
 				E('table', { 'class': 'mp-table' }, [
 					E('thead', {}, [
 						E('tr', {}, [
@@ -475,7 +488,7 @@ return view.extend({
 							E('th', {}, 'APN 接入点'),
 							E('th', {}, 'PDP 协议'),
 							E('th', {}, '链路状态'),
-							E('th', {}, '默认'),
+							E('th', {}, '备注'),
 							E('th', { 'style': 'text-align:right' }, '操作')
 						])
 					]),
@@ -558,6 +571,7 @@ return view.extend({
 							E('td', { 'colspan': 6, 'style': 'text-align:center;color:var(--mp-neutral-500);padding:18px' }, '模组内没有已保存的 APN 上下文')
 						])
 					])
+				])
 				])
 			])
 		]);

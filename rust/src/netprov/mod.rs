@@ -214,7 +214,11 @@ pub fn plan_wan(
     let mut ipaddr = String::new();
     let mut netmask = String::new();
     let mut gateway = String::new();
-    let want_static = !static_ipv4.trim().is_empty() && matches!(mode, WanMode::Dhcp);
+    // 覆盖 dhcp 与 modem_pro 两种模式（与 provision.rs 的转换条件同口径）：
+    // modem_pro 的 v4 也是 udhcpc，FM350 的模组内 DHCP 服务器长期无响应，
+    // 不覆盖的话 modem_pro 模式在 350 系列上永远拿不到 v4。
+    let want_static = !static_ipv4.trim().is_empty()
+        && matches!(mode, WanMode::Dhcp | WanMode::ModemPro);
     if want_static {
         proto = "static";
         ipaddr = static_ipv4.trim().to_string();
@@ -1095,8 +1099,10 @@ mod tests {
     }
 
     #[test]
-    fn static_only_in_dhcp_mode() {
-        // modem_pro 模式交给 netifd 协议自己取地址，不能被 static 顶掉
+    fn static_only_when_address_given() {
+        // 350 系列怪癖（模组内 DHCP 无响应）覆盖 dhcp 与 modem_pro 两种模式：
+        // 给了模组上报地址就转 static；modem_pro 的 v4 也是 udhcpc（mp-client），
+        // 不转换的话 350 系列在 modem_pro 模式下永远拿不到 v4（实机踩过）。
         let p = plan_wan(
             0,
             "ncm",
@@ -1107,8 +1113,8 @@ mod tests {
             false,
             "10.0.0.5",
         );
-        assert_eq!(p.ifaces[0].proto, "modem_pro");
-        assert!(p.ifaces[0].ipaddr.is_empty());
+        assert_eq!(p.ifaces[0].proto, "static");
+        assert_eq!(p.ifaces[0].ipaddr, "10.0.0.5");
         // 没给地址 ⇒ 维持 dhcp
         let p = plan_wan(
             0,

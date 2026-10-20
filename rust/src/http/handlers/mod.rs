@@ -108,8 +108,15 @@ pub fn modem_by_query(state: &AppState, query: &HashMap<String, String>) -> Opti
         .map(|s| s.trim())
         .filter(|s| !s.is_empty());
     let id = match raw {
-        // 没给 = 单模组场景的默认值，与既有行为一致
-        None => 0,
+        // 没给 = 单模组场景的默认值。**回落到第一台实际存在的模组**，
+        // 不再硬编码 0 —— USB 重新枚举 / 模组重启后管理器会重新编号
+        // （实测 id 0 → 1），硬编码 0 会让所有缺省请求 404、前端整页崩。
+        None => state
+            .mgr
+            .all()
+            .first()
+            .map(|m| m.id)
+            .unwrap_or(0),
         // 给了但解析不了 = 调用方出错，让它看见「找不到」，不要猜
         Some(s) => s.parse::<u32>().ok()?,
     };

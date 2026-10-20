@@ -67,7 +67,10 @@ return view.extend({
 			api.get('/api/version').catch(function () { return {}; }),
 			store.start(api),
 			api.get('/api/changes', { limit: 5 }).catch(function () { return {}; }),
-			fs.read('/etc/modemd/config.toml').catch(function () { return ''; })
+			fs.read('/etc/modemd/config.toml').catch(function () { return ''; }),
+			/* 快照（/api/snapshot）的 blocks 里**没有** cells 块（后端不给），
+			   概览要显示服务小区数量就得自己拉一份 —— 早先读 B.cells 永远 0。 */
+			api.get('/api/cells', { modem_id: store.id() != null ? store.id() : 0 }).catch(function () { return {}; })
 		]);
 	},
 
@@ -76,6 +79,7 @@ return view.extend({
 		var ver = data[0] || {};
 		var changes = data[2] || {};
 		var cfg = data[3] || '';
+		this._cells = data[4] || {};
 
 		var m = /\[server\][\s\S]*?listen\s*=\s*["']?[^"'\n]*:(\d+)/.exec(cfg || '');
 		var webuiPort = m ? m[1] : '9527';
@@ -714,11 +718,24 @@ return view.extend({
 		}
 
 		/* 基站小区与拨号摘要 */
-		var cells = B.cells || {};
+		var cells = this._cells || B.cells || {};
 		var cellsKv = document.getElementById('cells-summary-kv');
 		if (cellsKv) {
 			cellsKv.innerHTML = '';
-			cellsKv.appendChild(kvItem('服务小区数量', String(cells.serving_count || 0)));
+			/* ⚠️ 后端 `/api/cells` 返回的 `serving` 是**数组**（每制式一条），
+			   没有 `serving_count` 字段 —— 早先读错字段，服务小区数量永远是 0。 */
+			var srv = cells.serving || [];
+			cellsKv.appendChild(kvItem('服务小区数量', String(srv.length)));
+			/* 顺手把第一个服务小区的关键信息带出来：数量之外再给一点「是哪个小区」 */
+			if (srv.length && srv[0]) {
+				var c0 = srv[0];
+				var bits = [];
+				if (c0.band_label || c0.band) bits.push(c0.band_label || ('B' + c0.band));
+				if (c0.pcid) bits.push('PCI ' + c0.pcid);
+				if (c0.earfcn) bits.push('EARFCN ' + c0.earfcn);
+				if (c0.rsrp) bits.push('RSRP ' + c0.rsrp + ' dBm');
+				if (bits.length) cellsKv.appendChild(kvItem('当前服务小区', bits.join(' · ')));
+			}
 			cellsKv.appendChild(kvItem('邻区基站数量', String(cells.neighbour_count || 0)));
 			cellsKv.appendChild(kvItem('载波聚合 (CA) 状态', cells.ca_active ? '已激活' : '未激活 / 单载波'));
 			if (cells.ca_note) cellsKv.appendChild(kvItem('CA 指令说明', cells.ca_note));
