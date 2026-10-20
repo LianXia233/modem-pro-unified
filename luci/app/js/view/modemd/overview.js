@@ -374,7 +374,8 @@ return view.extend({
 							icons.get('antenna', 18),
 							'基站与载波聚合'
 						]),
-						E('a', { 'class': 'mp-btn mp-btn-ghost mp-btn-sm', 'href': '#tab=cells' }, '基站详情 →')
+						E('a', { 'class': 'mp-btn mp-btn-ghost mp-btn-sm',
+						  'href': (typeof L !== 'undefined' && L.url) ? L.url('admin/modemd/cells') : '/cgi-bin/luci/admin/modemd/cells' }, '基站详情 →')
 					]),
 					E('div', { 'id': 'cells-summary-kv', 'class': 'mp-kv-grid', 'style': 'grid-template-columns:1fr' }, [])
 				]),
@@ -385,7 +386,8 @@ return view.extend({
 							icons.get('dial', 18),
 							'拨号链路状态'
 						]),
-						E('a', { 'class': 'mp-btn mp-btn-ghost mp-btn-sm', 'href': '#tab=dial' }, '拨号设置 →')
+						E('a', { 'class': 'mp-btn mp-btn-ghost mp-btn-sm',
+						  'href': (typeof L !== 'undefined' && L.url) ? L.url('admin/modemd/dial') : '/cgi-bin/luci/admin/modemd/dial' }, '拨号设置 →')
 					]),
 					E('div', { 'id': 'dial-summary-kv', 'class': 'mp-kv-grid', 'style': 'grid-template-columns:1fr' }, [])
 				])
@@ -398,7 +400,8 @@ return view.extend({
 					E('span', { 'style': 'font-weight:600' }, '最近网络变化:'),
 					E('span', { 'id': 'recent-change-text' }, (changes.entries && changes.entries[0]) ? (changes.entries[0].at + ' · ' + changes.entries[0].label + ' 从 ' + changes.entries[0].from + ' 变更为 ' + changes.entries[0].to) : '暂无波动记录')
 				]),
-				E('a', { 'class': 'mp-btn mp-btn-ghost mp-btn-sm', 'href': '#tab=tools' }, '查看全部记录')
+				E('a', { 'class': 'mp-btn mp-btn-ghost mp-btn-sm',
+					'href': (typeof L !== 'undefined' && L.url) ? L.url('admin/modemd/tools') : '/cgi-bin/luci/admin/modemd/tools' }, '查看全部记录')
 			])
 		]);
 

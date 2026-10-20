@@ -72,7 +72,7 @@ return view.extend({
 		/* 弹窗创建函数 */
 		function openApnModal(apnItem) {
 			var isEdit = !!apnItem;
-			var cidVal = isEdit ? apnItem.cid : 1;
+			var cidVal = isEdit ? apnItem.cid : (function () { var mx = 0; (params.contexts || []).forEach(function (c) { if (c.cid > mx) mx = c.cid; }); return mx + 1; })(); /* CID 不固定为 1：默认取现有最大 CID+1，避免跟 IMS/sos 常驻的 cid 1~2 撞 */
 			var apnVal = isEdit ? (apnItem.apn || '') : '';
 			var pdpVal = isEdit ? (apnItem.pdp_type || 'IPV4V6') : 'IPV4V6';
 
@@ -87,14 +87,14 @@ return view.extend({
 					]),
 					E('div', { 'style': 'display:flex;flex-direction:column;gap:12px' }, [
 						E('div', {}, [
-							E('label', { 'style': 'display:block;font-size:12.5px;color:var(--mp-neutral-700);margin-bottom:4px;font-weight:500' }, 'CID 上下文编号 (1~16):'),
+							E('label', { 'style': 'display:block;font-size:12.5px;color:var(--mp-neutral-700);margin-bottom:4px;font-weight:500' }, 'CID 上下文编号（正整数，上限因模组而异；默认已避开现有 CID）:'),
 							E('input', {
 								'id': 'modal-apn-cid',
 								'class': 'mp-input',
 								'style': 'width:100%',
 								'type': 'number',
 								'min': '1',
-								'max': '16',
+
 								'value': String(cidVal),
 								'disabled': isEdit
 							})
@@ -131,7 +131,7 @@ return view.extend({
 								var cid = parseInt(document.getElementById('modal-apn-cid').value, 10);
 								var apn = (document.getElementById('modal-apn-name').value || '').trim();
 								var pdp = document.getElementById('modal-apn-pdp').value;
-								if (!apn) { alert('请输入 APN 名称'); return; }
+								if (!apn) { alert('请输入 APN 名称'); return; } if (!(cid > 0)) { alert('CID 必须是正整数'); return; }
 								b.target.disabled = true;
 								b.target.textContent = '写入中…';
 								api.post('/api/params/apn', {
@@ -178,7 +178,22 @@ return view.extend({
 							btn.disabled = true;
 							var orig = btn.textContent;
 							btn.textContent = '拨号中…';
-							return task.run(api, 'dial.connect', { modem_id: id }, {
+							/* 一键拨号默认用**已配置的 APN 上下文**（fm350 同款体验）：
+							   优选「已激活且非 IMS」的 cid，其次任意已定义的非 IMS 上下文；
+							   都没有就留空（后端沿用模组自身配置 + 默认 cid）。
+							   早先什么也不传 → 永远落在默认 cid=1 上，用户明明在
+							   「APN 管理」里配好了上下文却没被用上。 */
+							var ctxs = (params.contexts || []).filter(function (c) { return !c.internal; });
+							var pick = ctxs.find(function (c) { return c.active && c.apn; })
+							          || ctxs.find(function (c) { return c.apn; })
+							          || null;
+							var dialParams = { modem_id: id };
+							if (pick) {
+								dialParams.cid = pick.cid;
+								dialParams.apn = pick.apn;
+								dialParams.pdp_type = pick.pdp_type || 'IPV4V6';
+							}
+							return task.run(api, 'dial.connect', dialParams, {
 							onTick: function (t) {
 								if (t && t.progress) btn.textContent = t.progress;
 							}
@@ -242,6 +257,32 @@ return view.extend({
 								});
 							})
 						}, dial.dial_enabled ? '关闭拨号' : '开启拨号')
+					]),
+
+					/* 自动拨号开关（[net] auto_dial，fm350 同款语义，默认开）：
+					   开着时守护循环每 30 秒巡检，PDP 掉了/开机没拨自动重拨；
+					   手动断开（manual_stop）后不再打扰 —— 用户说断就真断了。 */
+					E('div', { 'class': 'mp-metric-box', 'style': 'justify-content:center' }, [
+						E('div', { 'style': 'display:flex;align-items:center;justify-content:space-between;margin-bottom:8px' }, [
+							E('span', { 'style': 'font-weight:600;font-size:13.5px' }, '自动拨号'),
+							E('span', { 'class': 'mp-badge ' + (dial.auto_dial ? 'mp-badge-success' : 'mp-badge-muted') }, dial.auto_dial ? '已开启' : '已关闭')
+						]),
+						E('p', { 'style': 'font-size:12px;color:var(--mp-neutral-500);margin:0 0 10px' },
+							'开机与掉线自动重拨，无需手动点击；手动断开后不会被自动重连。'),
+						E('button', {
+							'class': 'mp-btn mp-btn-sm ' + (dial.auto_dial ? 'mp-btn-danger' : 'mp-btn-primary'),
+							'click': ui.createHandlerFn(self, function (btn) {
+								var nextOn = !dial.auto_dial;
+								btn.disabled = true;
+								api.post('/api/dial/auto', { on: nextOn }).then(function () {
+									ui.addNotification(null, E('p', {}, nextOn ? '自动拨号已开启' : '自动拨号已关闭'), 'info');
+									window.location.reload();
+								}).catch(function (e) {
+									ui.addNotification(null, E('p', {}, '切换失败: ' + (e.message || e)), 'error');
+									btn.disabled = false;
+								});
+							})
+						}, dial.auto_dial ? '关闭自动拨号' : '开启自动拨号')
 					]),
 
 					/* WAN 模式选择 */
@@ -438,7 +479,7 @@ return view.extend({
 							E('th', { 'style': 'text-align:right' }, '操作')
 						])
 					]),
-					E('tbody', {}, (params.apns && params.apns.length) ? params.apns.map(function (a) {
+					E('tbody', {}, (params.contexts && params.contexts.length) ? params.contexts.map(function (a) {
 						var isActive = !!a.active;
 						return E('tr', {}, [
 							E('td', { 'style': 'font-weight:600' }, String(a.cid)),
@@ -447,7 +488,8 @@ return view.extend({
 							E('td', {}, [
 								E('span', { 'class': 'mp-badge ' + (isActive ? 'mp-badge-success' : 'mp-badge-muted') }, isActive ? '已激活' : '已停用')
 							]),
-							E('td', {}, a.default_cid ? E('span', { 'class': 'mp-badge mp-badge-primary' }, '默认') : '-'),
+							/* 后端没有 default_cid 概念；internal 是 IMS/sos 专用上下文，标出来防止误删上网那条 */
+							E('td', {}, a.internal ? E('span', { 'class': 'mp-badge mp-badge-primary' }, 'IMS 专用') : '-'),
 							E('td', { 'style': 'text-align:right' }, [
 								E('div', { 'style': 'display:inline-flex;gap:6px' }, [
 									E('button', {

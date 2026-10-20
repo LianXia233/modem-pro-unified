@@ -55,6 +55,7 @@ pub fn handle(req: Request, state: &AppState, query: &HashMap<String, String>) -
         },
         "wan_ipv6_modes": crate::netprov::v6::v6_modes_payload(),
         "dial_enabled": state.dial_enabled(),
+        "auto_dial": state.auto_dial(),
         "wan_mode": mode.as_str(),
         "wan_mode_label": mode.label(),
         "wan_modes": crate::config::WanMode::list_payload(),

@@ -14,6 +14,7 @@ pub mod changes_clear;
 pub mod dial;
 pub mod dial_connect;
 pub mod dial_disconnect;
+pub mod dial_auto;
 pub mod dial_enable;
 pub mod dial_ipv6;
 pub mod dial_mode;

@@ -67,6 +67,11 @@ pub struct AppState {
     pub(crate) net_allow_roaming: Mutex<Option<bool>>,
     /// 运行期改过的拨号总开关（`[net] dial_enabled`，见 handlers/dial_enable.rs）
     pub(crate) net_dial_enabled: Mutex<Option<bool>>,
+    /// 自动拨号开关（`[net] auto_dial`）运行期覆盖值。
+    ///
+    /// 开着时守护循环每 30 秒巡检一次：PDP 掉了/没拨就自动重拨（fm350 同款语义），
+    /// 用户手动断开（manual_stop）后不再打扰。
+    pub(crate) net_auto_dial: Mutex<Option<bool>>,
     /// 运行期改过的模组侧 IPv6 开关（`[net] wan_ipv6`，见 handlers/dial_ipv6.rs）
     pub(crate) net_wan_ipv6: Mutex<Option<bool>>,
     /// 运行期改过的接口模式（`[net] wan_mode`，见 handlers/dial_mode.rs）
@@ -115,6 +120,14 @@ impl AppState {
             .lock()
             .unwrap()
             .unwrap_or(self.cfg.net.dial_enabled)
+    }
+
+    /// 自动拨号开关（`[net] auto_dial`）：运行期改过的优先。
+    pub(crate) fn auto_dial(&self) -> bool {
+        self.net_auto_dial
+            .lock()
+            .unwrap()
+            .unwrap_or(self.cfg.net.auto_dial)
     }
 
     /// 模组侧 IPv6 开关（`[net] wan_ipv6`）：运行期改过的优先。
@@ -199,6 +212,7 @@ pub fn serve(
         config_path: config_path.to_string(),
         net_allow_roaming: Mutex::new(None),
         net_dial_enabled: Mutex::new(None),
+        net_auto_dial: Mutex::new(None),
         net_wan_ipv6: Mutex::new(None),
         net_wan_mode: Mutex::new(None),
         netprov: crate::netprov::provision::ReportStore::new(),

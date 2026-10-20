@@ -3175,3 +3175,35 @@ peerdns/static dns 提供，netifd 常规行为，不改代码。
 - 锁小区（operatetype=1/2）需要 `<band>` 参数，UI 接口只有 earfcn/pci —— 待扩展接口后接；
 - FOTA（手册 §15）与 STK（§10）属独立功能域，未迁移；
 - ^CELLSCAN 实机回归（luci-app-mt5700 已验证解析逻辑，Rust 移植靠单测）。
+
+
+---
+
+## 52. 跳转按钮 + APN/PDP + 自动拨号（2026-10-20，1.0.1-3）
+
+实机反馈三件事，全部当天闭环。
+
+### 52.1 根因速记
+
+| 现象 | 根因 |
+| --- | --- |
+| overview「基站详情/拨号设置/查看全部记录」点了没反应 | `#tab=` 是 main.js SPA 的路由格式；本应用每个页面是独立 LuCI view，没人消费这个 hash |
+| 配置了 APN 列表仍空 | 前端读 `params.apns`，后端字段一直是 `params.contexts` |
+| 开机/掉线后不自动拨号 | `[net] auto_dial` 字段从 fm350 迁移时带过来了，但从未被消费 |
+
+### 52.2 自动拨号守护（spawn_auto_dial）
+
+30 秒巡检；跳过条件：总开关关 / auto_dial 关 / 已连接 / 正在拨 /
+manual_stop（用户手动断开就别打扰）。失败退避 5 分钟。
+与 netprov 分工：那个管「建接口」（写 UCI），这个管「拨号」（发 AT）。
+
+### 52.3 实机验证
+
+| 项 | 结果 |
+| --- | --- |
+| 自动拨号接管 | ✅ 重启后 disconnected → 45s 内 `[auto-dial] modem #0 自动拨号成功`、phase=online |
+| APN 写入→显示→删除 | ✅ cid 3 全链路，回读确认 |
+| 跳转按钮 | ✅ Playwright：三按钮真实 URL，tools 页标题「调试工具」 |
+| 自动拨号卡 | ✅ 策略区四格（总开关/自动拨号/WAN 模式/IPv6） |
+
+`cargo test` 700 passed / 0 failed；aarch64-musl 编译部署 1.0.1-3。

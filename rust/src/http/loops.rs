@@ -32,6 +32,10 @@ const LOG_INTERVAL: u64 = 1;
 pub fn spawn_all(state: &Arc<AppState>) {
     spawn_urc(state, URC_INTERVAL);
     spawn_netprov(state, NETPROV_INTERVAL);
+    // 自动拨号守护：PDP 掉了 / 开机没拨就自动重拨（[net] auto_dial，默认开）。
+    // 与 netprov 分开：那个管「建接口」（写 UCI），这个管「拨号」（发 AT），
+    // 失败节奏也不同 —— 拨号失败要退避，不能 30 秒一轮地硬砸模组。
+    spawn_auto_dial(state);
     spawn_push(state, state.cfg.server.push_interval);
     spawn_traffic(state, state.cfg.server.traffic_interval);
     spawn_quota(state, QUOTA_INTERVAL);
@@ -491,6 +495,75 @@ fn spawn_netprov(state: &Arc<AppState>, interval: u64) {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(interval.max(1)));
         crate::netprov::provision::run_once(&state);
+    });
+}
+
+/// 自动拨号守护循环（`[net] auto_dial`，默认开；fm350 同款语义）。
+///
+/// 每 30 秒对每台运行中的模组做一次巡检：
+/// - 拨号总开关 / 自动拨号关着 → 整台跳过；
+/// - 已连接 / 正在拨 → 跳过（复用现有连接，绝不无谓断开重拨）；
+/// - 用户手动断开过（`manual_stop`）→ 跳过，尊重用户的「断开」；
+/// - 其余（空闲 / 失败）→ 走与手动拨号完全相同的 `Modem::dial`（apn 留空 =
+///   沿用模组里已配置的 APN 上下文，cid=0 = 默认数据通道）。
+///
+/// 失败退避：拨号失败后该模组 5 分钟内不再重试（无卡 / 无服务的机器
+/// 不该被 30 秒一轮地硬砸 —— fm350 的无服务退避是 300 秒，同一个量级）。
+fn spawn_auto_dial(state: &Arc<AppState>) {
+    let state = state.clone();
+    std::thread::spawn(move || {
+        use std::collections::HashMap;
+        use std::time::Instant;
+        const INTERVAL: u64 = 30;
+        const FAIL_BACKOFF: u64 = 300;
+        // 模组 id → 上次失败时刻（跨轮持有）
+        let mut last_fail: HashMap<u32, Instant> = HashMap::new();
+        loop {
+            std::thread::sleep(Duration::from_secs(INTERVAL));
+            if !state.dial_enabled() || !state.auto_dial() {
+                continue;
+            }
+            for m in state.mgr.all() {
+                if !m.is_running() {
+                    continue;
+                }
+                let st = m.dial_status();
+                if st.state == crate::modem::model::dial::DIAL_CONNECTED
+                    || st.state == crate::modem::model::dial::DIAL_DIALING
+                    || st.manual_stop
+                {
+                    continue;
+                }
+                // 失败退避：5 分钟内失败过的模组先歇着
+                if last_fail
+                    .get(&m.id)
+                    .is_some_and(|t| t.elapsed().as_secs() < FAIL_BACKOFF)
+                {
+                    continue;
+                }
+                let req = crate::modem::model::DialRequest {
+                    cid: 0,
+                    apn: String::new(),
+                    pdp_type: String::new(),
+                    reconnect: false,
+                    force: false,
+                };
+                match m.dial(&req, state.dial_enabled(), state.cfg.dial.activate_ims) {
+                    Ok(_) => {
+                        last_fail.remove(&m.id);
+                        log::info!("[auto-dial] modem #{} 自动拨号成功（此前 state={}）", m.id, st.state);
+                    }
+                    Err(e) => {
+                        // busy 不算失败：手动拨号正在进行，下一轮再看
+                        let s = e.to_string();
+                        if !s.contains("进行中") {
+                            last_fail.insert(m.id, Instant::now());
+                            log::warn!("[auto-dial] modem #{} 自动拨号失败（{} 秒后重试）: {}", m.id, FAIL_BACKOFF, s);
+                        }
+                    }
+                }
+            }
+        }
     });
 }
 
