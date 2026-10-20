@@ -99,6 +99,7 @@ impl VendorSpec for Spec {
             )],
             deactivate: vec![AtStep::new("AT+ZECMCALL=0", "关闭 ECM 数据呼叫")],
             cgact_fallback: true,
+            autodial_probe: None,
             note: "高新兴 LTE 平台由 AT+ZECMCALL 激活 ECM",
         })
     }

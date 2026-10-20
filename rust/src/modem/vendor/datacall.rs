@@ -75,6 +75,21 @@ impl AtStep {
     }
 }
 
+/// 挂断前的「模组自拨」状态查询（华为展锐专用；其余厂商 `None`）。
+///
+/// 依据 QModem `auto_dial_hang_huawei_unisoc()`
+/// （`application/qmodem/files/usr/share/qmodem/modem_dial.sh:1546-1568`）：
+/// 先 `AT^SETAUTODIAL?` 看状态，**只有自拨开着**才 `=0` + CFUN 循环；
+/// 本来就是关着时改走通用的 `AT^NDISDUP=0,0`，不碰射频。
+/// 不看状态就 CFUN 循环，会把一次「用户点断开」变成整模组重新注册。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AutodialProbe {
+    /// 查询指令（`AT^SETAUTODIAL?`）。
+    pub query: &'static str,
+    /// 回读未显示「开着」时改发的断开指令（`AT^NDISDUP=0,0`）。
+    pub fallback: &'static str,
+}
+
 /// 一家厂商在某个平台上的数据通道配方。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DataChannel {
@@ -89,6 +104,8 @@ pub struct DataChannel {
     pub deactivate: Vec<AtStep>,
     /// 私有指令全部被拒时，是否允许退回 `AT+CGACT=1,<cid>`。
     pub cgact_fallback: bool,
+    /// 挂断前先查自拨状态（见 [`AutodialProbe`]）；`None` = 直接走 `deactivate`。
+    pub autodial_probe: Option<AutodialProbe>,
     /// 给界面看的一句话（为什么这么拨 / 有哪些限制）。
     pub note: &'static str,
 }
@@ -101,6 +118,7 @@ impl DataChannel {
             activate: Vec::new(),
             deactivate: Vec::new(),
             cgact_fallback: true,
+            autodial_probe: None,
             note,
         }
     }
@@ -351,6 +369,28 @@ mod tests {
             let p = plan(Vendor::Meig, &ctx("rndis", "qualcomm", "srm815", cid));
             assert!(p.activate[0].cmd.ends_with(&format!(",{cid}")));
             assert!(p.deactivate[0].cmd.ends_with(&format!(",{cid}")));
+        }
+    }
+
+    /// 华为展锐自拨：挂断前先查 `AT^SETAUTODIAL?`，没开着才走通用 NDISDUP
+    /// （依据 QModem `auto_dial_hang_huawei_unisoc`，modem_dial.sh:1546-1568）。
+    #[test]
+    fn huawei_unisoc_probes_autodial_before_hangup() {
+        let p = plan(Vendor::Huawei, &ctx("ecm", "unisoc", "mt5700m-cn", 3));
+        let probe = p.autodial_probe.expect("华为展锐必须带自拨状态查询");
+        assert_eq!(probe.query, "AT^SETAUTODIAL?");
+        assert_eq!(probe.fallback, "AT^NDISDUP=0,0");
+
+        // 其它厂商不该被这条逻辑波及（含同为自拨的合宙：它不断模组）
+        for v in [Vendor::Quectel, Vendor::Fibocom, Vendor::Openluat] {
+            for platform in ["qualcomm", "unisoc", "mediatek"] {
+                assert!(
+                    plan(v, &ctx("ecm", platform, "x", 1))
+                        .autodial_probe
+                        .is_none(),
+                    "{v:?}/{platform} 不该带自拨查询"
+                );
+            }
         }
     }
 }

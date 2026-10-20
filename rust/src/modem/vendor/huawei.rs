@@ -108,7 +108,13 @@ impl VendorSpec for Spec {
                     AtStep::new("AT+CFUN=1", "射频恢复上行"),
                 ],
                 cgact_fallback: false,
-                note: "展锐平台由模组自拨，主机不持有 PDP；断开需 CFUN 循环",
+                // 先问「自拨开着吗」再决定要不要 CFUN 循环 —— 依据 QModem
+                // auto_dial_hang_huawei_unisoc（modem_dial.sh:1546-1568）。
+                autodial_probe: Some(super::datacall::AutodialProbe {
+                    query: "AT^SETAUTODIAL?",
+                    fallback: "AT^NDISDUP=0,0",
+                }),
+                note: "展锐平台由模组自拨，主机不持有 PDP；断开需 CFUN 循环（先查自拨状态）",
             });
         }
         Some(DataChannel {
@@ -122,6 +128,7 @@ impl VendorSpec for Spec {
                 "NDISDUP=0 关闭 NDIS 数据通道（巴龙不按 cid 断开）",
             )],
             cgact_fallback: true,
+            autodial_probe: None,
             note: "海思/巴龙平台由 AT^NDISDUP 激活 ECM/RNDIS 数据通道",
         })
     }

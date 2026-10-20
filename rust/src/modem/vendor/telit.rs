@@ -93,6 +93,7 @@ impl VendorSpec for Spec {
             )],
             deactivate: vec![cgact_deactivate(cid)],
             cgact_fallback: true,
+            autodial_probe: None,
             note: "Telit 由 AT#ICMAUTOCONN 激活；上游未登记断开指令，按 3GPP CGACT 收尾",
         })
     }

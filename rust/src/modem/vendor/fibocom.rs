@@ -159,6 +159,7 @@ impl VendorSpec for Spec {
                 activate: Vec::new(),
                 deactivate: vec![cgact_deactivate(cid)],
                 cgact_fallback: true,
+                autodial_probe: None,
                 note: "MTK 平台（FM350/RW350）没有 GTRNDIS：靠 AT+CGACT 激活，地址由主机静态配置",
             });
         }
@@ -173,6 +174,7 @@ impl VendorSpec for Spec {
                 "GTRNDIS=0 关闭该 cid 的 USB 数据通道",
             )],
             cgact_fallback: true,
+            autodial_probe: None,
             note: "高通/展锐平台由 AT+GTRNDIS 激活数据通道",
         })
     }

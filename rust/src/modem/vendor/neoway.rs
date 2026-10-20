@@ -88,6 +88,7 @@ impl VendorSpec for Spec {
                 "关闭 USB 网卡数据通道（模组侧需要几秒才真正停）",
             )],
             cgact_fallback: true,
+            autodial_probe: None,
             note: "有方展锐平台由 AT$MYUSBNETACT 激活；断开后固件要 3 秒左右才落定",
         })
     }

@@ -84,6 +84,7 @@ impl VendorSpec for Spec {
                 "QCRMCALL=0 关闭同一条数据呼叫",
             )],
             cgact_fallback: true,
+            autodial_probe: None,
             note: "美格高通平台由 AT$QCRMCALL 激活数据通道",
         })
     }

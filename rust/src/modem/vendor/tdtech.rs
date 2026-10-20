@@ -177,6 +177,7 @@ impl VendorSpec for Spec {
                 "NDISDUP=0 关闭 NDIS 数据通道",
             )],
             cgact_fallback: true,
+            autodial_probe: None,
             note: "鼎桥（巴龙）由 AT^NDISDUP 激活 ECM/RNDIS；与华为海思同族",
         })
     }

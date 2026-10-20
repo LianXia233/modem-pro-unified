@@ -1,10 +1,22 @@
-//! 拨号上网域（`/api/dial` 一族）：USB 类型识别、拨号状态机、拨号方式表。
+//! 拨号上网域（`/api/dial` 一族）：USB 类型识别、拨号方式表、拨号状态机与链路阶段。
 //!
-//! 契约见 docs/API.md 的拨号一族：
-//!   · 一个 AT 口 = 一个模组（简化模型），`DialState` 挂在 [`Modem`] 上；
-//!   · USB 类型（usbnet）决定拨号方式：**QMI / MBIM 的数据呼叫归主机侧厂商拨号器**
-//!     （现在由 modemd 托管，见 `runtime/dialer/`），其余走模组侧 AT 激活 PDP；
-//!   · 拨号过程逐步记录（`DialStep`），失败也把状态带回去 —— 页面要显示「卡在哪一步」。
+//! 契约见 docs/API.md 的「拨号」一族。本文件承担三件事：
+//!
+//!   · 认类型 —— USB 类型（usbnet 取值）决定**谁来拨号**：QMI / MBIM 的数据呼叫
+//!     归主机侧拨号器（本项目由 modemd 托管，见 `runtime/dialer/`），ECM / RNDIS /
+//!     NCM 走模组侧 AT 激活 PDP（含厂商私有数据通道指令，表在 `vendor::datacall`）；
+//!   · 拨号与挂断 —— 逐步记录 [`DialStep`]，失败也把状态带回去（页面要显示「卡在哪一步」）；
+//!   · 看状态 —— `state` 回答「拨号任务进行到哪了」，`phase` 回答「网络真的通了吗」，
+//!     两者分工见 [`PHASE_IDLE`] 一带常量的注释。
+//!
+//! **不在本文件**的三件事（别在这里找）：
+//!   · 失败重试退避 —— `runtime/dialer::retry_delay`（5/10/20/40/60s）；
+//!     自动拨号守护的失败退避在 `http/loops.rs::spawn_auto_dial`（5 分钟）；
+//!   · 主机侧接口/路由的创建与清理 —— `netprov::provision`、`netprov::route`；
+//!   · QMI / MBIM 会话本身 —— `runtime/dialer::native`。
+//!
+//! ⚠️ 一台模组的多个 tty（`Modem::set_ttys`）与各自绑定的窗口是另一套东西，
+//! 本文件只读 **当前在用的那一个 AT 口**（`Modem::port()`）。
 
 use std::time::{Duration, Instant};
 
@@ -18,6 +30,7 @@ use super::addr;
 use super::modem::Modem;
 use super::params::{cgact_state, is_internal_apn, valid_apn, Context};
 use super::regstate;
+use crate::modem::sysfs;
 use crate::modem::vendor::datacall;
 
 // ---------- 拨号状态机 ----------
@@ -51,11 +64,10 @@ pub const DIAL_FAILED: &str = "failed";
 // `state` 保持不变（API 契约不动），前端按 phase 显示细分说明。
 pub const PHASE_IDLE: &str = "idle";
 pub const PHASE_DIALING: &str = "dialing";
-/// 模组侧数据会话已建立（PDP 激活 / 数据呼叫建立），主机侧未验证。
-pub const PHASE_SESSION: &str = "session";
 /// 主机网卡还没起来（没找到网卡 / 网卡没拿到地址）。
 pub const PHASE_IFACE: &str = "iface_pending";
-/// 网卡有地址，但默认路由不经它（被别的口抢了 / 没配）。
+/// 网卡有地址，但**按族判断**缺默认路由（v4 有地址却没有 v4 默认路由、
+/// 或 v6 有地址却没有 v6 默认路由；被别的口抢了 / 没配）。
 pub const PHASE_ROUTE: &str = "route_pending";
 /// 网卡有地址且默认路由经它 —— 这才是用户体感里的「已连接」。
 pub const PHASE_ONLINE: &str = "online";
@@ -79,7 +91,6 @@ pub fn dial_phase_text(phase: &str) -> String {
     match phase {
         PHASE_IDLE => "未初始化".into(),
         PHASE_DIALING => "拨号执行中".into(),
-        PHASE_SESSION => "数据会话已建立（主机侧未验证）".into(),
         PHASE_IFACE => "数据会话已建立，主机网卡未就绪".into(),
         PHASE_ROUTE => "网卡有地址，但默认路由不经它".into(),
         PHASE_ONLINE => "网络就绪（地址 + 默认路由）".into(),
@@ -89,6 +100,16 @@ pub fn dial_phase_text(phase: &str) -> String {
 }
 
 /// 数据默认 cid（请求没带 cid 时用它）。
+///
+/// cid（PDP 上下文标识）的取值范围由 3GPP TS 27.007 的 `+CGDCONT` 规定，
+/// 下限 1；上限写在固件里，多数 ≤ 11，本项目按 42 收口（见 [`valid_cid`]）。
+///
+/// ⚠️ 与上游口径不一致（**本次不改**，改了会动实机行为）：
+/// QModem 按「厂商 × 平台」建议 cid —— 移远 LTE 平台与广和通 MTK 平台建议 3，
+/// 其余建议 1（依据 QModem `modem_dial.sh:454-481` `get_platform_suggest_pdp_index`，
+/// 同文件 :1337-1342 又注明 FM350 的 cid=3 是历史遗留、已建议改成用户自定）。
+/// 本项目对所有平台一律 1：`hangup` / `dial_inner` 会复用拨号状态里已有的 cid，
+/// 换默认值会让用户已经在线的链路在下次重拨时被搁在一边。
 pub const DEFAULT_DATA_CID: i32 = 1;
 
 /// 状态码 → 中文（页面「拨号上网」显示）。
@@ -907,122 +928,33 @@ pub fn pick_dial_iface(list: &[IfaceInfo]) -> Option<IfaceInfo> {
     best.cloned()
 }
 
-// ---------- sysfs 小工具（读不到就返回空，跨平台行为一致） ----------
-
-/// 读 sysfs 文本文件的首行（sysfs 的「一行一个值」）。
-fn read_sysfs_line(path: &std::path::Path) -> String {
-    match std::fs::read_to_string(path) {
-        Ok(s) => s.lines().next().unwrap_or("").trim().to_string(),
-        Err(_) => String::new(),
-    }
-}
-
-/// 读 sysfs 里的一个十六进制**字节**值（归一成两位小写）。
-///
-/// ⚠️ 只用于 bInterfaceClass 这类单字节属性 —— VID/PID 是 **4 位**，
-/// 必须用 [`read_sysfs_id`]（实测踩过：用错函数 VID/PID 永远是空）。
-fn read_sysfs_hex(path: &std::path::Path) -> String {
-    let s = read_sysfs_line(path).to_lowercase();
-    if s.is_empty() || s.len() > 2 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return String::new();
-    }
-    format!("{:0>2}", s)
-}
-
-/// 读 sysfs 里的 USB ID（idVendor / idProduct = 4 位十六进制，小写归一）。
-fn read_sysfs_id(path: &std::path::Path) -> String {
-    let s = read_sysfs_line(path).to_lowercase();
-    if s.len() != 4 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return String::new();
-    }
-    s
-}
-
-/// USB 接口目录名（`1-1:1.0`；测试/Windows 退化写法 `1-1.0` 也认）。
-fn is_usb_interface_dir_name(name: &str) -> bool {
-    name.contains(':') || (name.contains('-') && name.contains('.'))
-}
-
-/// 读一个目录的接口类码，拼成 `02/06/00`（读不到返回空串）。
-///
-/// 接口目录优先用 bInterface*；设备目录只有 bDevice*（非复合设备）。
-fn usb_interface_code(dir: &std::path::Path) -> String {
-    let mut class = read_sysfs_hex(&dir.join("bInterfaceClass"));
-    let mut sub = read_sysfs_hex(&dir.join("bInterfaceSubClass"));
-    let mut proto = read_sysfs_hex(&dir.join("bInterfaceProtocol"));
-    if class.is_empty() {
-        class = read_sysfs_hex(&dir.join("bDeviceClass"));
-        sub = read_sysfs_hex(&dir.join("bDeviceSubClass"));
-        proto = read_sysfs_hex(&dir.join("bDeviceProtocol"));
-    }
-    if class.is_empty() {
-        return String::new();
-    }
-    format!("{class}/{sub}/{proto}")
-}
-
-/// 从一个 sysfs 路径往上找含 idVendor 的目录（= USB 设备目录）。非 USB 设备找不到。
-fn usb_ancestor_dir(path: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mut real = std::fs::canonicalize(path).ok()?;
-    for _ in 0..8 {
-        if real.join("idVendor").exists() {
-            return Some(real);
-        }
-        let parent = real.parent()?;
-        if parent == real {
-            break;
-        }
-        real = parent.to_path_buf();
-    }
-    None
-}
-
-/// AT 口 → USB 设备目录（往上逐层找到含 idVendor 的那层）。
-///
-/// 返回 None 表示这个口不是 USB 串口（主板物理口 / 蓝牙虚拟口 / 名字不是 tty*）。
-fn usb_device_dir(port: &str) -> Option<std::path::PathBuf> {
-    let name = std::path::Path::new(port.trim())
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
-    if name.is_empty() || name == "." {
-        return None;
-    }
-    let link = std::path::Path::new("/sys/class/tty")
-        .join(&name)
-        .join("device");
-    usb_ancestor_dir(&link)
-}
-
 /// 读模组 USB 侧的实际描述（VID/PID + 各接口类码）。
 ///
 /// 拿不到（不是 USB 串口 / 没有 sysfs）时返回 None，调用方退化成「类型未知」而不是报错。
 pub fn usb_descriptor_for_port(port: &str) -> Option<UsbDesc> {
-    let dev = usb_device_dir(port)?;
+    let dev = sysfs::tty_usb_device_dir(port)?;
     let mut d = UsbDesc {
         source: "sysfs".into(),
         ..UsbDesc::default()
     };
-    d.vid = read_sysfs_id(&dev.join("idVendor"));
-    d.pid = read_sysfs_id(&dev.join("idProduct"));
-    d.product = read_sysfs_line(&dev.join("product"));
+    d.vid = sysfs::read_hex_id(&dev.join("idVendor"));
+    d.pid = sysfs::read_hex_id(&dev.join("idProduct"));
+    d.product = sysfs::read_line(&dev.join("product"));
     // 各接口（1-1:1.0 / 1-1:1.1 …）的类码
     if let Ok(entries) = std::fs::read_dir(&dev) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            if !e.path().is_dir() || !is_usb_interface_dir_name(&name) {
+            if !e.path().is_dir() || !sysfs::is_interface_dir_name(&name) {
                 continue;
             }
-            let code = usb_interface_code(&e.path());
-            if !code.is_empty() {
+            if let Some(code) = sysfs::interface_code(&e.path()) {
                 d.classes.push(code);
             }
         }
     }
     if d.classes.is_empty() {
         // 非复合设备（或老内核不在接口目录放类码）→ 退回设备级类码
-        let code = usb_interface_code(&dev);
-        if !code.is_empty() {
+        if let Some(code) = sysfs::interface_code(&dev) {
             d.classes.push(code);
         }
     }
@@ -1042,7 +974,7 @@ pub fn usb_descriptor_for_port(port: &str) -> Option<UsbDesc> {
 /// QMAP 模组会返回两张（`wwan0` 父口 + `wwan0_1` mux 数据口）：两个都交出去，
 /// 由调用方按 `qmap_mode` 挑数据口（见 `netprov/provision.rs`）。
 pub fn usb_netifs_for_port(port: &str) -> Vec<String> {
-    let Some(dev) = usb_device_dir(port) else {
+    let Some(dev) = sysfs::tty_usb_device_dir(port) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -1210,25 +1142,23 @@ fn read_host_iface_hint(name: &str) -> Option<HostIfaceHint> {
     }
     h.value = usbnet_from_host_driver(&h.driver);
     // USB 祖先目录（网卡绑在 USB 接口上时才有）：VID/PID/产品名 + 各接口类码
-    if let Some(dev) = usb_ancestor_dir(&base.join("device")) {
-        h.vid = read_sysfs_id(&dev.join("idVendor"));
-        h.pid = read_sysfs_id(&dev.join("idProduct"));
-        h.product = read_sysfs_line(&dev.join("product"));
+    if let Some(dev) = sysfs::ancestor_with(&base.join("device"), "idVendor") {
+        h.vid = sysfs::read_hex_id(&dev.join("idVendor"));
+        h.pid = sysfs::read_hex_id(&dev.join("idProduct"));
+        h.product = sysfs::read_line(&dev.join("product"));
         if let Ok(entries) = std::fs::read_dir(&dev) {
             for e in entries.flatten() {
                 let ename = e.file_name().to_string_lossy().to_string();
-                if !e.path().is_dir() || !is_usb_interface_dir_name(&ename) {
+                if !e.path().is_dir() || !sysfs::is_interface_dir_name(&ename) {
                     continue;
                 }
-                let code = usb_interface_code(&e.path());
-                if !code.is_empty() {
+                if let Some(code) = sysfs::interface_code(&e.path()) {
                     h.classes.push(code);
                 }
             }
         }
         if h.classes.is_empty() {
-            let code = usb_interface_code(&dev);
-            if !code.is_empty() {
+            if let Some(code) = sysfs::interface_code(&dev) {
                 h.classes.push(code);
             }
         }
@@ -1352,6 +1282,14 @@ impl Modem {
     /// 注册态必须问 `AT+CEREG?`：5G 附着时 `AT+CREG?` 可能恒回 `0,0`，
     /// 拿它当判据会把「已注册」误判成「未注册」。某家没有 CEREG 时
     /// 回落 CREG / CGREG（复用注册态解析的分派）。
+    ///
+    /// ⚠️ 与 QModem `check_dial_prepare()`（`modem_dial.sh:570-624`）的**有意差异**：
+    /// 上游在检查通过后无条件补一条 `AT+CFUN=1`（`cmd_dial_cfun_enable`，:619），
+    /// 本项目**只读不写** —— 飞行模式在本项目是显式用户动作
+    /// （`/api/airplane/set`），拨号器偷偷改射频状态会在用户不知情时
+    /// 重置协议栈；体检结果会把「在飞行模式」写进失败原因，由用户自己决定
+    /// 要不要退。同时上游还查「USB 网卡在不在」，本项目放到拨号后的
+    /// 网卡就绪阶段（phase iface）判，更接近「拨号失败的真实原因」。
     pub fn dial_readiness(&self) -> DialReadiness {
         let mut rd = DialReadiness::default();
 
@@ -1995,7 +1933,7 @@ impl Modem {
             if names.is_empty() {
                 return; // 模组 USB 下没有任何网卡：维持现状，不猜
             }
-            let belongs = names.iter().any(|n| *n == s.host_iface);
+            let belongs = names.contains(&s.host_iface);
             if !belongs || s.host_iface.trim().is_empty() {
                 let pick = names
                     .iter()
@@ -2261,6 +2199,17 @@ impl Modem {
                 }
             }
         }
+
+        // 与 QModem `at_dial()`（`modem_dial.sh:1285`，:1291 发 `AT+COPS=0,0`）的两处**有意差异**，
+        // 上游在进厂商 case 之前会各发一条指令，本项目都不发：
+        //
+        // 1. `AT+COPS=0,0`（复位到自动选网）：本项目 `/api/params/netselect`
+        //    支持手动锁定运营商（`AT+COPS=1,2,"<plmn>"`），每次拨号都无条件
+        //    复位会把用户锁好的网冲掉 —— 上游没有手动锁网入口，感受不到这点。
+        // 2. `AT+QCFG="nat",1/0`（移远，按 `donot_nat` 配置）：本项目主机侧
+        //    接管 PDP 后自己路由（见 `netprov`），模组 NAT 开关与组网无关，
+        //    留固件默认；要改的用户可在 AT 页面手动发。
+        // 想对账上游行为时先看这里，别当成漏移植。
 
         // ② 按 USB 类型分派 —— 一台模组只走**一种**拨号方式。
         //
@@ -2581,6 +2530,31 @@ impl Modem {
         let kind = self.cached_dial_kind();
         let plan = self.data_channel_for(&kind, cid);
         let mut steps: Vec<datacall::AtStep> = plan.deactivate.clone();
+        // 华为展锐自拨：先问模组「自拨开着吗」，再决定要不要 CFUN 循环。
+        // 依据 QModem `auto_dial_hang_huawei_unisoc`（modem_dial.sh:1546-1568）：
+        // 开着才 `=0` + CFUN 循环；没开过还去循环，会把一次「点断开」
+        // 变成整模组重新注册（掉网几秒到几十秒），此时改走通用 NDISDUP。
+        if let Some(probe) = &plan.autodial_probe {
+            let resp = self.at_cmd_prio(Prio::Data, probe.query);
+            // 回读形如 `^SETAUTODAIL:1,4`（上游脚本里这个关键字就带拼写错误），
+            // 冒号后第一段是开关状态；查不到/回 ERROR 一律按「没开」处理。
+            let autodial_on = resp.contains("SETAUTO") && resp.contains(":1");
+            self.dial_step(
+                &format!("查询模组自拨状态（{}）", probe.query),
+                true,
+                if autodial_on {
+                    "自拨开启中，按配方断开"
+                } else {
+                    "自拨未开启，跳过 CFUN 循环，改走通用断开"
+                },
+            );
+            if !autodial_on {
+                steps = vec![datacall::AtStep::new(
+                    probe.fallback,
+                    "上游对未开启自拨的华为展锐机型走通用 NDISDUP 断开，不碰射频",
+                )];
+            }
+        }
         if steps.is_empty() {
             if plan.cgact_fallback {
                 steps.push(datacall::cgact_deactivate(cid));

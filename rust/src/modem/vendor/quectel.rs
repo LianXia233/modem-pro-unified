@@ -138,6 +138,7 @@ impl VendorSpec for Spec {
                 "QNETDEVCTL op=2 = 断开数据通道",
             )],
             cgact_fallback: true,
+            autodial_probe: None,
             note: "移远 ECM/RNDIS/NCM 由 QNETDEVCTL 激活；只发 CGACT 时网卡常常没有 carrier",
         })
     }

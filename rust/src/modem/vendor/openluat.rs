@@ -92,6 +92,7 @@ impl VendorSpec for Spec {
             )],
             deactivate: Vec::new(),
             cgact_fallback: false,
+            autodial_probe: None,
             note: "合宙模组自持 PDP：断开只停主机接口，不向模组发断开指令（上游同口径）",
         })
     }

@@ -86,6 +86,7 @@ impl VendorSpec for Spec {
             activate: Vec::new(),
             deactivate: vec![cgact_deactivate(ctx.cid)],
             cgact_fallback: true,
+            autodial_probe: None,
             note: "芯讯通只有 3GPP CGACT；高通平台的 CNMP 保活值随卡变化，不写死",
         })
     }
