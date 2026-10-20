@@ -806,6 +806,11 @@ impl Modem {
     /// `lock_type`：0=解除 1=锁频点+PCI 2=仅锁频点。QNWLOCK 置 0 是**文档化的解锁**，
     /// 与 QNWPREFCFG 的频段不同，可以直接写。
     ///
+    /// `band` 仅 5G NR 用（频段号，如 78）：Quectel 的 5G 锁小区语法
+    /// `AT+QNWLOCK="common/5g",<pci>,<arfcn>,<scs>,<band>` 里它是收尾参数。
+    /// 缺省时用**缓存里**的驻网频段兜底（不发 AT），缓存也没有就省略 ——
+    /// 官方支持答复把四个参数都列为可选（`[pci],[freq],[scs],[band]`）。
+    ///
     /// 广和通 MTK（`AT+EMMCHLCK`）与芯讯通一样**拒绝盲写**：实机 `AT+EMMCHLCK=?`
     /// 只给出 5 个参数组 `(0-1),(0,2,7),(0,1),(0-46589),(0-511)`，末两组能认出是
     /// EARFCN / PCI 区间，但中间两组枚举（`0,2,7` 与 `0,1`）的含义没有手册可查，
@@ -818,6 +823,7 @@ impl Modem {
         earfcn: i32,
         pcid: i32,
         scs: Option<i32>,
+        band: Option<i32>,
     ) -> Result<LockStatus> {
         let d = self
             .lock_dialect()
@@ -890,16 +896,47 @@ impl Modem {
                 if lock_type == 1 && pcid <= 0 {
                     return Err(msg("锁频点+PCI 需要同时给 PCI"));
                 }
-                let mut c = format!("AT+QNWLOCK=\"{kind}\",{lock_type},{earfcn}");
-                if lock_type == 1 {
-                    c.push_str(&format!(",{pcid}"));
-                }
                 if tech == "NR" {
-                    if let Some(s) = scs {
+                    // 5G 的 QNWLOCK 语法与 4G 完全不同：**没有 lock_type 字段，
+                    // PCI 在最前**，scs 用 kHz 值（15/30/60/120/240）、band 收尾。
+                    // 依据：Quectel 官方支持答复（forums.quectel.com/t/rmu500-ek-
+                    // to-prevent-from-handover/11554：`"common/5g",[pci],[freq],
+                    // [scs],[band]`）与 MikroTik ROS 文档的实测回读
+                    // `+QNWLOCK: "common/5g",138,628032,30,78`；
+                    // QModem 同口径（vendor/quectel.sh:1309 `locknr`）。
+                    //
+                    // ⚠️ 早先这里按 4G 语法发 `1,<earfcn>,<pci>[,<scs>]`，
+                    // 在 5G 固件眼里 PCI=1、freq=earfcn、scs=pci —— 参数整体错位，
+                    // 要么锁错小区要么直接 ERROR。
+                    //
+                    // 「仅频点」在 5G 语法里没有对应档位（PCI 是必填位），
+                    // 拒绝而不是猜一个写法发出去。
+                    if lock_type != 1 {
+                        return Err(msg(
+                            "5G NR 锁小区只支持「频点+PCI」：QNWLOCK 的 5G 语法没有「仅频点」档位",
+                        ));
+                    }
+                    // band 缺省时用缓存里的驻网频段兜底（不发 AT，见本函数文档）
+                    let band = band
+                        .filter(|b| *b > 0)
+                        .or_else(|| cached_serving_band(self, "NR"));
+                    let mut c = format!("AT+QNWLOCK=\"{kind}\",{pcid},{earfcn}");
+                    if let Some(s) = scs.filter(|s| *s > 0) {
                         c.push_str(&format!(",{s}"));
                     }
+                    if let Some(b) = band {
+                        c.push_str(&format!(",{b}"));
+                    }
+                    c
+                } else {
+                    // 4G：`"<kind>",<lock_type>,<earfcn>[,<pci>]`（1=频点+PCI，2=仅频点），
+                    // 依据 Quectel 论坛 RM520N-GL 实例 `"common/4g",1,EARFCN,PCI`。
+                    let mut c = format!("AT+QNWLOCK=\"{kind}\",{lock_type},{earfcn}");
+                    if lock_type == 1 {
+                        c.push_str(&format!(",{pcid}"));
+                    }
+                    c
                 }
-                c
             }
             _ => return Err(msg("lock_type 只认 0（解除）/ 1（频点+PCI）/ 2（仅频点）")),
         };
@@ -947,7 +984,7 @@ impl Modem {
             self.set_band_lock(tech, &[], true)?;
         }
         for tech in ["LTE", "NR"] {
-            self.set_cell_lock(tech, 0, 0, 0, None)?;
+            self.set_cell_lock(tech, 0, 0, 0, None, None)?;
         }
         Ok(self.lock_status(true))
     }
@@ -1491,6 +1528,15 @@ pub fn band_lock_restricted(current: &[i32], policy: &[i32]) -> bool {
 }
 
 /// 解析 `+QNWLOCK: "common/4g",1,2452,155` 小区锁定应答。
+///
+/// 两种 scope 的回读字段**完全不同**（依据 Quectel 官方支持答复与 MikroTik ROS
+/// 文档的实测输出）：
+///
+/// - `common/4g`：`"<kind>",<lock_type>,<earfcn>,<pci>`，`lock_type` 0=未锁；
+/// - `common/5g`：`"<kind>",<pci>,<arfcn>,<scs>,<band>` —— **没有 lock_type 字段，
+///   PCI 在最前**；未锁定时只有 `"<kind>",0` 一段。
+///   实测样本：`+QNWLOCK: "common/5g",138,628032,30,78`（help.mikrotik.com
+///   LTE/5G 文档）。这里把 PCI/ARFCN 映射回 `CellLock`，scs/band 只作佐证不入库。
 pub fn parse_qnwlock(resp: &str, kind: &str) -> Option<CellLock> {
     for line in resp.lines() {
         let up = line.to_ascii_uppercase();
@@ -1500,6 +1546,23 @@ pub fn parse_qnwlock(resp: &str, kind: &str) -> Option<CellLock> {
         let f = csv(&line[idx + "+QNWLOCK:".len()..]);
         if f.len() < 2 || !f[0].eq_ignore_ascii_case(kind) {
             continue;
+        }
+        let is_nr = kind.eq_ignore_ascii_case("common/5g");
+        if is_nr {
+            // 5G：`<pci>,<arfcn>[,<scs>[,<band>]`；未锁定是单个 0。
+            // PCI 0 本身合法，所以判锁不看首段是否为 0，而看有没有跟频点段。
+            let pcid = f[1].parse::<i32>().unwrap_or(0);
+            let earfcn = f.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let locked = f.len() >= 3;
+            return Some(CellLock {
+                // 本项目 UI 语义里「频点+PCI」= 1，5G 回读没有 lock_type 就按 1 记
+                lock_type: if locked { 1 } else { 0 },
+                locked,
+                earfcn,
+                pcid,
+                raw_value: f.join(","),
+                ..Default::default()
+            });
         }
         let lock_type = f[1].parse::<i32>().unwrap_or(0);
         let mut cl = CellLock {
@@ -1515,6 +1578,23 @@ pub fn parse_qnwlock(resp: &str, kind: &str) -> Option<CellLock> {
         return Some(cl);
     }
     None
+}
+
+/// 缓存里驻网小区的频段号（`tech` = `LTE` / `NR`）；没有就 `None`。
+///
+/// 只读缓存、**不发 AT**：5G 锁小区语法要把 band 收尾，而请求里允许不带
+/// （多数用户锁的就是自己正驻着的那个小区，频段页面上有、表单里没有）。
+/// 缓存超过 60 秒视为过期——用户在别的页面看了会儿再去锁，小区可能都变了。
+fn cached_serving_band(modem: &Modem, tech: &str) -> Option<i32> {
+    let c = modem.cells_cache()?;
+    let age = crate::logging::seconds_since(&c.scanned_at)?;
+    if age > 60 {
+        return None;
+    }
+    c.serving
+        .iter()
+        .find(|s| s.tech.eq_ignore_ascii_case(tech) && s.band > 0)
+        .map(|s| s.band)
 }
 
 /// 供 `Modem` 复用的锁网缓存槽访问。
@@ -1817,5 +1897,31 @@ mod tests {
         let open = parse_qnwlock("+QNWLOCK: \"common/5g\",0\r\nOK", "common/5g").unwrap();
         assert!(!open.locked);
         assert_eq!(open.earfcn, 0);
+    }
+
+    /// 5G 回读是 `<pci>,<arfcn>,<scs>,<band>`（没有 lock_type，PCI 在最前）——
+    /// 依据 MikroTik ROS 文档实测样本 `+QNWLOCK: "common/5g",138,628032,30,78`。
+    #[test]
+    fn qnwlock_parse_nr_puts_pci_first() {
+        let locked = parse_qnwlock(
+            "+QNWLOCK: \"common/5g\",138,628032,30,78\r\nOK",
+            "common/5g",
+        )
+        .unwrap();
+        assert!(locked.locked, "带回读明细就是锁定态");
+        assert_eq!(locked.pcid, 138, "PCI 在首段，不是 lock_type");
+        assert_eq!(locked.earfcn, 628032);
+        assert_eq!(locked.lock_type, 1, "本项目语义：频点+PCI");
+        assert!(
+            locked.raw_value.contains("30,78"),
+            "scs/band 原样留在 raw 里"
+        );
+
+        // PCI 0 是合法值：有三个后续段仍算锁定，不能被当成「未锁定」
+        let zero_pci =
+            parse_qnwlock("+QNWLOCK: \"common/5g\",0,628032,30,78\r\nOK", "common/5g").unwrap();
+        assert!(zero_pci.locked);
+        assert_eq!(zero_pci.pcid, 0);
+        assert_eq!(zero_pci.earfcn, 628032);
     }
 }

@@ -180,13 +180,22 @@ return view.extend({
 							E('label', { 'style': 'display:block;font-size:12.5px;font-weight:600;margin-bottom:6px' }, '锁定类型:'),
 							E('select', { 'id': 'cell-lock-type', 'class': 'mp-select', 'style': 'width:100%' }, [
 								E('option', { 'value': '1' }, '锁定频点 + 物理小区 (EARFCN + PCI)'),
-								E('option', { 'value': '2' }, '仅锁定物理频点 (仅 EARFCN)'),
+								E('option', { 'id': 'cell-lock-type-freqonly', 'value': '2' }, '仅锁定物理频点 (仅 EARFCN)'),
 								E('option', { 'value': '0' }, '解除小区锁定 (Lock Type = 0)')
 							])
 						]),
 						E('div', {}, [
 							E('label', { 'style': 'display:block;font-size:12.5px;font-weight:600;margin-bottom:6px' }, '接入网络技术域 (RAT):'),
-							E('select', { 'id': 'cell-lock-tech', 'class': 'mp-select', 'style': 'width:100%' }, [
+							E('select', { 'id': 'cell-lock-tech', 'class': 'mp-select', 'style': 'width:100%', 'change': function(ev) {
+								var nr = (ev.target.value === 'NR');
+								var freqOnly = document.getElementById('cell-lock-type-freqonly');
+								var bandRow = document.getElementById('cell-lock-band-row');
+								if (freqOnly) {
+									freqOnly.disabled = nr;
+									if (nr && freqOnly.selected) document.getElementById('cell-lock-type').value = '1';
+								}
+								if (bandRow) bandRow.style.display = nr ? '' : 'none';
+							} }, [
 								E('option', { 'value': 'LTE' }, 'LTE (4G)'),
 								E('option', { 'value': 'NR' }, '5G NR')
 							])
@@ -221,6 +230,16 @@ return view.extend({
 								'placeholder': '30'
 							})
 						]),
+						E('div', { 'id': 'cell-lock-band-row', 'style': 'display:none' }, [
+							E('label', { 'style': 'display:block;font-size:12.5px;font-weight:600;margin-bottom:6px' }, '5G 频段号 (NR Band，如 78；仅 5G NR 用，可留空):'),
+							E('input', {
+								'id': 'cell-lock-band',
+								'class': 'mp-input',
+								'style': 'width:100%',
+								'type': 'number',
+								'placeholder': '78'
+							})
+						]),
 						E('div', { 'style': 'padding-top:10px' }, [
 							E('button', {
 								'class': 'mp-btn mp-btn-primary',
@@ -230,6 +249,7 @@ return view.extend({
 									var earfcn = parseInt(document.getElementById('cell-lock-earfcn').value, 10);
 									var pcid = parseInt(document.getElementById('cell-lock-pcid').value, 10);
 									var scs = parseInt(document.getElementById('cell-lock-scs').value, 10);
+									var band = parseInt(document.getElementById('cell-lock-band').value, 10);
 
 									if (ltype !== 0 && isNaN(earfcn)) {
 										alert('请输入有效的频点 (EARFCN)');
@@ -237,6 +257,10 @@ return view.extend({
 									}
 									if (ltype === 1 && isNaN(pcid)) {
 										alert('锁频点+PCI 必须输入 PCI');
+										return;
+									}
+									if (tech === 'NR' && ltype === 2) {
+										alert('5G NR 锁小区只支持「频点 + PCI」（5G 锁小区语法没有「仅频点」档位）');
 										return;
 									}
 
@@ -248,7 +272,8 @@ return view.extend({
 										lock_type: ltype,
 										earfcn: isNaN(earfcn) ? 0 : earfcn,
 										pcid: isNaN(pcid) ? 0 : pcid,
-										scs: isNaN(scs) ? 30 : scs
+										scs: isNaN(scs) ? 30 : scs,
+										band: isNaN(band) ? 0 : band
 									}).then(function (r) {
 										ui.addNotification(null, E('p', {}, '锁小区指令已执行'), 'info');
 										window.location.reload();
@@ -261,7 +286,7 @@ return view.extend({
 							}, '执行锁小区')
 						]),
 						E('p', { 'style': 'font-size:12px;color:var(--mp-neutral-500);line-height:1.6;margin:0' },
-							'注意：部分平台（如广和通 FM350 系列）未公开锁小区寄存器参数，该平台支持一键解锁（Lock Type = 0），下发锁定前请确认设备支持。')
+							'注意：部分平台（如广和通 FM350 系列）未公开锁小区寄存器参数，该平台支持一键解锁（Lock Type = 0），下发锁定前请确认设备支持。5G NR 锁小区语法为「PCI, 频点, SCS, 频段」，只支持频点+PCI 一种档位；频段号留空时服务端用当前驻网频段兜底。')
 					])
 				])
 			]),

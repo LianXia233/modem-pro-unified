@@ -182,7 +182,7 @@
 | GET | `/api/lock/status` | `lock_status::handle` |  |
 | GET | `/api/lock/caps` | `lock_caps::handle` |  |
 | POST | `/api/lock/band` | `lock_band::handle` | 请求体：`{modem_id, tech, bands: [78], unlock?}` |
-| POST | `/api/lock/cell` | `lock_cell::handle` | 请求体：`{modem_id, tech, lock_type, earfcn, pcid?, scs?}` |
+| POST | `/api/lock/cell` | `lock_cell::handle` | 请求体：`{modem_id, tech, lock_type, earfcn, pcid?, scs?, band?}`。`scs`/`band` 仅 NR 用；`band` 留空时服务端用缓存驻网频段兜底；NR 只接受 `lock_type=1`（5G 锁小区语法没有「仅频点」档位） |
 | POST | `/api/lock/mode` | `lock_mode::handle` | 请求体：`{modem_id, mode}`。返回最新锁网状态（同 `GET /api/lock/status`） |
 | POST | `/api/lock/unlock` | `lock_unlock::handle` | 请求体：`{modem_id}`。返回最新锁网状态（同 `GET /api/lock/status`） |
 

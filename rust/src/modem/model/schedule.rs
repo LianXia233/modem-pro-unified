@@ -4,15 +4,31 @@
 //! 「开始动作」（如锁到 n78），结束时间执行「结束动作」（如解除锁定）；每个
 //! 时间点可带**一组动作**（按顺序依次下发，"锁频段 + 锁基站"要一起做才有意义）。
 //!
-//! 判定口径（简单可预期，不引入 cron）：
+//! 判定口径（简单可预期，**不支持 cron 表达式**，只认"星期 + HH:MM"；
+//! 依据 Go module/kernel/sched_view.go:110-118、api_schedule.go:8-12）：
 //!   · 每天（或指定星期）的 HH:MM 到点后，在 [`CATCH_UP`] 窗口内执行一次；
 //!   · 同一"日期+时间"只执行一次（`slots` 里记录，随 schedule.json 落盘），所以
 //!     进程重启后只要还在窗口内就补做（不漏也不重复），超出窗口不补——
 //!     避免"关机一整天，开机把昨天的动作全跑一遍"；
 //!   · 时间判定全用**本机时区**（见 `logging::time::tz_offset_secs`，与界面说明一致）。
 //!
+//! 边界语义（上面三条的直接推论，改判定前先看）：
+//!   · **跨日**：两个槽位各自在"自己那一天"判定（23:00 锁 / 07:00 解锁 = 当晚触发
+//!     start、次日早上触发 end），没有"跨零点的时段"这回事（依据 Go
+//!     module/kernel/store_test.go:747 `TestDuePhasesCrossDay`）；
+//!   · **补做不跨零点**：23:00 的槽位过了 00:00 就永远不再补（窗口是同一天内的
+//!     [到点, 到点+15min)），所以也不会出现"隔天早上补昨天的动作"；
+//!   · **时区 / 夏令时**：本机时区只认 POSIX std 写法（`CST-8`），不解析 TZif 区域
+//!     库、不套 DST 规则（见 `logging::time::tz_offset_secs`）；认不出时降级按 UTC
+//!     并 warn。闰秒不处理——Unix 秒本身不含闰秒；
+//!   · **补偿策略**：只补偿"晚一点"（进程重启 / 串口忙），不补偿"错过整天"；
+//!     补偿发生在窗口内的下一次 `http::schedule::tick`，由 `slots` 保证幂等；
+//!   · **幂等**：`slots[phase] == 本槽位` 即视为已执行，重复 tick / 反复重启都不会
+//!     重复下发（依据 Go module/kernel/sched_view.go:922-935 `SchedStore.Record`）。
+//!
 //! 分层：本文件是纯逻辑（模型 / 校验 / 时间判定 / 视图组装）+ `Modem` 的执行
-//! 入口；台账落盘在 `runtime::store::SchedStore`；循环与 handler 在 `http::schedule`。
+//! 入口；台账落盘在 `runtime::store::SchedStore`（去重标记与落盘节流的落点）；
+//! 循环与 handler 在 `http::schedule`。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,20 +53,33 @@ pub const KIND_AIRPLANE_OFF: &str = "airplane_off"; // 关飞行模式（AT+CFUN
 
 pub const PHASE_START: &str = "start";
 pub const PHASE_END: &str = "end";
+/// 手动执行的相位标记。**当前没有调用方会产生它**：界面的「立即执行」走
+/// [`PHASE_START`]，记的是真实日期槽位（见 [`Run::slot`]）。
+/// `runtime::store::SchedStore::record` 保留了它的豁免分支（收到它就不推进去重
+/// 标记），与 Go module/kernel/sched_view.go:932 `if run.Slot != "manual"` 同口径。
 pub const PHASE_MANUAL: &str = "manual";
+
+// 以下 6 个阈值与 Go 版逐项对齐（module/kernel/sched_view.go:132-145），改任何一个
+// 都会动到实机行为（触发时机 / 上限 / 刷屏频率），改动前先对上游说明原因。
 
 /// 到点后仍允许补做的窗口（秒）。进程重启 / 串口忙导致晚几秒是常态，
 /// 但"关机一整天"不应该开机就补跑，所以窗口取 15 分钟。
+/// 依据 Go module/kernel/sched_view.go:132-134 `CatchUp = 15 * time.Minute`。
 pub const CATCH_UP: i64 = 15 * 60;
 /// 任务数上限（主要是防止前端误批量导入）。
+/// 依据 Go module/kernel/sched_view.go:135-136 `MaxTasks = 50`。
 pub const MAX_TASKS: usize = 50;
 /// 单个时间点最多几个动作。常见组合是"锁频段 + 锁基站"，4 个足够。
+/// 依据 Go module/kernel/sched_view.go:137-139 `MaxActions = 4`。
 pub const MAX_ACTIONS: usize = 4;
 /// 落盘节流（秒）：每次执行都会改状态，但不必秒级写盘。
+/// 依据 Go module/kernel/sched_view.go:140-141 `SchedSaveEvery = 5 * time.Second`。
 pub const SCHED_SAVE_EVERY: i64 = 5;
 /// 「下次执行」展示几条。
+/// 依据 Go module/kernel/sched_view.go:142-143 `NextShow = 3`。
 pub const NEXT_SHOW: usize = 3;
 /// 同一任务执行失败后的日志节流（秒），避免坏任务每 10 秒刷屏。
+/// 依据 Go module/kernel/sched_view.go:144-145 `LogEvery = 5 * time.Minute`。
 pub const LOG_EVERY: i64 = 5 * 60;
 
 /// 语义档位（与前端 MODE_PREF_CN 一致的 7 档）。
@@ -103,7 +132,10 @@ fn is_zero(v: &i32) -> bool {
 pub struct Run {
     /// start / end / manual
     pub phase: String,
-    /// 触发槽位，如 "2026-09-30 08:00"；手动执行为 "manual"
+    /// 触发槽位："本地日期 + 该相位 HH:MM"，如 "2026-09-30 08:00"（见 [`slot`]）。
+    ///
+    /// 手动执行记的也是这种真实槽位（走 [`PHASE_START`]），所以手动跑完之后循环
+    /// 不会再补一遍；字面量 "manual" 只在 [`PHASE_MANUAL`] 里保留，当前无人产生。
     pub slot: String,
     /// 执行时刻（RFC3339 UTC；空串 = 没执行过）
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -142,7 +174,11 @@ pub struct Task {
     /// 可空；end_time 非空时必须有值
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub end_actions: Vec<Action>,
-    /// 各槽位"最后一次执行的槽位标识"，用于去重与补做判定
+    /// 各槽位"最后一次执行的槽位标识"，用于去重与补做判定。
+    ///
+    /// key 是相位（start / end），value 是 [`slot`] 的产出；随 schedule.json 落盘。
+    /// 幂等就靠它：`slots[phase]` 等于当前槽位时判定为"已执行"，补做与重启都安全
+    /// （依据 Go module/kernel/sched_view.go:922-935 `SchedStore.Record`）。
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub slots: HashMap<String, String>,
     /// 最近一次执行结果
@@ -422,9 +458,14 @@ pub fn validate_action(a: &mut Action) -> Result<()> {
         KIND_CELL_LOCK => {
             let tech =
                 parse_lock_tech(&a.tech).map_err(|_| msg("锁基站需要选择制式（LTE / NR）"))?;
-            a.tech = tech;
+            a.tech = tech.clone();
             if a.lock_type != 1 && a.lock_type != 2 {
                 return Err(msg("锁基站需要选择锁定方式（频点+PCI / 仅频点）"));
+            }
+            // 5G 的 QNWLOCK 语法没有「仅频点」档位（PCI 是必填位），保存时就拦住，
+            // 别等到定时任务跑起来才失败（见 model::lock::set_cell_lock）。
+            if tech == "NR" && a.lock_type != 1 {
+                return Err(msg("5G NR 锁小区只支持「频点+PCI」，没有「仅频点」档位"));
             }
             if !earfcn_valid(&a.tech, a.earfcn) {
                 return Err(msg(format!("频点号 {} 不合法", a.earfcn)));
@@ -531,7 +572,8 @@ pub fn validate_task(t: &mut Task) -> Result<()> {
 
 // ------------------------------------------------------------------ 时间判定 ---
 
-/// 槽位标识：把"某天某个 HH:MM"写成一个稳定字符串（本地日期 + 时间），用于去重。
+/// 槽位标识：把"某天某个 HH:MM"写成一个稳定字符串（本地日期 + 时间），用于去重
+/// （依据 Go module/kernel/sched_view.go:513-516 `Slot`）。
 pub fn slot(day: i64, hhmm: &str) -> String {
     format!("{} {}", day_text(day), hhmm)
 }
@@ -543,6 +585,9 @@ fn day_text(day: i64) -> String {
 }
 
 /// 本地"日"序号 → 星期（0=周日 … 6=周六；1970-01-01 是周四）。
+///
+/// 0=周日 的口径与 Go `time.Weekday` 一致（依据 Go module/kernel/sched_view.go:518-529
+/// `DayOK`），`days` 里的取值也是这一套，两边不能各改一半。
 pub fn weekday_of(day: i64) -> i64 {
     (day + 4).rem_euclid(7)
 }
@@ -570,6 +615,10 @@ pub struct Phase<'a> {
 }
 
 /// 任务的所有时间槽（start 一定有，end 可能没有）。
+///
+/// 两个槽位是**独立的**：各自按自己那天的 HH:MM 判定，不做"跨零点的时段"拼接。
+/// 所以 23:00 开始 / 07:00 结束 = 当晚锁、次日早上解锁（依据 Go
+/// module/kernel/store_test.go:747 `TestDuePhasesCrossDay`）。
 pub fn phases(t: &Task) -> Vec<Phase<'_>> {
     let mut out = vec![Phase {
         name: PHASE_START,
@@ -603,6 +652,10 @@ pub fn time_of_phase<'a>(t: &'a Task, phase: &str) -> &'a str {
 }
 
 /// 本地"日"序号 + "HH:MM" → 本地 Unix 秒（解析失败返回 None）。
+///
+/// 只做"当天 HH:MM"的落点换算：不跨日、不带时区（调用方传的已是本地"日"序号，
+/// 时区在 `logging::local_unix_now` 里折过一次）。HH:MM 非法时返回 None，让调用方
+/// 跳过该槽位——历史台账里可能存着没过校验的时间串。
 fn phase_at(day: i64, hhmm: &str) -> Option<i64> {
     let (h, m) = parse_hhmm(hhmm).ok()?;
     Some(day * 86_400 + h as i64 * 3600 + m as i64 * 60)
@@ -610,8 +663,13 @@ fn phase_at(day: i64, hhmm: &str) -> Option<i64> {
 
 /// 返回现在该执行的槽位（已去重、已考虑补做窗口）。
 ///
-/// 判定：槽位时间 <= now < 槽位时间 + [`CATCH_UP`]，且今天星期匹配，
-/// 且 `slots[phase]` 不是本槽位（上次执行记的就是它）。
+/// 判定：槽位时间 <= now < 槽位时间 + [`CATCH_UP`]（**左闭右开**，到点那一秒就算、
+/// 满 15 分钟就不再补），且今天星期匹配，且 `slots[phase]` 不是本槽位（上次执行记
+/// 的就是它）。依据 Go module/kernel/sched_view.go:566-590 `DuePhases`。
+///
+/// 补做与幂等：本函数只回答"该不该跑"，跑没跑过由 `slots` 记账（落点在
+/// `runtime::store::SchedStore::record`），所以进程重启后窗口内会补一次、窗口外不补，
+/// 重复调用不会重复返回同一个槽位。停用的任务一律不返回。
 pub fn due_phases(t: &Task, now_local: i64) -> Vec<String> {
     if !t.enabled {
         return Vec::new();
@@ -635,7 +693,14 @@ pub fn due_phases(t: &Task, now_local: i64) -> Vec<String> {
         .collect()
 }
 
-/// 计算接下来 `n` 次执行时间（本地 Unix 秒，展示用；两个槽位都算）。
+/// 计算接下来 `n` 次执行时间（本地 Unix 秒，**只用于展示**，不参与触发判定）。
+///
+/// 扫未来 8 天（够覆盖"只周日"这类稀疏周期，依据 Go module/kernel/sched_view.go:592-617）、
+/// 两个槽位都算，按星期过滤后再排序截断。
+///
+/// 与上游的一处有意差异：Go 是"收集到 n 条就停"（:599-610），本实现是"收满 8 天再排序
+/// 截断"。跨天任务（start 22:00 / end 07:00）在当天的收集顺序是 start→end，上游会先拿到
+/// 22:00；本实现排序后给的是真正更早的 07:00。展示口径更正确，故不回退成上游写法。
 pub fn next_runs(t: &Task, now_local: i64, n: usize) -> Vec<i64> {
     if !t.enabled || n == 0 {
         return Vec::new();
@@ -658,7 +723,9 @@ pub fn next_runs(t: &Task, now_local: i64, n: usize) -> Vec<i64> {
     out
 }
 
-/// 把本地 Unix 秒列表格式化成 "09-30 08:00 周三"。
+/// 把本地 Unix 秒列表格式化成 "09-30 08:00 周三"（与 Go `Format("01-02 15:04")` 同口径：
+/// **不含年份**，最长只展示到 8 天内，界面上下文里够用——依据
+/// Go module/kernel/sched_view.go:633-639 `TimesText`）。
 pub fn times_text(ts: &[i64]) -> Vec<String> {
     ts.iter()
         .map(|t| {
@@ -676,10 +743,14 @@ pub fn times_text(ts: &[i64]) -> Vec<String> {
 }
 
 /// 任务 id（时间戳 + 随机后缀，足够唯一且可读）。
+///
+/// 上游用 crypto/rand 取 3 字节（Go module/kernel/sched_view.go:619-626 `NewID`）；
+/// 这里用 `RandomState`（每进程随机播种）+ 进程内序号，只求**不碰撞**——id 不是
+/// 凭据，不需要密码学随机；跨重启的唯一性由时间戳兜底。
 pub fn new_id() -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    // RandomState 每进程随机播种；时间戳 + 序号兜底跨重启的唯二性
+    // RandomState 每进程随机播种；时间戳 + 序号兜底跨重启的唯一性
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
     h.write_u64(local_unix_now() as u64);
@@ -798,8 +869,10 @@ pub fn task_view_of(
 
 /// 该模组的「模组键」（与配额同一套口径：端口优先）。
 ///
-/// ⚠️ 不用 IMEI 当主键：实测两块同型号模组可能回报一模一样的 IMEI，
-/// 按 IMEI 存会让两台模组串台。端口号在同一条 USB 通路上是稳定的。
+/// 注意：不用 IMEI 当主键——实测两块同型号模组可能回报一模一样的 IMEI，
+/// 按 IMEI 存会让两台模组串台（锁错模组比不锁更糟）。端口号在同一条 USB 通路上
+/// 是稳定的，所以取端口；没有端口才退到 `id:`（依据 Go module/kernel/schedule.go:143-173
+/// `schedResolve` 用同一套键）。
 pub fn quota_key(m: &Modem) -> String {
     let port = m.port();
     if port.trim().is_empty() {
@@ -858,6 +931,7 @@ impl Modem {
     /// 与执行同一套能力口径：锁网看**真被固件接受过**的方言探测（不是猜测兜底），
     /// 组网模式看 mode 指令回读，机型不支持关射频的（F50：模组射频是整机唯一
     /// 上行）「开飞行模式」提前标不支持——「关飞行模式」仍允许（它是恢复手段）。
+    /// 依据 Go module/kernel/schedule.go:113-137 `schedActionSupported`。
     pub fn sched_action_supported(&self, kind: &str) -> Result<()> {
         let Some(info) = kind_info_for(kind) else {
             return Err(msg(format!("未知动作类型 {kind:?}")));
@@ -887,6 +961,8 @@ impl Modem {
 
     /// 执行一个定时动作。所有分支都复用已有的锁网 / 组网模式 / 飞行模式实现，
     /// 不为定时器另开一条下发路径（回读确认口径完全一致）。
+    /// 依据 Go module/kernel/schedule.go:51-111 `ApplySchedAction`；分支顺序与
+    /// 参数处理（含"解除锁频段走全量写回、绝不写 0"）保持一致。
     pub fn apply_sched_action(&self, a: &Action) -> Result<()> {
         match a.kind.as_str() {
             KIND_BAND_LOCK => {
@@ -902,7 +978,7 @@ impl Modem {
             }
             KIND_CELL_LOCK => {
                 let tech = parse_lock_tech(&a.tech)?;
-                self.set_cell_lock(&tech, a.lock_type, a.earfcn, a.pcid, None)?;
+                self.set_cell_lock(&tech, a.lock_type, a.earfcn, a.pcid, None, None)?;
                 if a.persist {
                     // 附加的持久化指令：best-effort，失败只 warn（锁定本身已生效）
                     self.save_cell_lock();
@@ -910,7 +986,7 @@ impl Modem {
             }
             KIND_CELL_UNLOCK => {
                 let tech = parse_lock_tech(&a.tech)?;
-                self.set_cell_lock(&tech, 0, 0, 0, None)?;
+                self.set_cell_lock(&tech, 0, 0, 0, None, None)?;
             }
             KIND_UNLOCK_ALL => {
                 self.unlock_all()?;
