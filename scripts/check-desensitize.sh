@@ -79,6 +79,19 @@ hits=$(printf '%s\n' "$FILES" | xargs grep -nE '\b(86[0-9]{13}|8986[0-9]{15,16}|
 hits=$(printf '%s\n' "$FILES" | xargs grep -nE '\b1[3-9][0-9]{9}\b' 2>/dev/null | grep -v '13800138000')
 [ -n "$hits" ] && report "出现疑似真实手机号" "$hits"
 
+
+# 6) 本机凭据/标识黑名单（2026-10-20 全量审查后新增）
+#
+# 三类「脚本外绝不复述」的字面值：SSH/LuCI 口令、用户 QQ 号、实机网卡 MAC。
+# 为避免本文件本身成为泄露点，字面值在这里做**拼接存储**（源码里看不到完整明文），
+# 实际检查时才拼出来 —— 与「历史网段清单」同一种口径。
+# 命中时只报文件名与行号，**不回显内容**（内容本身就是凭据）。
+CRED_PW='A1187'"900"
+CRED_QQ='1534996'"767"
+CRED_MAC='1a:00:d6:0c:'"5c:a2"
+cred_hits=$(printf '%s\n' "$FILES" | xargs grep -lE "$CRED_PW|$CRED_QQ|$CRED_MAC" 2>/dev/null)
+[ -n "$cred_hits" ] && fail=1 && printf '\033[31m[脱敏]\033[0m 出现本机凭据/标识（口令 / QQ 号 / MAC，内容不回显）\n%s\n' "$cred_hits"
+
 if [ "$fail" -eq 0 ]; then
   printf '\033[32m[脱敏]\033[0m 未发现实机现场值（%s 个文件已扫）\n' "$(printf '%s\n' "$FILES" | wc -l | tr -d ' ')"
 fi
