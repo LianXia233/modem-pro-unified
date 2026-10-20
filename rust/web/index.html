@@ -6286,7 +6286,7 @@ function renderDial() {
        <span class="pill ${pill}">${esc(s.state_text || '未拨号')}</span>
        ${s.phase_text ? `<span class="pill ${phasePill}" title="链路阶段：模组会话 / 主机网卡 / 默认路由三层">阶段：${esc(s.phase_text)}</span>` : ''}
        <span class="muted">cid=${esc(dash(s.cid))}${s.apn ? ' · APN ' + esc(s.apn) : ''}${s.pdp_type ? ' · ' + esc(s.pdp_type) : ''}</span>
-       ${s.elapsed_sec ? `<span class="muted">已连接 ${esc(fmtHeld(s.elapsed_sec))}</span>` : ''}
+       ${s.elapsed_sec ? `<span class="muted">接口在线 ${esc(fmtHeld(s.elapsed_sec))}</span>` : ''}
        ${s.type_name ? `<span class="muted">USB ${esc(s.type_name)}</span>` : ''}
        ${s.manual_stop ? '<span class="pill seg">已手动断开，不再自动拨号</span>' : ''}
      </div>

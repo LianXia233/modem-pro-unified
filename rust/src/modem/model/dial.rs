@@ -755,6 +755,57 @@ fn read_iface_addrs(dev: &str) -> Vec<String> {
     v
 }
 
+/// netifd 接口在线时长（秒）—— `ifstatus <iface>` 的 `uptime`，带 5 秒缓存。
+///
+/// 这才是页面「连接时间」该跟随的「接口时间」，见 `dial_status()` 第 ⑤ 步：
+/// 模组会话 `connected_at` 会因重拨/接口重建与接口真实在线时间对不上，内存
+/// 观测起点又会因 modemd 重启归零；netifd 的 uptime 跨重启保持正确。
+/// 与 `iface_addrs_cached` 同款缓存理由：`/api/dial`、`/api/snapshot` 被轮询，
+/// 不缓存就会每次 fork 一个 `ifstatus`。
+fn netifd_iface_uptime_cached(iface: &str) -> Option<u64> {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<Option<(String, Instant, Option<u64>)>> = Mutex::new(None);
+
+    let iface = iface.trim();
+    if iface.is_empty() {
+        return None;
+    }
+    {
+        let g = CACHE.lock().unwrap();
+        if let Some((n, at, up)) = g.as_ref() {
+            if n == iface && at.elapsed() < Duration::from_secs(5) {
+                return *up;
+            }
+        }
+    }
+    let up = read_iface_uptime(iface);
+    *CACHE.lock().unwrap() = Some((iface.to_string(), Instant::now(), up));
+    up
+}
+
+/// 真正执行 `ifstatus <iface>` 并解析 JSON 里的 `uptime`（秒）。
+fn read_iface_uptime(iface: &str) -> Option<u64> {
+    let out = std::process::Command::new("ifstatus").arg(iface).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_iface_uptime(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// 从 `ifstatus` 的 JSON 输出里取 `uptime`（秒）。0 / 缺失 / 非数字 ⇒ None。
+///
+/// 单独成函数是为了能单测（`ifstatus` 是外部命令，测试里跑不了）。
+fn parse_iface_uptime(json: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let up = match v.get("uptime") {
+        Some(serde_json::Value::Number(n)) => n.as_u64(),
+        Some(serde_json::Value::String(s)) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    };
+    up.filter(|&u| u > 0)
+}
+
 /// 扫一遍主机网卡，挑出可能是模组数据口的那些（强候选在前，其余按名字排）。
 ///
 /// 只是**提示**：真正把网卡拉起来要看主机侧的驱动/拨号器（见 [`DialType::host_setup`]），
@@ -1728,20 +1779,27 @@ impl Modem {
             take(&|a| a.contains(':'), &mut st.ipv6);
         }
 
-        // ⑤ 在线时长。
+        // ⑤ 在线时长：**跟随 netifd 接口时间**（`ifstatus modem<id>` 的 `uptime`）。
         //
-        //    netifd 拉起的链路没有 `connected_at`（本程序没拨过号），
-        //    页面「在线持续时长」就永远是 `-`。这里用「本程序第一次观察到
-        //    它在线」的时刻起算 —— 语义上要说清楚：这是**观测时长**，
-        //    不是运营商侧的真实会话时长（后者只有模组自己知道）。
+        //    这是用户报「连接时间显示不正常」的根因：早先时长有两个来源，都与
+        //    「接口时间」对不上 ——
+        //      · 模组会话 `connected_at`：重拨 / 接口重建后，会话起点和接口真实
+        //        在线时间不是一回事（接口可能比拨号后的会话更早或更晚起来）；
+        //      · 内存观测起点 `link_since`：modemd 一重启就归零，只是「本程序
+        //        观察到它在线至今」，不是接口在线时长。
+        //    netifd 的接口 uptime 才是权威的「这条链路起来了多久」，且跨 modemd
+        //    重启保持正确。拿不到（接口非本程序所建 / ifstatus 失败）才回退。
         if st.state == DIAL_CONNECTED {
-            let mut g = self.link_since.lock().unwrap_or_else(|e| e.into_inner());
-            let since = *g.get_or_insert_with(Instant::now);
-            // 只补「本来没有」的那种：本程序自己拨号时 connected_at 是有值的，
-            // 那套时长更准（含拨号耗时），不要被覆盖。
-            if st.connected_at.is_empty() && st.elapsed_sec <= 0 {
+            let iface = crate::netprov::iface_name(self.id);
+            if let Some(up) = netifd_iface_uptime_cached(&iface) {
+                st.elapsed_sec = up as i64;
+            } else if st.connected_at.is_empty() {
+                // 没有 netifd 接口可查（用户手工搭的链路）⇒ 退回观测起点
+                let mut g = self.link_since.lock().unwrap_or_else(|e| e.into_inner());
+                let since = *g.get_or_insert_with(Instant::now);
                 st.elapsed_sec = since.elapsed().as_secs() as i64;
             }
+            // else：connected_at 有值但取不到接口 uptime ⇒ 保留 normalized() 已算的会话时长
         } else {
             // 断开就清基线：下次连上重新起算，避免把断线期间也算进去
             *self.link_since.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -2503,6 +2561,15 @@ mod tests {
         assert_eq!(dial_state_text(DIAL_DISCONNECTING), "正在断开");
         assert_eq!(dial_state_text(DIAL_UNKNOWN), "状态未知");
         assert_eq!(dial_state_text("别的"), "未拨号");
+    }
+
+    #[test]
+    fn parse_iface_uptime_reads_number_and_rejects_zero() {
+        assert_eq!(parse_iface_uptime(r#"{"up":true,"uptime":1388}"#), Some(1388));
+        assert_eq!(parse_iface_uptime(r#"{"up":true,"uptime":"42"}"#), Some(42));
+        assert_eq!(parse_iface_uptime(r#"{"up":true,"uptime":0}"#), None);
+        assert_eq!(parse_iface_uptime(r#"{"up":false}"#), None);
+        assert_eq!(parse_iface_uptime("not json"), None);
     }
 
     #[test]

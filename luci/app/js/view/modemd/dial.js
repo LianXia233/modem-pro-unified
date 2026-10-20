@@ -373,14 +373,10 @@ return view.extend({
 					rowKv('IPv4 本机地址', st.ipv4 || '未分配'),
 					rowKv('IPv6 本机地址', st.ipv6 || '未分配'),
 					rowKv('已分配 CID', st.cid != null ? String(st.cid) : '-'),
-					/* 在线时长：
-					   · 本程序自己拨的号 → 用 connected_at 算的真实会话时长；
-					   · netifd 按 UCI 拉起的链路 → 没有 connected_at，后端用
-					     「本程序第一次观察到它在线」起算，所以如实标成「观测」。
-					   早先 `elapsed_sec ? … : '-'` 在 0 秒时也会显示 `-`，
-					   刚连上那一刻看起来像「读不到」。 */
-					rowKv('在线持续时长', durText(st.elapsed_sec),
-						st.link_source === 'netifd' ? '（观测值）' : '')
+					/* 接口在线时长：跟随 netifd 接口时间（ifstatus 的 uptime），跨 modemd
+					   重启也准确；拿不到接口 uptime 才回退到模组会话 connected_at 或
+					   本程序观测起点。显示的就是这条接口真正起来了多久。 */
+					rowKv('接口在线时长', durText(st.elapsed_sec))
 				]),
 				st.steps && st.steps.length ? E('div', { 'style': 'margin-top:14px;padding-top:10px;border-top:1px solid var(--mp-border-glass-subtle)' }, [
 					E('div', { 'style': 'font-size:12.5px;font-weight:600;color:var(--mp-neutral-700);margin-bottom:6px' }, '拨号流程步骤记录:'),

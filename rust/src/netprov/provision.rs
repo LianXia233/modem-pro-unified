@@ -211,7 +211,7 @@ pub fn provision_modem_with(
         }
     }
     let v6_plan = V6Plan::of(v6_mode, &static_v6, state.cfg.net.lan_ipv6);
-    let plan = plan_wan(
+    let mut plan = plan_wan(
         modem.id,
         &usb.kind,
         mode,
@@ -221,6 +221,12 @@ pub fn provision_modem_with(
         state.cfg.net.host_dial,
         &static_ipv4,
     );
+    // 强制下发 DNS（`[net] wan_dns`，默认 223.5.5.5 119.29.29.29）：只注入主接口，
+    // v6 兄弟接口不配 v4 DNS。蜂窝链路 DHCP 常拿不到 DNS（FM350 尤其如此），
+    // 写进 network.modem<id>.dns 后 netifd 拉起接口即下发到 resolv.conf.auto。
+    if let Some(main) = plan.ifaces.first_mut() {
+        main.dns = state.cfg.net.wan_dns.trim().to_string();
+    }
     rep.ifaces = plan.ifaces.iter().map(|i| i.name.clone()).collect();
 
     // ⑤ diff → 应用（现状已由调用方读好）

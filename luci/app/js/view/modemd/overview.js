@@ -749,7 +749,7 @@ return view.extend({
 			dialKv.appendChild(kvItem('接口驱动类型', dialSt.type_name || dialSt.kind || '-'));
 			dialKv.appendChild(kvItem('主机网卡接口', dialSt.host_iface || dialSt.iface || '-'));
 			dialKv.appendChild(kvItem('已分配 IPv4', dialSt.ipv4 || '-'));
-			dialKv.appendChild(kvItem('已连接时长', dialSt.elapsed_sec ? Math.round(dialSt.elapsed_sec / 60) + ' 分钟' : '-'));
+			dialKv.appendChild(kvItem('接口在线时长', dialSt.elapsed_sec ? Math.round(dialSt.elapsed_sec / 60) + ' 分钟' : '-'));
 		}
 	},
 

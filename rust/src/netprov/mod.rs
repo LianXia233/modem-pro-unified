@@ -166,6 +166,11 @@ pub struct PlannedIface {
     pub extendprefix: bool,
     /// `static` 模式的 IPv6 地址（带 `/128`；空 = 不设这一项）。
     pub ip6addr: String,
+    /// 强制下发的 DNS（空格分隔；空 = 不写 `dns` 项）。
+    ///
+    /// 只对主接口有意义 —— DNS 跟着默认路由走，v6 兄弟接口不配 v4 DNS。
+    /// 值由 provision 从 `[net] wan_dns` 注入（默认 `223.5.5.5 119.29.29.29`）。
+    pub dns: String,
 }
 
 /// 一个模组的组网计划。
@@ -237,6 +242,7 @@ pub fn plan_wan(
         gateway,
         extendprefix: false,
         ip6addr: String::new(),
+        dns: String::new(),
     }];
     if v6.mode.wants_sibling() && mode.wants_dhcpv6_sibling() {
         // `static` 模式没有可用地址时退回 dhcpv6：写个没有地址的 static 接口
@@ -263,6 +269,7 @@ pub fn plan_wan(
             gateway: String::new(),
             extendprefix: v6_mode == V6Mode::Dhcpv6 && v6.extend_prefix,
             ip6addr,
+            dns: String::new(),
         });
     }
     let zone_networks = ifaces.iter().map(|i| i.name.clone()).collect();
@@ -368,6 +375,8 @@ pub struct ExistingIface {
     /// `extendprefix` 原样存字符串（`"1"` / 空），`ip6addr` 带 `/128`。
     pub extendprefix: String,
     pub ip6addr: String,
+    /// 已下发的 DNS（空格分隔；用于 diff 对齐，避免每轮重复写）。
+    pub dns: String,
     /// 已经在哪些防火墙 zone 里（zone 名，如 `wan`）。
     pub zones: Vec<String>,
 }
@@ -445,6 +454,7 @@ pub fn diff_plan(
                 push_if_set(&mut ops, &p.name, "ipaddr", &p.ipaddr);
                 push_if_set(&mut ops, &p.name, "netmask", &p.netmask);
                 push_if_set(&mut ops, &p.name, "gateway", &p.gateway);
+                push_if_set(&mut ops, &p.name, "dns", &p.dns);
                 if p.extendprefix {
                     push_if_set(&mut ops, &p.name, "extendprefix", "1");
                 }
@@ -521,6 +531,18 @@ pub fn diff_plan(
                     ops.push(UciOp::Unset {
                         section: p.name.clone(),
                         key: "ip6addr".into(),
+                    });
+                }
+                // DNS 强制下发（见 PlannedIface.dns）：计划有就补齐/更新；
+                // 计划没有而现状有 ⇒ 清掉（切到 carrier 模式不残留旧 DNS）。
+                if !p.dns.is_empty() {
+                    if e.dns != p.dns {
+                        push_if_set(&mut ops, &p.name, "dns", &p.dns);
+                    }
+                } else if !e.dns.is_empty() {
+                    ops.push(UciOp::Unset {
+                        section: p.name.clone(),
+                        key: "dns".into(),
                     });
                 }
             }
@@ -1447,5 +1469,75 @@ mod tests {
         for p in ["pppoe", "static", "qmi", "3g", "", "MODEM_PRO "] {
             assert!(!is_managed_proto(p), "{p} 不该归我们管");
         }
+    }
+
+    // ---------- DNS 强制下发（`[net] wan_dns`） ----------
+
+    #[test]
+    fn diff_forces_and_updates_wan_dns() {
+        // 模拟 provision 注入后的计划：主接口带强制 DNS
+        let mut p = plan_wan(
+            0,
+            "ncm",
+            WanMode::Dhcp,
+            "eth2",
+            V6Plan::off(),
+            20,
+            false,
+            "10.42.0.16",
+        );
+        p.ifaces[0].dns = "223.5.5.5 119.29.29.29".to_string();
+
+        // 1) 新建接口：应写 dns
+        let ops = diff_plan(&[], &p, FIREWALL_ZONE, "firewall.wan");
+        assert!(ops.contains(&UciOp::Set {
+            section: "modem0".into(),
+            key: "dns".into(),
+            value: "223.5.5.5 119.29.29.29".into()
+        }));
+
+        // 2) 已配好同值：零写入（每轮组网循环不重复动手）
+        let cur = vec![ExistingIface {
+            name: "modem0".into(),
+            proto: PROTO_STATIC.into(),
+            device: "eth2".into(),
+            metric: "20".into(),
+            auto: "1".into(),
+            ipaddr: "10.42.0.16".into(),
+            netmask: "255.255.255.0".into(),
+            gateway: "10.42.0.1".into(),
+            dns: "223.5.5.5 119.29.29.29".into(),
+            zones: vec![FIREWALL_ZONE.into()],
+            ..Default::default()
+        }];
+        assert!(diff_plan(&cur, &p, FIREWALL_ZONE, "firewall.wan").is_empty());
+
+        // 3) 值变了：更新
+        let mut cur2 = cur.clone();
+        cur2[0].dns = "8.8.8.8".into();
+        let ops = diff_plan(&cur2, &p, FIREWALL_ZONE, "firewall.wan");
+        assert!(ops.contains(&UciOp::Set {
+            section: "modem0".into(),
+            key: "dns".into(),
+            value: "223.5.5.5 119.29.29.29".into()
+        }));
+
+        // 4) 计划不强制（carrier 模式）：清掉现状里的 dns
+        let mut p_off = plan_wan(
+            0,
+            "ncm",
+            WanMode::Dhcp,
+            "eth2",
+            V6Plan::off(),
+            20,
+            false,
+            "10.42.0.16",
+        );
+        p_off.ifaces[0].dns = String::new();
+        let ops = diff_plan(&cur, &p_off, FIREWALL_ZONE, "firewall.wan");
+        assert!(ops.contains(&UciOp::Unset {
+            section: "modem0".into(),
+            key: "dns".into()
+        }));
     }
 }

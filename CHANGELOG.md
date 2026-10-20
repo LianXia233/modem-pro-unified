@@ -2,6 +2,24 @@
 
 本项目采用 [语义化版本](https://semver.org/lang/zh-CN/)；版本号单一来源为仓库根 `VERSION`。
 
+## [未发布] - 2026-10-20
+
+### 强制下发 DNS（`[net] wan_dns`，默认 223.5.5.5 119.29.29.29）
+
+实机「获取 IP 异常 / APN 异常」的真凶是 `resolv.conf.auto` 为空 —— 蜂窝链路
+（FM350 系列 RNDIS 尤其如此）拿不到 DNS，dnsmasq 对公网域名一律 REFUSED。
+新增 `[net] wan_dns`（默认两个公共 DNS，`off`/`none` 关闭），组网时写进
+`network.modem<id>.dns`，netifd 拉起接口即经 `interface_add_dns_server`
+下发到 `resolv.conf.auto`。取值可配，空值回落默认。
+
+### 连接时间跟随接口时间
+
+拨号链路「在线时长」早先有两个来源、都与「接口时间」对不上：模组会话
+`connected_at`（重拨/接口重建后对不上）与内存观测起点 `link_since`
+（modemd 重启即归零）。改为取 `ifstatus modem<id>` 的 `uptime`——
+netifd 接口在线时长才是权威值，且跨重启保持正确；前两者降为兜底。
+前端三处标签统一为「接口在线时长」。
+
 ## [1.0.1] - 2026-10-20
 
 ### 1.0.0-14：实机四连修 —— 网卡归属 / 小区数量 / APN 溢出 / 全链路自动恢复

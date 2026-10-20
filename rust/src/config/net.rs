@@ -21,6 +21,13 @@ pub struct NetConfig {
     pub lan_ipv6: bool,
     pub wan_metric: i64,
     pub wan_zone: String,
+    /// 强制下发到 WAN 接口的 DNS（空格分隔；默认 `223.5.5.5 119.29.29.29`）。
+    ///
+    /// 蜂窝链路 DHCP 常拿不到 DNS（FM350 系列 RNDIS 尤其如此），导致
+    /// `resolv.conf.auto` 为空、域名解析全 REFUSED。插件组网时把它写进
+    /// `network.modem<id>.dns`，netifd 拉起接口即经 `interface_add_dns_server`
+    /// 下发到 resolv.conf.auto。取值 `off` / `none` = 不强制，用运营商/DHCP DNS。
+    pub wan_dns: String,
     pub dial_enabled: bool,
     pub allow_roaming: bool,
 }
@@ -39,6 +46,7 @@ impl Default for NetConfig {
             lan_ipv6: true,
             wan_metric: 20,
             wan_zone: "wan".to_string(),
+            wan_dns: "223.5.5.5 119.29.29.29".to_string(),
             dial_enabled: true,
             allow_roaming: true,
         }
@@ -65,6 +73,12 @@ impl NetConfig {
         // 这样 `/api/config` 与日志里看到的就是实际生效值。
         if self.host_dial_bin.trim().is_empty() {
             self.host_dial_bin = "native".to_string();
+        }
+        // DNS 强制下发：空值回落默认（两个公共 DNS）；off/none = 不强制。
+        match self.wan_dns.trim().to_ascii_lowercase().as_str() {
+            "" => self.wan_dns = "223.5.5.5 119.29.29.29".to_string(),
+            "off" | "none" | "carrier" => self.wan_dns = String::new(),
+            _ => self.wan_dns = self.wan_dns.trim().to_string(),
         }
     }
 }

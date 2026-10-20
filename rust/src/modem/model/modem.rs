@@ -90,9 +90,10 @@ pub struct Modem {
     pub(super) netscan_stop: Mutex<Option<Arc<AtomicBool>>>,
     /// 「本程序第一次观察到链路在线」的时刻（见 model/dial.rs）。
     ///
-    /// 只给 netifd 拉起的链路用：那种情况 `dial_state.connected_at` 是空的
-    /// （本程序没拨过号），于是页面「在线持续时长」永远是 `-`。
-    /// 用观测起点算时长，并在输出里标明这是「本程序观测到的」，不是运营商侧的真实时长。
+    /// **仅作兜底**：正常路径下「连接时间」跟随 netifd 接口 uptime（`ifstatus`，
+    /// 见 `dial_status()` 第 ⑤ 步）。只有取不到接口 uptime、且 `connected_at`
+    /// 也为空（用户手工搭的 netifd 链路、本程序没拨过号）时，才退回到这个内存
+    /// 观测起点 —— 它跨不过 modemd 重启，重启即归零。
     pub(super) link_since: Mutex<Option<Instant>>,
     /// 拨号状态机（见 model/dial.rs；零值 = 没拨过号）
     pub(super) dial_state: Mutex<DialState>,
