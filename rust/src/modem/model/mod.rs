@@ -20,7 +20,7 @@ mod netscan;
 mod netselect;
 mod network;
 mod params;
-// 拨号 APN 优选：一键拨号 / 自动拨号守护 / 拨号器托管三方共用（见 params.rs）
+// 拨号 APN 优选：一键拨号 / 自动重拨调度 / 拨号器托管三方共用（见 params.rs）
 pub use params::pick_dial_context;
 pub mod quota;
 mod regstate;

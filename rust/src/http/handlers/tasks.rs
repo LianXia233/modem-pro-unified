@@ -268,6 +268,10 @@ fn handle_post(
             tasks.submit(spec, move |t| {
                 t.progress("已下发重启，模组会掉线约 20 秒");
                 let r = m.reboot()?;
+                // 与同步接口同口径：重启断链 → 状态拉回 dialing（不是用户断开），
+                // 清退避让模组回来后立刻可重拨。
+                m.note_external_break("模组重启中，连接将重建");
+                crate::runtime::dialer::supervisor().reset_backoff(m.id);
                 Ok(serde_json::to_value(r)?)
             })
         }
@@ -282,6 +286,11 @@ fn handle_post(
             tasks.submit(spec, move |t| {
                 t.progress("正在拨号（QMI/MBIM 会起主机侧拨号器，约 10~30 秒）");
                 let out = m.dial(&dial_req, enabled, ims);
+                // QMI/MBIM 只是「交办」：会话由拨号协调器建。立刻踢一轮，
+                // 别让用户等下一次 15 秒节拍（AT 路径此时已连上，踢一轮是空操作）。
+                if out.is_ok() {
+                    crate::runtime::dialer::supervisor().kick(st.clone());
+                }
                 // 无论成败都把「卡在哪一步」的状态归档 + 广播，页面据此刷新
                 let st_now = m.dial_status();
                 let j = serde_json::to_value(&st_now)?;

@@ -35,12 +35,17 @@ pub fn handle(mut req: Request, state: &AppState, query: &HashMap<String, String
         log::warn!("写回 [net] dial_enabled 失败: {e}");
     }
     *state.net_dial_enabled.lock().unwrap() = Some(on);
+    // 重新打开：清退避，让统一调度下一轮（≤15 秒）立刻尝试，而不是等旧窗口走完。
+    if on {
+        crate::runtime::dialer::supervisor().reset_backoff_all();
+    }
 
     let msg = if on {
         "已开启拨号（[net] dial_enabled 已写回配置；自动组网 ≤15 秒按新值走）"
     } else {
-        // 关掉时组网循环的拨号器托管会立刻把 QMI/MBIM 的拨号器收起
-        // （见 runtime/dialer::want_for 的「拨号总开关关闭」），不用在这里亲自动手。
+        // 关掉时组网循环的拨号器托管会立刻把 QMI/MBIM 的会话收起
+        // （见 runtime/dialer 的 `stop_reason`「拨号总开关关闭」），不用在这里亲自动手；
+        // AT 路径也不再自动重拨（统一判定在 `auto_connect_allowed`）。
         "已关闭拨号（[net] dial_enabled 已写回配置）：所有拨号方式都不再拨号，主机侧拨号器也会被收起；要恢复打开这个开关即可"
     };
     let data = serde_json::json!({ "dial_enabled": state.dial_enabled() });

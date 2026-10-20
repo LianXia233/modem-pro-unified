@@ -1,7 +1,8 @@
 //! `POST /api/dial/auto` —— 自动拨号开关（`{on}`）。
 //!
 //! 写回 `config.toml` 的 `[net] auto_dial`（fm350 同款语义、默认 true），并同步
-//! 运行期值。开着时守护循环（`http::loops::spawn_auto_dial`）每 30 秒巡检：
+//! 运行期值。开着时拨号协调器（`runtime/dialer` 的 `reconcile`，随组网循环
+//! ≤15 秒一轮）统一巡检：
 //! PDP 掉了 / 开机没拨就自动重拨；用户手动断开（manual_stop）后不再打扰。
 //!
 //! `on` 必须显式给值（同 `/api/dial/enable` 的口径，防误关）。
@@ -31,6 +32,11 @@ pub fn handle(mut req: Request, state: &AppState, query: &HashMap<String, String
         log::warn!("写回 [net] auto_dial 失败: {e}");
     }
     *state.net_auto_dial.lock().unwrap() = Some(on);
+    // 刚打开自动拨号：清掉所有模组的退避窗口，别让人等完一个已经无意义的 5 分钟。
+    // （调度由拨号协调器统一负责，见 runtime/dialer 的 `reconcile`。）
+    if on {
+        crate::runtime::dialer::supervisor().reset_backoff_all();
+    }
 
     let msg = if on {
         "已开启自动拨号（[net] auto_dial 已写回配置；守护循环 30 秒内接管）"

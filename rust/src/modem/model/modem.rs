@@ -8,7 +8,7 @@
 //! 分组口径见 `module/netdev/ports_unix.go:112` 的 `GroupByUSBDevice`。
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -111,6 +111,21 @@ pub struct Modem {
     pub(super) dial_state: Mutex<DialState>,
     /// 拨号流程进行中（拨号要连发几条 AT，不允许并发）
     pub(super) dial_busy: AtomicBool,
+    /// 连接代次（generation）：每次「连接意图」变化就 +1。
+    ///
+    /// ## 解决的是什么
+    ///
+    /// 拨号是慢操作（连发几条 AT，最长几十秒），而这期间用户可能点了「断开」、
+    /// 自动调度可能发起了新一次重拨、模组可能被重启。没有代次时，旧流程醒来后
+    /// 会照常把状态写成「已连接」—— 覆盖掉新意图，页面显示与实际相反。
+    ///
+    /// 规则（全仓统一）：
+    ///   · `dial_inner` 开始时 `bump()` 拿到自己的代次，**每次提交状态前**比对；
+    ///   · `hangup`（用户断开）第一件事就是 `bump()`，作废所有在途拨号；
+    ///   · 原生后端起会话前记下代次，会话建好后再比对，代次变了立即拆掉新会话。
+    ///
+    /// 只做「提交门禁」，不打断在途 AT 收发（串口上发出去的字节收不回来）。
+    pub(super) dial_epoch: AtomicU64,
     /// USB 类型识别缓存（30 秒 TTL，见 model/dial.rs 的 `usb_type`）
     pub(super) dial_type: Mutex<Option<(DialTypeInfo, Instant)>>,
     /// IMEI 缓存（`imei()` 每次发 AT；定时器目标解析会反复问，见 model/schedule.rs）
@@ -181,6 +196,7 @@ impl Modem {
             link_since: Mutex::new(None),
             dial_state: Mutex::new(DialState::default()),
             dial_busy: AtomicBool::new(false),
+            dial_epoch: AtomicU64::new(0),
             dial_type: Mutex::new(None),
             imei_cache: Mutex::new(None),
             mode_supported_slot: Mutex::new(None),
@@ -464,6 +480,36 @@ impl Modem {
     /// 当前 AT 口路径。
     pub fn port(&self) -> String {
         self.port.lock().unwrap().clone()
+    }
+
+    // ---------- 连接代次（见 `dial_epoch` 字段的说明） ----------
+
+    /// 当前连接代次。只读，不发 AT，可任意线程调用。
+    pub fn dial_epoch(&self) -> u64 {
+        self.dial_epoch.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 宣布一次新的连接意图，返回新代次（调用方拿着它做后续提交门禁）。
+    ///
+    /// `pub(crate)`：只有拨号状态机、断开流程与原生后端能改意图；
+    /// 外部模块（HTTP handler / 调度循环）通过它们的公开入口间接使用。
+    pub(crate) fn bump_dial_epoch(&self) -> u64 {
+        self.dial_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
+    }
+
+    /// 代次是否仍是 `epoch`（即：这次慢操作的意图还有效）。
+    pub(crate) fn dial_epoch_is(&self, epoch: u64) -> bool {
+        self.dial_epoch() == epoch
+    }
+
+    /// 是否有拨号流程正在跑（只读原子量，不碰串口）。
+    ///
+    /// 拨号协调器用它区分「拨号中且有人跑」与「拨号中是上次异常留下的标记」：
+    /// 后者可以重来，前者必须等 —— 否则会每个节拍派一次活、全部撞在 `dial_busy` 上。
+    pub(crate) fn dial_in_progress(&self) -> bool {
+        self.dial_busy.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// 在已打开的 AT 口上执行一段操作（没有就现开）。

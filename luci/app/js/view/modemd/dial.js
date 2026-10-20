@@ -262,7 +262,7 @@ return view.extend({
 					]),
 
 					/* 自动拨号开关（[net] auto_dial，fm350 同款语义，默认开）：
-					   开着时守护循环每 30 秒巡检，PDP 掉了/开机没拨自动重拨；
+					   开着时拨号协调器每 ≤15 秒巡检一次，PDP 掉了/开机没拨自动重拨；
 					   手动断开（manual_stop）后不再打扰 —— 用户说断就真断了。 */
 					E('div', { 'class': 'mp-metric-box', 'style': 'justify-content:center' }, [
 						E('div', { 'style': 'display:flex;align-items:center;justify-content:space-between;margin-bottom:8px' }, [

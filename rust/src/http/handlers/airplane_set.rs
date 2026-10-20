@@ -18,7 +18,17 @@ pub fn handle(mut req: Request, state: &AppState, query: &HashMap<String, String
     };
     let on = request::bool_param(&params, "enabled", false);
     match modem.set_airplane(on) {
-        Ok(()) => response::ok(req, serde_json::to_value(modem.airplane())?),
+        Ok(()) => {
+            // 飞行模式会直接掐断数据链路（CFUN=4）：把连接状态拉回 dialing 并作废
+            // 在途流程，统一调度下一轮会按退避尝试（飞行中会失败并继续退避）。
+            // 关掉飞行模式时清退避 —— 立刻恢复拨号，不等旧窗口。
+            if on {
+                modem.note_external_break("已进入飞行模式，数据链路中断");
+            } else {
+                crate::runtime::dialer::supervisor().reset_backoff(modem.id);
+            }
+            response::ok(req, serde_json::to_value(modem.airplane())?)
+        }
         Err(e) => response::fail(req, -1, &e.to_string()),
     }
 }

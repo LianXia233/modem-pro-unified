@@ -69,7 +69,7 @@ pub struct AppState {
     pub(crate) net_dial_enabled: Mutex<Option<bool>>,
     /// 自动拨号开关（`[net] auto_dial`）运行期覆盖值。
     ///
-    /// 开着时守护循环每 30 秒巡检一次：PDP 掉了/没拨就自动重拨（fm350 同款语义），
+    /// 开着时拨号协调器每 ≤15 秒巡检一次：PDP 掉了/没拨就自动重拨（fm350 同款语义），
     /// 用户手动断开（manual_stop）后不再打扰。
     pub(crate) net_auto_dial: Mutex<Option<bool>>,
     /// 运行期改过的模组侧 IPv6 开关（`[net] wan_ipv6`，见 handlers/dial_ipv6.rs）

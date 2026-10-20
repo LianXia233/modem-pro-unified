@@ -11,7 +11,7 @@
 //!
 //! **不在本文件**的三件事（别在这里找）：
 //!   · 失败重试退避 —— `runtime/dialer::retry_delay`（5/10/20/40/60s）；
-//!     自动拨号守护的失败退避在 `http/loops.rs::spawn_auto_dial`（5 分钟）；
+//!     自动重拨的失败退避在 `runtime/dialer`（统一退避表，AT 30→300s）；
 //!   · 主机侧接口/路由的创建与清理 —— `netprov::provision`、`netprov::route`；
 //!   · QMI / MBIM 会话本身 —— `runtime/dialer::native`。
 //!
@@ -240,6 +240,15 @@ pub struct DialState {
     pub phase: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub phase_text: String,
+    /// 这次连接由哪个后端执行（新增的可选字段，旧前端不看它）：
+    /// `at` = 模组侧 AT 配方（ECM/RNDIS/NCM/unknown）；`native-qmi` / `native-mbim`
+    /// = 主机侧内置拨号器；空 = 没连过 / 不是本程序拨的（netifd 链路）。
+    ///
+    /// 与 `kind` 的分工：`kind` 说「模组是什么形态」，`backend` 说「谁在拨」——
+    /// 同一台 qmi 模组，`kind=qmi` + `backend=native-qmi` 才是一对；
+    /// 若 `kind=qmi` 而 `backend` 为空，说明会话还没建（或不由本程序管）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub backend: String,
 }
 
 impl DialState {
@@ -2049,6 +2058,140 @@ impl Modem {
         self.dial_status()
     }
 
+    /// 带代次门禁的失败提交：代次变了就**不写** failed（新意图已经接管状态）。
+    ///
+    /// 与 [`Self::dial_fail`] 的差别只在「写不写状态」——错误信息照样由调用方返回，
+    /// 让这次操作自己报告失败，而不是把别人刚设定的状态改掉。
+    fn dial_fail_guarded(&self, epoch: u64, err: &str) -> DialState {
+        if self.dial_epoch_is(epoch) {
+            self.dial_fail(err)
+        } else {
+            self.dial_status()
+        }
+    }
+
+    /// 提交门禁：代次变了说明有更新的连接意图（用户断开 / 新拨号 / 后端切换），
+    /// 本次慢操作的结果作废。
+    ///
+    /// 只挡「写状态」，不打断在途 AT 收发 —— 串口上已经发出去的字节收不回来，
+    /// 强行中断只会留下半条应答。作废后由新意图的持有者决定下一步。
+    fn dial_stale(&self, epoch: u64) -> Result<()> {
+        if self.dial_epoch_is(epoch) {
+            Ok(())
+        } else {
+            Err(msg(
+                "拨号流程已被更新的操作取代（用户断开或新的拨号请求），本次结果作废",
+            ))
+        }
+    }
+
+    // ---------- 统一生命周期：状态写入点（native 后端 / 外部断链） ----------
+
+    /// 原生后端（QMI/MBIM）数据呼叫建立成功：写权威连接状态。
+    ///
+    /// ## 为什么必须由后端回调
+    ///
+    /// QMI/MBIM 的 `Modem::dial()` 只做「交办」（发 AT 会顶掉承载），真正的会话
+    /// 由 `runtime/dialer` 在后续轮次建。早先这条路径**没有任何人**把
+    /// `DialState.state` 写成 `connected` —— 页面于是永远停在「拨号中」。
+    /// 现在由后端在会话确认后回调这里，代次作为门禁。
+    ///
+    /// 返回 `false` = 代次已变（用户刚断开 / 换了拨号请求），调用方应**立刻拆掉**
+    /// 刚建好的会话，而不是让一个没人要的连接挂在模组上。
+    pub(crate) fn note_native_up(&self, epoch: u64, backend: &str, note: &str) -> bool {
+        if !self.dial_epoch_is(epoch) {
+            return false;
+        }
+        self.dial_update(|s| {
+            s.state = DIAL_CONNECTED.to_string();
+            s.state_text = dial_state_text(DIAL_CONNECTED);
+            s.connected_at = rfc3339(unix_now());
+            s.last_error = String::new();
+            s.backend = backend.to_string();
+            s.manual_stop = false; // 后端在跑会话 = 用户没在断开
+            s.steps.push(DialStep {
+                name: "主机侧数据呼叫已建立".into(),
+                ok: true,
+                info: note.to_string(),
+                at: rfc3339(unix_now()),
+            });
+        });
+        true
+    }
+
+    /// 原生后端掉线 / 被重建：把状态从 connected 拉回 dialing（准备重拨）并记原因。
+    ///
+    /// 与 [`Self::hangup`] 的区别：那不是「人」的意图，**不能**置 `manual_stop`
+    /// （否则统一调度会把它当成用户断开，再也不重拨）。
+    pub(crate) fn note_native_down(&self, epoch: u64, reason: &str) -> bool {
+        if !self.dial_epoch_is(epoch) {
+            return false;
+        }
+        self.dial_update(|s| {
+            s.state = DIAL_DIALING.to_string();
+            s.state_text = dial_state_text(DIAL_DIALING);
+            s.connected_at = String::new();
+            s.last_error = reason.to_string();
+            s.steps.push(DialStep {
+                name: "主机侧数据呼叫断开".into(),
+                ok: false,
+                info: reason.to_string(),
+                at: rfc3339(unix_now()),
+            });
+        });
+        true
+    }
+
+    /// 会话被**策略**停掉（拨号总开关关闭 / host_dial 关闭）：状态落到 disconnected。
+    ///
+    /// 与 [`Self::note_external_break`] 的区别：那个是「马上会重拨」（dialing），
+    /// 这个是「按你的要求不再拨」，所以停在 disconnected，且**不置** manual_stop
+    /// （开关关着本来就由 `auto_connect_allowed` 拦住，无需伪装成用户断开）。
+    pub(crate) fn note_stopped(&self, why: &str) {
+        self.dial_update(|s| {
+            if s.state == DIAL_CONNECTED || s.state == DIAL_DIALING {
+                s.state = DIAL_DISCONNECTED.to_string();
+                s.state_text = dial_state_text(DIAL_DISCONNECTED);
+                s.connected_at = String::new();
+                s.backend = String::new();
+            }
+            s.last_error = why.to_string();
+            s.steps.push(DialStep {
+                name: "连接已停止".into(),
+                ok: true,
+                info: why.to_string(),
+                at: rfc3339(unix_now()),
+            });
+        });
+    }
+
+    /// 外部原因确认链路已断（模组重启 / 切 usbnet / 进飞行模式）。
+    ///
+    /// 作废在途流程（代次 +1）并把状态拉回 dialing：统一调度下一轮会按退避重拨。
+    /// **不置 `manual_stop`** —— 这不是用户的断开意图；飞行模式下重拨会失败并
+    /// 进入退避，关掉飞行模式时由 handler 清退避即可立刻恢复。
+    pub(crate) fn note_external_break(&self, why: &str) {
+        self.bump_dial_epoch();
+        self.dial_update(|s| {
+            if s.state == DIAL_CONNECTED || s.state == DIAL_DIALING {
+                s.state = DIAL_DIALING.to_string();
+                s.state_text = dial_state_text(DIAL_DIALING);
+                s.connected_at = String::new();
+            }
+            if s.state == DIAL_IDLE {
+                s.state = DIAL_DISCONNECTED.to_string();
+                s.state_text = dial_state_text(DIAL_DISCONNECTED);
+            }
+            s.last_error = why.to_string();
+            s.steps.push(DialStep {
+                name: "链路被外部操作中断".into(),
+                ok: false,
+                info: why.to_string(),
+                at: rfc3339(unix_now()),
+            });
+        });
+    }
+
     /// 最近一次**从模组读出来**的 APN（拨号时记下的）。内部专用 APN 不算。
     ///
     /// `pub(crate)`：拨号器托管要用它给 MBIM 补 `-s`（没 APN 拨号器直接退出）。
@@ -2119,27 +2262,35 @@ impl Modem {
 
     /// 拨号主流程（busy 锁由 [`Self::dial`] 持有）。
     fn dial_inner(&self, req: &DialRequest, activate_ims: bool) -> Result<DialState> {
+        // 本次拨号的连接代次：后面每个「要写成功状态」的地方都拿它比对。
+        // 用户中途点断开（`hangup` 会 bump）或自动调度发起新一次拨号时，
+        // 本流程继续把剩余 AT 发完，但**不允许**再改状态（见 `dial_stale`）。
+        let epoch = self.bump_dial_epoch();
         let mut cid = req.cid;
         if cid <= 0 {
             cid = DEFAULT_DATA_CID;
         }
         if !valid_cid(cid) {
             return Err(msg(self
-                .dial_fail(&format!("cid 必须在 0~42 之间，当前 {cid}"))
+                .dial_fail_guarded(epoch, &format!("cid 必须在 0~42 之间，当前 {cid}"))
                 .last_error));
         }
         let apn = req.apn.trim();
         let pdp_type = req.pdp_type.trim().to_uppercase();
         if !apn.is_empty() && !valid_apn(apn) {
             return Err(msg(self
-                .dial_fail(&format!("APN 只能包含字母、数字与 . - _（当前 {apn:?}）"))
+                .dial_fail_guarded(
+                    epoch,
+                    &format!("APN 只能包含字母、数字与 . - _（当前 {apn:?}）"),
+                )
                 .last_error));
         }
         if !pdp_type.is_empty() && !valid_pdp_type(&pdp_type) {
             return Err(msg(self
-                .dial_fail(&format!(
-                    "PDP 类型只支持 IP / IPV6 / IPV4V6（当前 {pdp_type:?}）"
-                ))
+                .dial_fail_guarded(
+                    epoch,
+                    &format!("PDP 类型只支持 IP / IPV6 / IPV4V6（当前 {pdp_type:?}）"),
+                )
                 .last_error));
         }
 
@@ -2159,6 +2310,13 @@ impl Modem {
             s.kind = info.kind.clone();
             s.type_name = info.name.clone();
             s.host_setup = host_setup.clone();
+            // 谁负责这次连接：QMI/MBIM 交给内置拨号器（native-*），其余走 AT 配方。
+            // 页面/排障靠它区分「已交办」与「AT 已发完」两种 dialing。
+            s.backend = if wan_host_dial_by_daemon(&info.kind) {
+                format!("native-{}", info.kind)
+            } else {
+                "at".to_string()
+            };
             s.ipv4 = String::new();
             s.ipv6 = String::new();
             s.host_iface = String::new();
@@ -2229,7 +2387,8 @@ impl Modem {
                 let last = self.last_dial_apn();
                 if last.is_empty() {
                     return Err(msg(self
-                        .dial_fail(
+                        .dial_fail_guarded(
+                            epoch,
                             "MBIM 模式必须填 APN（拨号器没有 -s 会直接退出）。\
                              请在「拨号上网」里填上运营商给的 APN 再拨号。",
                         )
@@ -2270,6 +2429,9 @@ impl Modem {
         let mut st_err = None;
         let mut st = self.params_refresh();
         if plan.pdp_first {
+            // 发激活指令前再确认一次意图：用户可能刚点了断开（hangup 已 bump）。
+            // 检查与发送之间只有微秒级窗口，实机竞态已收敛到可接受范围。
+            self.dial_stale(epoch)?;
             st_err = self.set_pdp(cid, true, req.reconnect).err();
             st = self.params_refresh();
             if st_err.is_some() && apn.is_empty() {
@@ -2302,6 +2464,9 @@ impl Modem {
         let mut vendor_ok = true;
         let mut vendor_err = String::new();
         for step in &plan.activate {
+            // 每条私有激活指令前都看一眼代次：一条 GTRNDIS/QNETDEVCTL 就要几秒，
+            // 用户在这期间点断开是常态，别让后面的指令把刚拆掉的承载又激活起来。
+            self.dial_stale(epoch)?;
             let resp = self.at_cmd_prio(Prio::Data, &step.cmd);
             let ok = is_ok(&resp);
             self.dial_step(
@@ -2345,12 +2510,12 @@ impl Modem {
                 format!("{e}（{why}）")
             };
             self.dial_step("拨号前置体检", false, &detail);
-            return Err(msg(self.dial_fail(&detail).last_error));
+            return Err(msg(self.dial_fail_guarded(epoch, &detail).last_error));
         }
         if !vendor_ok {
             let detail = format!("{vendor_err}；{}", plan.note);
             self.dial_step("拨号前置体检", false, &detail);
-            return Err(msg(self.dial_fail(&detail).last_error));
+            return Err(msg(self.dial_fail_guarded(epoch, &detail).last_error));
         }
         // 私有指令激活后，上下文列表可能才更新（没走 CGACT，params 还停在旧值）
         if !plan.pdp_first && !plan.activate.is_empty() {
@@ -2366,6 +2531,9 @@ impl Modem {
                 type_in_use = c.pdp_type.clone();
             }
         }
+        // AT 激活已经落地，但**先别宣布**：这中间用户可能点了断开 / 刚发起了新拨号。
+        // 代次变了就停在这里 —— 状态由新意图的持有者决定，本次只把错误带回去。
+        self.dial_stale(epoch)?;
         if plan.pdp_first {
             self.dial_step("激活 PDP（AT+CGACT）", true, &format!("cid={cid} 已激活"));
         } else {
@@ -2470,11 +2638,15 @@ impl Modem {
             );
         }
 
+        // 最后一道门禁：只凭「PDP 激活 + 模组给了地址」宣布成功之前，再确认意图没被换掉。
+        // 这一条挡的是「拨号进行中点断开」——旧流程醒来不能把状态改回 connected。
+        self.dial_stale(epoch)?;
         self.dial_update(|s| {
             s.state = DIAL_CONNECTED.to_string();
             s.state_text = dial_state_text(DIAL_CONNECTED);
             s.connected_at = rfc3339(unix_now());
             s.last_error = String::new();
+            s.backend = "at".to_string();
         });
         Ok(self.dial_status())
     }
@@ -2488,6 +2660,9 @@ impl Modem {
     /// cid <= 0 时用当前拨号状态里的 cid，再不行用数据默认 cid。
     /// ⚠️ 内部上下文（IMS / sos）有的固件不许手动停用，会回 ERROR —— 那时如实报错、不改状态。
     pub fn hangup(&self, cid: i32) -> Result<DialState> {
+        // 「用户要断开」是最高优先级的意图：第一步就作废所有在途拨号流程
+        // （它们醒来后会被 `dial_stale` 挡住，不会把状态改回 connected）。
+        self.bump_dial_epoch();
         let mut cid = cid;
         if cid <= 0 {
             cid = self.dial_state.lock().unwrap().cid;
@@ -2512,6 +2687,7 @@ impl Modem {
                 s.connected_at = String::new();
                 s.last_error = String::new();
                 s.manual_stop = true; // 尊重「人」的断开
+                s.backend = String::new();
                 s.steps = vec![DialStep {
                     name: "断开数据连接（停止主机侧拨号器）".into(),
                     ok: true,
@@ -2570,7 +2746,8 @@ impl Modem {
                     s.host_ips = Vec::new();
                     s.connected_at = String::new();
                     s.last_error = String::new();
-                    s.manual_stop = true;
+                    s.manual_stop = true; // 尊重「人」的断开
+                    s.backend = String::new();
                     s.steps = vec![DialStep {
                         name: "断开数据连接（模组自持会话）".into(),
                         ok: true,
@@ -2616,6 +2793,7 @@ impl Modem {
             s.connected_at = String::new();
             s.last_error = String::new();
             s.manual_stop = true; // 是「人」断的：自动组网不要再替他把链路上拉
+            s.backend = String::new();
             s.steps = vec![DialStep {
                 name: format!("断开数据连接（{last_ok}）"),
                 ok: true,
@@ -3227,5 +3405,80 @@ mod tests {
         );
         assert_eq!(m.ensure_dial_kind(), "");
         assert_eq!(m.cached_dial_kind(), "", "探不到就不回写，状态干净");
+    }
+
+    // ---------- 连接代次（统一生命周期） ----------
+
+    fn dev_modem() -> Modem {
+        Modem::new(
+            0,
+            "definitely-not-a-real-port".into(),
+            115_200,
+            Duration::from_secs(1),
+            crate::modem::vendor::Vendor::Quectel,
+        )
+    }
+
+    #[test]
+    fn hangup_bumps_epoch_even_when_the_at_command_fails() {
+        // 「用户断开」必须**先**作废在途拨号，再去发 AT。
+        // 即使模组拒绝（IMS 内部上下文 / 端口不可用），代次也已经变了 ——
+        // 在途拨号醒来后不会把状态改回 connected。
+        let m = dev_modem();
+        let before = m.dial_epoch();
+        let _ = m.hangup(1); // 端口不存在 ⇒ 必失败，但 bump 已经发生
+        assert!(m.dial_epoch() > before);
+    }
+
+    #[test]
+    fn native_up_is_rejected_after_an_intent_change() {
+        let m = dev_modem();
+        let epoch = m.dial_epoch();
+        // 代次已过期（模拟：建会话期间用户点了断开）
+        let _ = m.hangup(1);
+        assert!(
+            !m.note_native_up(epoch, "native-qmi", "stale"),
+            "过期代次不能写 connected"
+        );
+        assert_ne!(m.dial_state.lock().unwrap().state, DIAL_CONNECTED);
+    }
+
+    #[test]
+    fn native_up_and_down_keep_the_authoritative_state() {
+        let m = dev_modem();
+        let epoch = m.dial_epoch();
+        assert!(m.note_native_up(epoch, "native-mbim", "plan"));
+        {
+            let st = m.dial_state.lock().unwrap();
+            assert_eq!(st.state, DIAL_CONNECTED);
+            assert_eq!(st.backend, "native-mbim");
+            assert!(!st.manual_stop, "后端在跑会话 ≠ 用户断开");
+        }
+        // 掉线：回到 dialing（准备重拨），但**不能**置 manual_stop，
+        // 否则统一调度会把它当成用户断开、再也不重拨。
+        assert!(m.note_native_down(epoch, "packet service status != connected"));
+        {
+            let st = m.dial_state.lock().unwrap();
+            assert_eq!(st.state, DIAL_DIALING);
+            assert!(!st.manual_stop);
+            assert!(st.last_error.contains("packet service"));
+        }
+    }
+
+    #[test]
+    fn external_break_invalidates_in_flight_dial() {
+        // 重启 / 飞行模式 / 切网卡：作废在途流程，状态拉回 dialing，
+        // 由统一调度按退避重拨（而不是永远停在 connected）。
+        let m = dev_modem();
+        m.dial_update(|s| {
+            s.state = DIAL_CONNECTED.into();
+            s.backend = "at".into();
+        });
+        let before = m.dial_epoch();
+        m.note_external_break("模组重启中");
+        assert!(m.dial_epoch() > before);
+        let st = m.dial_state.lock().unwrap();
+        assert_eq!(st.state, DIAL_DIALING);
+        assert!(!st.manual_stop);
     }
 }
