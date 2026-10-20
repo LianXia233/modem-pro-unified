@@ -414,7 +414,23 @@ impl QmiSession {
                 }
             }
         }
-        let settings = link.runtime(qmi::SVC_WDS, client4).unwrap_or_default();
+        // v4 运行时设置（地址/网关/DNS/MTU）。v6 client 上同一条 mask 返回
+        // v6 地址/网关——quectel-CM 的 requestGetIPAddress() 对两个 client
+        // 都取，我们照做；v6 取不到只影响状态页的 modem_ipv6，不致命。
+        let mut settings = link.runtime(qmi::SVC_WDS, client4).unwrap_or_default();
+        if let Some(c6) = client6 {
+            match link.runtime(qmi::SVC_WDS_IPV6, c6) {
+                Ok(v6) => {
+                    if settings.ipv6.is_none() {
+                        settings.ipv6 = v6.ipv6;
+                    }
+                    if settings.ipv6_gateway.is_none() {
+                        settings.ipv6_gateway = v6.ipv6_gateway;
+                    }
+                }
+                Err(e) => log::debug!("原生 QMI：IPv6 Get Runtime 失败（忽略）: {e}"),
+            }
+        }
         Ok((
             Self {
                 link,
@@ -550,6 +566,18 @@ mod tests {
                             t.extend(qmi::tlv(0x29, &1500u32.to_le_bytes()));
                             t
                         }
+                        // 同一 mask 对 IPv6 client 返回 v6 地址/网关
+                        (qmi::SVC_WDS_IPV6, qmi::WDS_GET_RUNTIME_SETTINGS) => {
+                            let mut t = qmi::tlv(
+                                0x25,
+                                &[0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 64],
+                            );
+                            t.extend(qmi::tlv(
+                                0x26,
+                                &[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 64],
+                            ));
+                            t
+                        }
                         // 设备接受 32K 窗口（比请求的 16K 大）：客户端应回填
                         (qmi::SVC_WDA, qmi::WDA_SET_DATA_FORMAT) => {
                             qmi::tlv(0x16, &(32 * 1024u32).to_le_bytes())
@@ -585,11 +613,15 @@ mod tests {
         assert_eq!(sess.alive(), Some(true), "Get Pkt Status=2 应判为已连接");
         assert_eq!(sess.settings.mtu, Some(1500));
         assert_eq!(sess.settings.ipv4, Some(Ipv4Addr::new(10, 4, 83, 16)));
+        // v6 client 上也取一次 Get Runtime：地址/网关回填进 settings
+        assert!(sess.settings.ipv6.is_some(), "IPv6 地址应回填");
+        assert!(sess.settings.ipv6_gateway.is_some(), "IPv6 网关应回填");
 
         // 设备回读的窗口覆盖请求值
         let st = sess.status();
         assert_eq!(st["qmap"]["mux_id"], 0x81);
         assert_eq!(st["qmap"]["rx_urb_size"], 32 * 1024);
+        assert!(st["modem_ipv6"].is_string(), "状态页应有 modem_ipv6");
 
         // 请求顺序
         let seen = seen.lock().unwrap();

@@ -269,7 +269,13 @@ pub fn wds_stop(transaction: u16, service: u8, client: u8, handle: u32) -> Vec<u
     )
 }
 
-/// WDS Get Runtime Settings：mask 与 quectel-CM 相同（v4 地址/网关/掩码/DNS + MTU）。
+/// WDS Get Runtime Settings。
+///
+/// mask 取 quectel-CM `WdsGetRuntimeSettingReq()` 里我们用得上的四位：
+/// DNS bit4 / IPv4 地址 bit8 / 网关 bit9 / MTU bit13（`0x2310`）；
+/// PCSCF 两位（bit11/bit14）本项目不消费，故不发。
+/// 同一 mask 对 IPv6 client 同样有效（quectel-CM 注释 "the following mask
+/// also applies to IPV6"），应答里出 `0x25`/`0x26` 即 v6 地址/网关。
 pub fn wds_runtime(transaction: u16, service: u8, client: u8) -> Vec<u8> {
     let mask: u32 = (1 << 4) | (1 << 8) | (1 << 9) | (1 << 13);
     encode(

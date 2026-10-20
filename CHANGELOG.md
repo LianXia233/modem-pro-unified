@@ -166,6 +166,54 @@ Go 原版 `module/kernel/modem_serial.go:307-343` 的非 AT 口退避分两段�
   `bands_accept_json_and_colon`、fmt_bps 搬迁后遗留的空测试桩）；
 - 全部改动文件 LF 换行（仓库红线）。
 
+### 新模组：百旺 QDC507（LTE 移远方言 + 通用 CGACT 拨号）
+
+来源 [ainuoyan/QDC507-Modem-Support](https://github.com/ainuoyan/QDC507-Modem-Support)
+@ `bb57bb7`（GPL-3.0，**只取事实依据、按指令重实现，未复制代码**）。实机口径：
+VID `2c7c`、实机 `2c7c:0125`、型号 `QDC507GLEFM21`、ECM + DHCP 供址、
+拨号只有 `AT+CGACT=1,1`。
+
+- `vendor/baiwang.rs`（新增）：识别关键字 `QDC507` / `BAIWANG`，**排在移远之前**
+  （同 VID `2c7c`，ATI 可能只回 Quectel，CGMM 先给出型号）；`data_channel`
+  不覆盖，走 3GPP 通用 `AT+CGACT`；`usbnet` 读走 QCFG 方言、写只认 ECM
+  （参考实现 `modes=["ecm"]`）；`nwscanmodeex` 位标志读写
+  （2G=4 / 3G=8 / 4G=16）+ 读回轮询；能力面 12 条只读 AT 预设，
+  IMEI 写入按参考实现口径置 off。
+- 数据表：`modem_catalog.json` 追加 `qdc507` 扩展条目（ecm-only、`vid:2c7c`）；
+  `modem_ports.json` 追加 `rg501q-eu` 规则（`2c7c:0800`，AT 口按接口号
+  1.2/1.3，参考实现 `common.sh` 的接口路径匹配；上游 QModem 端口表无此条，
+  属有依据的 documented extension）。
+- `vendor_is_exclusive("2c7c")` 翻 **false**：QDC507 与移远共享 VID，
+  VID 只能当提示、不能钉死厂商；识别测试随之更新
+  （`2c7c:0125` 空 ATI → unknown + candidates；CGMM 报型号 → baiwang）。
+- hostnic 特例排除：QDC507 的 ECM 由模组 DHCP 供址，明确**不进**
+  FM350/RW350 的静态地址路径（测试钉住）。
+
+### 对照 OpenVohive 补 QMI 会话边界：IPv6 运行时设置回填 + TLV 编号裁决
+
+来源 [6106757-lab/openvohive](https://github.com/6106757-lab/openvohive)
+@ `6c1cc74`（PolyForm Noncommercial，只作协议行为基准），并用 libqmi
+`qmi-service-wds.json` / `qmi-service-wda.json` 与厂商 C 拨号器
+（quectel-CM、Fibocom-dial）仲裁编号分歧。逐条结论见
+`docs/UPSTREAM_AUDIT.md` §8。
+
+- **实改 1 处**：IPv6 呼叫成功后按同一 mask 向 `SVC_WDS_IPV6` 再取一次
+  Get Runtime Settings，回填 `ipv6`/`ipv6_gateway`（原来只取 v4，状态页
+  `modem_ipv6` 永远为空）。依据：quectel-CM `requestGetIPAddress()` 对
+  两个 client 分别请求，且注释明示 "the following mask also applies to
+  IPV6"；失败仅 debug 日志，不影响拨号结果。
+- **TLV 编号裁决**：`wds_start` 的 `0x30`=Technology Preference（uint8，
+  `[0x01]`=3GPP）、`0x31`=Profile Index 3GPP、`0x16`=Authentication
+  Preference、`0x19`=IP Family 与 libqmi / quectel-CM / Fibocom dial
+  三处一致；OpenVohive 把 Profile Index 写在 `0x30`、另发 `0x34` 扩展
+  技术偏好，与三处冲突，**不采纳**（记录在案）。
+- Get Runtime Settings mask `0x2310` 精确对应 quectel-CM
+  `WdsGetRuntimeSettingReq()` 四位（PCSCF 两位有意不发）；WDA Set Data
+  Format 与 Bind Mux Data Port 的 TLV 顺序/常量与 quectel-CM 逐条对上；
+  聚合门限 `0x19`/`0x1B`/`0x1C` 仅在其 `QUECTEL_UL_DATA_AGG` 下出现，
+  本项目同样不发（注释已记录依据）。
+- `wds_runtime` 注释改为精确描述（不再笼统写"与 quectel-CM 相同"）。
+
 ## [1.0.3] - 2026-10-20
 
 ### 文档：补齐上游致谢（只列参考过的仓库）

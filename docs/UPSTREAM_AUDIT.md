@@ -210,7 +210,74 @@ write_json_atomic}`；`fmt_bps` → 只留 `model::fmt_bps`（主机侧/模组�
 
 ---
 
-## 8. 上游致谢
+## 8. 追加审计（2026-10-21 续）：OpenVohive QMI 会话边界核对
+
+参考仓库 [6106757-lab/openvohive](https://github.com/6106757-lab/openvohive)
+HEAD `6c1cc74`（PolyForm Noncommercial，**只作协议行为基准，未拷贝代码**）。
+本轮把其 `pkg/quectel-qmi/qmi/wds.go` 的 Start Network / Get Runtime
+Settings / WDA / Bind Mux 编解码与本仓库 `rust/src/runtime/dialer/qmi.rs`
+逐条对照，并用两个独立来源仲裁编号分歧：libqmi
+`data/qmi-service-wds.json` / `qmi-service-wda.json`（freedesktop 官方
+镜像，LGPL-2.1+，仅取协议编号）与厂商拨号器 C 源码（quectel-CM
+`QMIThread.c` / `MPQMUX.h`；Fibocom `Fibocom-dial_Linux_Tool/QMIThread.c`
+——与 FM350 同厂，参考价值最高）。
+
+### 8.1 TLV 编号裁决：`wds_start` 本仓库编号正确，OpenVohive 标签有误
+
+| TLV | 本仓库 | libqmi 定义 | quectel-CM / Fibocom dial | OpenVohive | 结论 |
+| --- | --- | --- | --- | --- | --- |
+| `0x30` | Technology Preference，uint8 `[0x01]`（3GPP） | Technology Preference（guint8，`ALLOW_3GPP=1`） | `0x30`，len 1，`0x01`/`0x02` | **Profile Index** | 本仓库正确；OpenVohive 把 profile index 写进了技术偏好的位置 |
+| `0x31` | Profile Index（`pdn > 0` 时发） | Profile Index 3GPP（guint8） | — | — | 正确 |
+| `0x34` | 未使用 | Extended Technology Preference（guint16 位图） | — | "Technology Preference" uint16 | OpenVohive 用的是扩展字段，与 `0x30` 不是同一个字段；不采纳 |
+| `0x14` | APN | APN（string） | `0x14` | `0x14` | 一致 |
+| `0x17` / `0x18` | Username / Password | 同名 string | `0x17` / `0x18` | 同名 | 一致 |
+| `0x16` | Authentication Preference，uint8 | Authentication Preference（guint8） | `0x16`，len 1 | `0x16` | 一致（某处 PDF 流传的 `0x15` 说法不成立：libqmi 明确 `0x15` = IPv4 Address Preference） |
+| `0x19` | IP Family，uint8（4/6） | IP Family Preference（guint8） | 同 | `0x19` | 一致 |
+| 应答 `0x01` | Packet Data Handle | Packet Data Handle（guint32） | 同 | `0x01` | 一致 |
+
+OpenVohive 不发 `0x30`、改发 `0x34` 扩展技术偏好，模组不支持扩展字段时只能
+吃默认值；本仓库显式发 `0x30=[3GPP]`，与 quectel-CM / Fibocom dial /
+libqmi 主流一致，保留。
+
+### 8.2 Get Runtime Settings：mask 与应答 TLV 全部有据
+
+- 请求 mask `0x2310` = DNS bit4 / IPv4 地址 bit8 / 网关 bit9 / MTU bit13，
+  即 quectel-CM `WdsGetRuntimeSettingReq()` 里用得上的四位；PCSCF 两位
+  （bit11/bit14）本项目不消费，**有意不发**（`qmi.rs` 注释已改为精确
+  描述，不再笼统写"与 quectel-CM 相同"）。
+- 应答 TLV：`0x15`/`0x16` DNS、`0x1E` IPv4、`0x20` 网关、`0x21` 掩码、
+  `0x29` MTU 与 quectel-CM `MPQMUX.h` 的 `QMIWDS_GET_RUNTIME_SETTINGS_TLV_TYPE_*`
+  逐值相同；v6 的 `0x25`/`0x26` 同样有据。
+
+### 8.3 WDA Set Data Format / Bind Mux Data Port：逐条对上
+
+WDA `Set Data Format`（`0x0020`）TLV 顺序与 libqmi + quectel-CM
+`WdaSetDataFormat()` 一致：`0x10` QoS=0（no-QOS）、`0x11` 链路层协议=2（IP）、
+`0x12`/`0x13` 上下行聚合协议=QMAP 版本、`0x15` 下行最大报文数=
+`rx_urb_size/512`、`0x16` 下行最大聚合尺寸=`rx_urb_size`、`0x17` 端点
+（ep_type + iface_id）。聚合门限 `0x19`/`0x1B`/`0x1C` 只在 quectel-CM 定义
+`QUECTEL_UL_DATA_AGG` 时下发，本项目同样不发（`qmi.rs` 注释已记录依据）。
+Bind Mux Data Port（`0x00A2`）：`0x10` 端点（8 字节）、`0x11` mux id
+（1 字节）、`0x13` client type=1（TETHERED），与 quectel-CM
+`WdsSetQMUXBindMuxDataPort()` 逐字节同构。
+
+### 8.4 本轮实改（1 处，有测试）
+
+| # | 改动 | 上游依据 |
+| --- | --- | --- |
+| Q1 | **IPv6 client 上也取 Get Runtime Settings**：原来只向 v4 client 取运行时设置，状态页 `modem_ipv6` 永远为空。现在 v6 呼叫成功后按同一 mask 向 `SVC_WDS_IPV6` 再取一次，回填 `ipv6`/`ipv6_gateway`（不覆盖 v4 的 MTU/地址；v6 失败仅 debug 日志，不影响拨号结果） | quectel-CM `requestGetIPAddress()` 对 v4/v6 两个 client 分别请求，且注释明示 "the following mask also applies to IPV6"；测试 `qmap_session_sequence_matches_quectel` 假设备新增 v6 应答并断言回填 |
+
+### 8.5 有意不采纳 / 待评估
+
+| 项 | 结论 |
+| --- | --- |
+| OpenVohive `0x30=Profile Index` | 不采纳：与 libqmi / quectel-CM / Fibocom dial 三处冲突，见 §8.1 |
+| OpenVohive `StopAnyNetworkInterface`（残留会话 escape hatch） | 待评估：本仓库 `stop()` 已覆盖正常释放路径；需实机残留会话场景才能判断是否补 |
+| OpenVohive call-end reason 诊断（应答 `0x10`/`0x11`） | 待评估：诊断价值明确，但属新增对外字段，需先定 API 契约再动 |
+
+---
+
+## 9. 上游致谢
 
 本项目在开发过程中参考了以下仓库（按对齐基准排序）：
 
@@ -220,6 +287,9 @@ write_json_atomic}`；`fmt_bps` → 只留 `model::fmt_bps`（主机侧/模组�
 | [ouyangzq/luci-proto-modem-pro](https://github.com/ouyangzq/luci-proto-modem-pro) | `modem_pro` netifd 协议：IPv4 + IPv6 单接口承载、`accept_ra=2`、QMI 数据面、前缀漂移等实机注意事项 | 未声明 |
 | [FUjr/QModem](https://github.com/FUjr/QModem) | 模组知识底座：型号清单、USB 接口号白名单与端口规则、语音 PCM 接口排除、厂商 AT 方言与拨号脚本、发现退避策略 | MPL-2.0（附禁止商用附加条款） |
 | [LianXia233/luci-app-fm350](https://github.com/LianXia233/luci-app-fm350) | FM350 / RW350 系列模组的识别与 AT 方言、锁频/锁小区、IMEI MFG 块备份恢复口径 | 未声明 |
+| [6106757-lab/openvohive](https://github.com/6106757-lab/openvohive) | QMI/MBIM 会话边界对照基准：WDS Start/Stop/Runtime、WDA Set Data Format、Bind Mux 的 TLV 编号与流程；据此修正 IPv6 运行时设置缺口（§8.4） | PolyForm Noncommercial 1.0.0（仅参考，未拷贝） |
+| [hchyhchyxh/luci-app-rg501q-eu](https://github.com/hchyhchyxh/luci-app-rg501q-eu) | RG501Q-EU（`2c7c:0800`）的 USB 接口号口径（AT 口 1.2/1.3、QMI 1.4）、不绑 option 驱动的端口规则；据此新增 `modem_ports.json` 条目 | Apache-2.0（仅事实依据，未拷贝） |
+| [ainuoyan/QDC507-Modem-Support](https://github.com/ainuoyan/QDC507-Modem-Support) | 百旺 QDC507（`2c7c:0125`）识别口径与移远方言 AT、`AT+QCFG="nwscanmodeex"` 位标志、通用 `CGACT` 拨号配方；据此新增 baiwang 厂商模块 | GPL-3.0（仅事实依据，未拷贝） |
 
 **厂商拨号器 C 源码（quectel-CM / fibocom-dial / meig-cm / simcom-cm 等）不在致谢范围**：
 内置 QMI / MBIM 拨号器是本仓库的独立 Rust 实现，未使用、未拷贝任何厂商 C 源码；
