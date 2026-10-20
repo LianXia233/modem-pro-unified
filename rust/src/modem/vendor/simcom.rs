@@ -70,6 +70,26 @@ impl VendorSpec for Spec {
         Some("AT+CNWSEARCH=1")
     }
 
+    /// 芯讯通：**只有** 3GPP 的 `AT+CGACT`，没有私有激活指令。
+    ///
+    /// 高通平台的 QModem 实现会先读 `AT+CNMP?` 再发 `AT+CNMP=<原值>;+CNWINFO=1`
+    /// 保活 —— 这个值随卡/固件变化，写死会改掉用户的网络制式偏好，
+    /// 所以这里不发，只在 note 里说明差异。
+    fn data_channel(
+        &self,
+        ctx: &super::datacall::DataCallCtx<'_>,
+    ) -> Option<super::datacall::DataChannel> {
+        use super::datacall::{cgact_deactivate, DataChannel};
+        let _ = ctx.platform;
+        Some(DataChannel {
+            pdp_first: true,
+            activate: Vec::new(),
+            deactivate: vec![cgact_deactivate(ctx.cid)],
+            cgact_fallback: true,
+            note: "芯讯通只有 3GPP CGACT；高通平台的 CNMP 保活值随卡变化，不写死",
+        })
+    }
+
     fn at_plan_commands(
         &self,
         ctx: &crate::modem::atplan::PlanCtx,

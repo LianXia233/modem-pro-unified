@@ -28,6 +28,12 @@ pub struct ModemManager {
     /// 看到对方还没插入的口，于是**同一台设备被登记两次**（id 不同、抢同一个
     /// tty）—— 表现为列表里冒出幽灵模组、AT 应答互相串扰。
     discovering: std::sync::Mutex<()>,
+    /// 补 option 驱动尝试记录（`bus_path` → 上次尝试时刻）。
+    ///
+    /// 有些设备（例如只有 MBIM 形态、`option_driver=1` 但固件不出 AT 口）
+    /// 补绑后依然没有 tty。不节流的话每个巡检周期都会写一次 `new_id` 并刷日志；
+    /// 这里按 5 分钟冷却，仍然不会永久放弃（固件升级/换模式后还能再试）。
+    bind_tried: std::sync::Mutex<BTreeMap<String, std::time::Instant>>,
 }
 
 impl ModemManager {
@@ -40,6 +46,7 @@ impl ModemManager {
             next_id: RwLock::new(0),
             reaped: std::sync::Mutex::new(Vec::new()),
             discovering: std::sync::Mutex::new(()),
+            bind_tried: std::sync::Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -66,6 +73,11 @@ impl ModemManager {
         // 之外会重入的公开方法。
         let _serial = self.discovering.lock().unwrap_or_else(|e| e.into_inner());
         let baud = self.cfg.serial.baud;
+        // ⓪ 先补 option 驱动：没 tty 的设备到不了后面任何一步
+        let bound = self.auto_bind_option();
+        if bound > 0 {
+            log::info!("本轮补绑 {bound} 台设备的 option 驱动，重新枚举串口");
+        }
         // ① 先回收消失的模组，**再**统计已知口。
         //
         // 顺序要紧：`known` 里要是还留着已拔掉设备的口，
@@ -80,11 +92,11 @@ impl ModemManager {
             .collect();
 
         let mut added = 0;
-        for path in discover_new(&known, baud, self.cfg.serial.probe_timeout()) {
+        for d in discover_new(&known, baud, self.cfg.serial.probe_timeout()) {
             let id = self.alloc_id();
             let modem = Arc::new(Modem::new(
                 id,
-                path.clone(),
+                d.path.clone(),
                 baud,
                 self.cfg.serial.command_timeout(),
                 Vendor::Unknown,
@@ -93,14 +105,67 @@ impl ModemManager {
             let _ = modem.identify();
             self.apply_saved_at_port(&modem);
             log::info!(
-                "发现模组 id={id} at={} vendor={}",
-                modem.port(),
-                modem.vendor().as_str()
+                "发现模组 id={id} at={} vendor={} group={} fallback={} 规则={} 证据={}",
+                d.path,
+                modem.vendor().as_str(),
+                d.group,
+                d.fallback_index,
+                if d.rule_note.is_empty() {
+                    "未命中"
+                } else {
+                    &d.rule_note
+                },
+                d.evidence.join(" | ")
             );
+            for (port, why) in &d.skipped {
+                log::debug!("发现流程跳过 {port}：{why}");
+            }
             self.modems.write().unwrap().insert(id, modem);
             added += 1;
         }
         added
+    }
+
+    /// 发现前先把「端口规则要求 option 驱动、但还没出 tty」的设备补绑上。
+    ///
+    /// 顺序要紧：枚举串口前不补绑，这类设备永远看不到 tty，也就永远发现不了
+    /// （QModem `modem_scand.c:570` 同样在枚举接口之前写 `option1/new_id`）。
+    /// 受 `[serial] usb_autobind` 控制；失败只记日志，不影响其他设备。
+    fn auto_bind_option(&self) -> usize {
+        if !self.cfg.serial.usb_autobind {
+            return 0;
+        }
+        const BIND_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(300);
+        let mut n = 0;
+        for dev in crate::modem::usbdev::option_bind_candidates() {
+            {
+                let mut tried = self.bind_tried.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(last) = tried.get(&dev.bus_path) {
+                    if last.elapsed() < BIND_COOLDOWN {
+                        continue;
+                    }
+                }
+                tried.insert(dev.bus_path.clone(), std::time::Instant::now());
+            }
+            match crate::modem::usbdev::ensure_serial_tty(&dev) {
+                Ok(note) => {
+                    log::info!(
+                        "已补绑 option 驱动：{}:{}（{}）→ {note}",
+                        dev.vid,
+                        dev.pid,
+                        dev.bus_path
+                    );
+                    n += 1;
+                }
+                Err(e) => log::warn!(
+                    "补绑 option 驱动失败 {}:{}（{}）：{e}",
+                    dev.vid,
+                    dev.pid,
+                    dev.bus_path
+                ),
+            }
+        }
+        n
     }
 
     /// 回收「设备已经不在了」的模组，返回被摘掉的 id 列表。

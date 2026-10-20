@@ -141,6 +141,42 @@ impl VendorSpec for Spec {
         ("AT+QNWPREFCFG=\"mode_pref\"", "qcf")
     }
 
+    /// 广和通的数据通道按平台分两套（QModem `modem_dial.sh:1321-1383`）：
+    ///
+    /// - **MTK（FM350 / RW350）**：只认 `AT+CGACT`，没有 `GTRNDIS`；地址靠主机静态配置；
+    /// - 高通 / 展锐 / LTE：`AT+GTRNDIS=1,<cid>` 激活，`=0,<cid>` 断开。
+    ///
+    /// 早先统一发 CGACT 会让 FM150/FM160 这类高通机型 PDP active 但网卡无 carrier。
+    fn data_channel(
+        &self,
+        ctx: &super::datacall::DataCallCtx<'_>,
+    ) -> Option<super::datacall::DataChannel> {
+        use super::datacall::{cgact_deactivate, AtStep, DataChannel};
+        let cid = ctx.cid;
+        if ctx.platform == "mediatek" {
+            return Some(DataChannel {
+                pdp_first: true,
+                activate: Vec::new(),
+                deactivate: vec![cgact_deactivate(cid)],
+                cgact_fallback: true,
+                note: "MTK 平台（FM350/RW350）没有 GTRNDIS：靠 AT+CGACT 激活，地址由主机静态配置",
+            });
+        }
+        Some(DataChannel {
+            pdp_first: false,
+            activate: vec![AtStep::slow(
+                format!("AT+GTRNDIS=1,{cid}"),
+                "GTRNDIS=1 让模组把该 cid 的数据送到 USB 网卡",
+            )],
+            deactivate: vec![AtStep::new(
+                format!("AT+GTRNDIS=0,{cid}"),
+                "GTRNDIS=0 关闭该 cid 的 USB 数据通道",
+            )],
+            cgact_fallback: true,
+            note: "高通/展锐平台由 AT+GTRNDIS 激活数据通道",
+        })
+    }
+
     fn at_plan_commands(
         &self,
         ctx: &crate::modem::atplan::PlanCtx,

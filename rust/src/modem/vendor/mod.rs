@@ -36,6 +36,7 @@ use serde::Serialize;
 
 use crate::modem::at::AtPreset;
 
+pub mod datacall;
 pub mod fibocom;
 pub mod foxconn;
 pub mod gosuncn;
@@ -184,6 +185,15 @@ pub trait VendorSpec: Sync {
 
     /// 主动扫小区指令（只有实测支持的那家给）。
     fn cell_scan_cmd(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// 模组侧数据通道（ECM / RNDIS / NCM）的拨号配方。
+    ///
+    /// 默认 `None` = 本厂商没有登记私有激活指令，调用方退回 3GPP 通用路径
+    /// （`AT+CGACT`）。每家只写自己**有上游依据**的平台分支，平台不明时
+    /// 由 [`datacall::plan`] 统一拦成通用路径 —— 不在厂商模块里猜。
+    fn data_channel(&self, _ctx: &datacall::DataCallCtx<'_>) -> Option<datacall::DataChannel> {
         None
     }
 

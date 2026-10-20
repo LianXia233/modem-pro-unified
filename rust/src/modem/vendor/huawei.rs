@@ -85,6 +85,47 @@ impl VendorSpec for Spec {
         ("AT^SYSCFGEX?", "huawei_acq")
     }
 
+    /// 华为的两个平台各有一套数据通道（QModem `modem_dial.sh:1385-1415`、`:1533-1567`）：
+    ///
+    /// - **海思（巴龙）**：`AT^NDISDUP=1,<cid>` 激活，`AT^NDISDUP=0,0` 断开；
+    /// - **展锐**：模组自拨（`AT^SETAUTODIAL=1,<mode>`），断开时要先关自拨再 `AT+CFUN=0/1`。
+    fn data_channel(
+        &self,
+        ctx: &super::datacall::DataCallCtx<'_>,
+    ) -> Option<super::datacall::DataChannel> {
+        use super::datacall::{AtStep, DataChannel};
+        let cid = ctx.cid;
+        if ctx.platform == "unisoc" {
+            return Some(DataChannel {
+                pdp_first: false,
+                activate: vec![AtStep::new(
+                    "AT^SETAUTODIAL=1,4",
+                    "展锐平台：打开模组自拨（mode=4，与 QModem 默认一致）",
+                )],
+                deactivate: vec![
+                    AtStep::new("AT^SETAUTODIAL=0", "关闭模组自拨").optional(),
+                    AtStep::new("AT+CFUN=0", "射频下行（自拨会话需要 CFUN 循环才彻底断开）"),
+                    AtStep::new("AT+CFUN=1", "射频恢复上行"),
+                ],
+                cgact_fallback: false,
+                note: "展锐平台由模组自拨，主机不持有 PDP；断开需 CFUN 循环",
+            });
+        }
+        Some(DataChannel {
+            pdp_first: false,
+            activate: vec![AtStep::slow(
+                format!("AT^NDISDUP=1,{cid}"),
+                "巴龙平台：NDISDUP=1 让该 cid 的数据进入 USB 网卡",
+            )],
+            deactivate: vec![AtStep::new(
+                "AT^NDISDUP=0,0",
+                "NDISDUP=0 关闭 NDIS 数据通道（巴龙不按 cid 断开）",
+            )],
+            cgact_fallback: true,
+            note: "海思/巴龙平台由 AT^NDISDUP 激活 ECM/RNDIS 数据通道",
+        })
+    }
+
     fn at_plan_commands(
         &self,
         ctx: &crate::modem::atplan::PlanCtx,

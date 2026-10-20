@@ -18,6 +18,7 @@ use super::addr;
 use super::modem::Modem;
 use super::params::{cgact_state, is_internal_apn, valid_apn, Context};
 use super::regstate;
+use crate::modem::vendor::datacall;
 
 // ---------- 拨号状态机 ----------
 
@@ -786,7 +787,10 @@ fn netifd_iface_uptime_cached(iface: &str) -> Option<u64> {
 
 /// 真正执行 `ifstatus <iface>` 并解析 JSON 里的 `uptime`（秒）。
 fn read_iface_uptime(iface: &str) -> Option<u64> {
-    let out = std::process::Command::new("ifstatus").arg(iface).output().ok()?;
+    let out = std::process::Command::new("ifstatus")
+        .arg(iface)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -1838,8 +1842,7 @@ impl Modem {
                 let iface = st.host_iface.trim();
                 let has_v4 = st.host_ips.iter().any(|a| !a.contains(':'));
                 let has_v6 = st.host_ips.iter().any(|a| a.contains(':'));
-                let route_ok = (!has_v4
-                    || crate::netprov::route::has_default_via_family(iface, 4))
+                let route_ok = (!has_v4 || crate::netprov::route::has_default_via_family(iface, 4))
                     && (!has_v6 || crate::netprov::route::has_default_via_family(iface, 6));
                 phase_for_connected(!iface.is_empty(), !st.host_ips.is_empty(), route_ok)
                     .to_string()
@@ -1968,6 +1971,24 @@ impl Modem {
                 s.host_ips = iface_addrs_cached(&s.host_iface);
             }
         });
+    }
+
+    /// 查这家厂商在当前平台上的数据通道配方（ECM / RNDIS / NCM 专用）。
+    ///
+    /// 平台取自**支持清单**（`catalog`）的 `platform` 列 —— 与识别用的是同一张表，
+    /// 不用再从 ATI 文本里猜。型号不在清单里 ⇒ 平台为空 ⇒ 通用 3GPP 路径。
+    pub(crate) fn data_channel_for(&self, kind: &str, cid: i32) -> datacall::DataChannel {
+        let model = self.model().unwrap_or_default();
+        let platform = crate::modem::catalog::lookup(&model)
+            .map(|e| e.platform.clone())
+            .unwrap_or_default();
+        let ctx = datacall::DataCallCtx {
+            kind,
+            platform: &platform,
+            model: &model,
+            cid,
+        };
+        datacall::plan(self.vendor(), &ctx)
     }
 
     /// 拨号状态里记着的 USB 类型（不发 AT，只读缓存）。没拨过号就是空串。
@@ -2200,31 +2221,76 @@ impl Modem {
             return Ok(st);
         }
 
-        // ② 激活 PDP（cid 校验 / 先断后连 / 回读确认都在 set_pdp 里）
-        let mut st_err = self.set_pdp(cid, true, req.reconnect).err();
+        // ② 激活数据通道。配方按「厂商 × 平台」查（见 `vendor::datacall`）：
+        //    FM350 MTK / 芯讯通只认 AT+CGACT，移远/华为/美格等必须先发私有指令，
+        //    否则 PDP 显示 active 而网卡一直没有 carrier。
+        let plan = self.data_channel_for(&info.kind, cid);
+        let mut st_err = None;
         let mut st = self.params_refresh();
-        if st_err.is_some() && apn.is_empty() {
-            // ⚠️ 实测 FM350-GL：AT+CGACT=0,<cid> 之后该 cid 会从 AT+CGDCONT? 里消失，
-            // 于是「断开 → 拨号（APN 留空）」会报错。这时拿**上次用过（本来就从模组读出来）
-            // 的 APN** 补写一次配置再激活，让「断开再拨」能正常来回。
-            let last = self.last_dial_apn();
-            if !last.is_empty() {
-                let pt = if pdp_type.is_empty() {
-                    "IPV4V6"
-                } else {
-                    &pdp_type
-                };
-                if self.set_apn(cid, pt, &last, false).is_ok() {
-                    self.dial_step(
-                        "补写 APN（该 cid 停用后会从配置列表里消失）",
-                        true,
-                        &format!("cid={cid} {pt} {last}"),
-                    );
-                    st_err = self.set_pdp(cid, true, req.reconnect).err();
-                    st = self.params_refresh();
+        if plan.pdp_first {
+            st_err = self.set_pdp(cid, true, req.reconnect).err();
+            st = self.params_refresh();
+            if st_err.is_some() && apn.is_empty() {
+                // ⚠️ 实测 FM350-GL：AT+CGACT=0,<cid> 之后该 cid 会从 AT+CGDCONT? 里消失，
+                // 于是「断开 → 拨号（APN 留空）」会报错。这时拿**上次用过（本来就从模组读出来）
+                // 的 APN** 补写一次配置再激活，让「断开再拨」能正常来回。
+                let last = self.last_dial_apn();
+                if !last.is_empty() {
+                    let pt = if pdp_type.is_empty() {
+                        "IPV4V6"
+                    } else {
+                        &pdp_type
+                    };
+                    if self.set_apn(cid, pt, &last, false).is_ok() {
+                        self.dial_step(
+                            "补写 APN（该 cid 停用后会从配置列表里消失）",
+                            true,
+                            &format!("cid={cid} {pt} {last}"),
+                        );
+                        st_err = self.set_pdp(cid, true, req.reconnect).err();
+                        st = self.params_refresh();
+                    }
                 }
             }
         }
+
+        // ②b 私有数据通道指令（ECM/RNDIS/NCM）；QMI/MBIM 走不到这里。
+        //     失败先记步骤，允许回退时再补一次 CGACT —— 老固件对私有指令回 ERROR
+        //     很常见，直接判失败会让本来能用的机型彻底拨不出去。
+        let mut vendor_ok = true;
+        let mut vendor_err = String::new();
+        for step in &plan.activate {
+            let resp = self.at_cmd_prio(Prio::Data, &step.cmd);
+            let ok = is_ok(&resp);
+            self.dial_step(
+                &format!("数据通道（{}）", step.cmd),
+                ok,
+                if ok {
+                    step.why
+                } else {
+                    "模组拒绝该指令"
+                },
+            );
+            if !ok {
+                if step.optional {
+                    continue;
+                }
+                vendor_ok = false;
+                vendor_err = format!("模组拒绝 {}（{}）", step.cmd, step.why);
+                break;
+            }
+        }
+        if !vendor_ok && plan.cgact_fallback && !plan.pdp_first {
+            self.dial_step(
+                "私有指令被拒，回退 3GPP 激活",
+                true,
+                &format!("{vendor_err}；改发 AT+CGACT=1,{cid}"),
+            );
+            st_err = self.set_pdp(cid, true, req.reconnect).err();
+            st = self.params_refresh();
+            vendor_ok = st_err.is_none();
+        }
+
         if let Some(e) = st_err {
             self.dial_step("激活 PDP（AT+CGACT）", false, &e.to_string());
             // 失败时补一次前置体检：把「SIM 未就绪 / 未在线 / 未注册」写进错误，
@@ -2239,6 +2305,15 @@ impl Modem {
             self.dial_step("拨号前置体检", false, &detail);
             return Err(msg(self.dial_fail(&detail).last_error));
         }
+        if !vendor_ok {
+            let detail = format!("{vendor_err}；{}", plan.note);
+            self.dial_step("拨号前置体检", false, &detail);
+            return Err(msg(self.dial_fail(&detail).last_error));
+        }
+        // 私有指令激活后，上下文列表可能才更新（没走 CGACT，params 还停在旧值）
+        if !plan.pdp_first && !plan.activate.is_empty() {
+            st = self.params_refresh();
+        }
         let mut apn_in_use = apn.to_string();
         let mut type_in_use = pdp_type.clone();
         if let Some(c) = st.contexts.iter().find(|c| c.cid == cid) {
@@ -2249,13 +2324,17 @@ impl Modem {
                 type_in_use = c.pdp_type.clone();
             }
         }
-        self.dial_step("激活 PDP（AT+CGACT）", true, &format!("cid={cid} 已激活"));
+        if plan.pdp_first {
+            self.dial_step("激活 PDP（AT+CGACT）", true, &format!("cid={cid} 已激活"));
+        } else {
+            self.dial_step("数据通道已建立", true, plan.note);
+        }
         self.dial_update(|s| {
             s.apn = apn_in_use;
             s.pdp_type = type_in_use;
         });
 
-        // ②b 顺手把 IMS 上下文也激活（VoLTE / IMS 短信的前提）。
+        // ②c 顺手把 IMS 上下文也激活（VoLTE / IMS 短信的前提）。
         // ⚠️ 失败只记一条步骤：有些固件就是不许手动激活 IMS，绝不能因此把拨号判成失败。
         if activate_ims {
             let res = self.activate_ims(&st.contexts);
@@ -2403,12 +2482,51 @@ impl Modem {
             return Ok(self.dial_status());
         }
 
-        let cmd = format!("AT+CGACT=0,{cid}");
-        let resp = self.at_cmd_prio(Prio::Data, &cmd);
-        if !is_ok(&resp) {
-            return Err(msg(format!(
-                "模组拒绝 {cmd}（内部上下文 IMS/sos 不允许手动停用；或该 cid 本来就没激活）"
-            )));
+        // ECM/RNDIS/NCM：断开必须和激活走**同一套配方**（见 `vendor::datacall`）。
+        // 早先只会发 AT+CGACT=0：移远/华为/美格那几家根本不断开数据通道，
+        // 网卡还在、模组还在往主机送包，页面上却显示「已断开」。
+        let kind = self.cached_dial_kind();
+        let plan = self.data_channel_for(&kind, cid);
+        let mut steps: Vec<datacall::AtStep> = plan.deactivate.clone();
+        if steps.is_empty() {
+            if plan.cgact_fallback {
+                steps.push(datacall::cgact_deactivate(cid));
+            } else {
+                // 模组自持会话（合宙）：上游明确「断开不动模组」，只停主机侧接口。
+                self.dial_update(|s| {
+                    s.state = DIAL_IDLE.to_string();
+                    s.state_text = dial_state_text(DIAL_IDLE);
+                    s.cid = cid;
+                    s.ipv4 = String::new();
+                    s.ipv6 = String::new();
+                    s.host_iface = String::new();
+                    s.host_ips = Vec::new();
+                    s.connected_at = String::new();
+                    s.last_error = String::new();
+                    s.manual_stop = true;
+                    s.steps = vec![DialStep {
+                        name: "断开数据连接（模组自持会话）".into(),
+                        ok: true,
+                        info: plan.note.to_string(),
+                        at: rfc3339(unix_now()),
+                    }];
+                });
+                return Ok(self.dial_status());
+            }
+        }
+
+        let mut last_ok = String::new();
+        for step in &steps {
+            let resp = self.at_cmd_prio(Prio::Data, &step.cmd);
+            if !is_ok(&resp) {
+                let tail = format!("{}（{}）", step.cmd, step.why);
+                self.dial_step(&format!("断开数据连接（{}）", step.cmd), false, &tail);
+                return Err(msg(format!(
+                    "模组拒绝 {}（内部上下文 IMS/sos 不允许手动停用；或该 cid 本来就没激活）",
+                    step.cmd
+                )));
+            }
+            last_ok = step.cmd.clone();
         }
         // 回读确认（去激活通常很快，读不到也不影响「已经下发过」这件事，所以不当失败）
         let activated = self.at_cmd_prio(Prio::Data, "AT+CGACT?");
@@ -2432,7 +2550,7 @@ impl Modem {
             s.last_error = String::new();
             s.manual_stop = true; // 是「人」断的：自动组网不要再替他把链路上拉
             s.steps = vec![DialStep {
-                name: format!("断开数据连接（{cmd}）"),
+                name: format!("断开数据连接（{last_ok}）"),
                 ok: true,
                 info: note,
                 at: rfc3339(unix_now()),
@@ -2464,7 +2582,10 @@ mod tests {
     #[test]
     fn phase_text_is_human_readable() {
         assert_eq!(dial_phase_text(PHASE_ONLINE), "网络就绪（地址 + 默认路由）");
-        assert_eq!(dial_phase_text(PHASE_IFACE), "数据会话已建立，主机网卡未就绪");
+        assert_eq!(
+            dial_phase_text(PHASE_IFACE),
+            "数据会话已建立，主机网卡未就绪"
+        );
         assert_eq!(dial_phase_text(PHASE_ROUTE), "网卡有地址，但默认路由不经它");
         // 未认识的值原样返回，不 panic
         assert_eq!(dial_phase_text("whatever"), "whatever");
@@ -2565,7 +2686,10 @@ mod tests {
 
     #[test]
     fn parse_iface_uptime_reads_number_and_rejects_zero() {
-        assert_eq!(parse_iface_uptime(r#"{"up":true,"uptime":1388}"#), Some(1388));
+        assert_eq!(
+            parse_iface_uptime(r#"{"up":true,"uptime":1388}"#),
+            Some(1388)
+        );
         assert_eq!(parse_iface_uptime(r#"{"up":true,"uptime":"42"}"#), Some(42));
         assert_eq!(parse_iface_uptime(r#"{"up":true,"uptime":0}"#), None);
         assert_eq!(parse_iface_uptime(r#"{"up":false}"#), None);

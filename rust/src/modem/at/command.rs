@@ -1,6 +1,5 @@
 //! AT 命令发送与应答读取。
 
-use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
 use crate::error::{msg, Result};

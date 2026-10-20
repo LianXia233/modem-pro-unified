@@ -4,6 +4,46 @@
 
 ## [未发布] - 2026-10-20
 
+### 上游融合（一）：端口规则进发现流程 + 厂商数据通道指令
+
+**发现流程不再「见 tty 就探」**
+
+- 新增 `discovery/plan.rs`：按 USB 设备分组（`1-1`），按 QModem 端口规则的
+  `include` 接口号白名单筛选，剔除语音 PCM 口；同组只选一个命令口，其余留作回退。
+  以前 RM520N-GL 这类 4 口模组会被登记成 2~3 台「模组」，抢同一块网卡。
+- 新增 `AtPort::probe_identity()`：`AT` 回 `OK` 不再当作命令口，必须
+  `AT+CGMM`/`AT+CGMI`/`ATI` 有一条内容行（对齐上游 Go 版
+  `module/netdev/ports.go:165-252` 的真机结论）。
+- `option_driver=1` 的设备在枚举串口**之前**补绑（`option1/new_id`），
+  按 5 分钟冷却避免刷日志；受 `[serial] usb_autobind` 控制。
+- PCIe/MHI 的 AT 口（`/dev/mhi_*DUN*`、`/dev/mhi_*AT*`、`/dev/wwan*at*`）并入候选；
+  `AtPort` 增加裸字符设备后端（这些节点不是 tty，`serialport` 打不开）。
+
+**ECM/RNDIS/NCM 的拨号改成按厂商发指令**
+
+- 新增 `vendor/datacall.rs`：`AT+QNETDEVCTL`（移远，按平台三套参数）、
+  `AT+GTRNDIS`（广和通高通/展锐）、`AT^NDISDUP`（华为/鼎桥）、`AT^SETAUTODIAL`
+  （华为展锐自拨）、`AT$QCRMCALL`（美格）、`AT$MYUSBNETACT`（有方）、
+  `AT#ICMAUTOCONN`（Telit）、`AT+ZECMCALL`（高新兴）、`AT+RNDISCALL`（合宙）。
+  以前一律 `AT+CGACT`，移远/华为/美格这类机型 PDP 显示 active 但网卡没有 carrier。
+- 挂断与激活**严格对称**：断开时发同族的 deactivate 指令，不再只停 PDP；
+  合宙（模组自持 PDP）按上游口径只停主机接口，并在步骤里注明。
+- FM350/RW350（广和通 MTK）与芯讯通保持 `AT+CGACT`，不发 `GTRNDIS`；
+  私有指令被拒时回退 CGACT 并记录，不会把失败伪装成成功。
+- 平台未识别（型号不在清单里）时只走 3GPP 通用路径，不发任何私有指令。
+
+**文档**
+
+- 新增 `docs/UPSTREAM_AUDIT.md`（审计 + 迁移矩阵 + 真机待办）与
+  `docs/SUPPORT_MATRIX.md`（91 型号 × 形态 × 平台）；`docs/README.md` 说明
+  `66853b8` 删除的历史文档不再作为设计依据，README 的失效链接同步修正。
+
+- 非 AT 口否定缓存：15s→30s→60s→120s→240s→300s 退避，端口消失即清空。
+  巡检 3 秒一轮，否则每个「不是模组」的 tty 每轮都要白等 4 条 AT 超时。
+
+测试：`cargo test --locked` 722 项通过（新增 19 项，含厂商命令字面量、平台回退、
+cid 替换、激活/挂断对称、端口白名单与物理分组、退避曲线）。真机验证待办见审计文档 §5。
+
 ### 强制下发 DNS（`[net] wan_dns`，默认 223.5.5.5 119.29.29.29）
 
 实机「获取 IP 异常 / APN 异常」的真凶是 `resolv.conf.auto` 为空 —— 蜂窝链路

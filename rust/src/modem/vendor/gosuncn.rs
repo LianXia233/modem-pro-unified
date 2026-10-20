@@ -82,6 +82,27 @@ impl VendorSpec for Spec {
         UsbnetWrite::Deny("高新兴的 USB 切换（AT+ZSWITCH）未逐档取证，只支持查看")
     }
 
+    /// 高新兴 LTE 平台：`AT+ZECMCALL=1` / `=0`（QModem `modem_dial.sh:1475-1482`、`:1154-1156`）。
+    fn data_channel(
+        &self,
+        ctx: &super::datacall::DataCallCtx<'_>,
+    ) -> Option<super::datacall::DataChannel> {
+        use super::datacall::{AtStep, DataChannel};
+        if ctx.platform != "lte" {
+            return None;
+        }
+        Some(DataChannel {
+            pdp_first: false,
+            activate: vec![AtStep::new(
+                "AT+ZECMCALL=1",
+                "高新兴 LTE：打开 ECM 数据呼叫",
+            )],
+            deactivate: vec![AtStep::new("AT+ZECMCALL=0", "关闭 ECM 数据呼叫")],
+            cgact_fallback: true,
+            note: "高新兴 LTE 平台由 AT+ZECMCALL 激活 ECM",
+        })
+    }
+
     fn at_plan_commands(
         &self,
         ctx: &crate::modem::atplan::PlanCtx,
