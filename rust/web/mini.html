@@ -20,9 +20,8 @@
   消息格式（摘要）：{tag:'modemd-mini', op, tech, rsrp, rsrpText, unread, total, hasModem, error}
   消息格式（新短信）：{tag:'modemd-mini', smsnew:{index, number, timestamp, content, rest, unread, unlocked}}
 
-  短信正文要令牌：设备中心解锁短信后会把令牌放到**同源**的 localStorage['modemd.smsToken']
-  （只在那只标签页活着时有值）—— 这里读到就把它带进 WS 握手（?sms_token=），
-  服务端才会把带正文的 sms 推送发过来；读不到就退化成“未读变多 = 有新短信”。
+  短信密码已于 2026-10-19 取消：带正文的 sms 推送与角标一样走普通广播
+  （见 http/push.rs 的 push_sms），不再需要令牌，也不再走“未读变多”兜底。
 
   用法：/?.... 都不需要，直接 /mini 即可（?theme=light 可切成浅色）。
 -->
@@ -216,28 +215,12 @@
   var SIGNAL = {};            // 最近一次 signal 推送/快照（按 id）
   var COUNTS = {};            // smscount 推送（按 id）
   var SMS_SEEN = {};          // 每模组“已知的短信索引”（判断推送里哪几条是新到的）
-  var SMS_UNREAD = {};        // 上一次的未读数（拿不到正文时用它判断“有新短信”）
-  var lastSmsPushAt = 0;      // 上一次收到带正文的 sms 推送（用来给计数路兜底去重）
-  // SMS_CONTENT：能不能拿到**带正文**的短信推送。
-  //   · 有短信令牌（设备中心解锁过）⇒ 能；
-  //   · 短信密码没启用（外层路由器登录已经接管，见 [ui] require_luci_login）⇒ 也能。
-  // 能拿到正文时就不能再走“未读变多”那条兜底 —— 否则第一条新短信会先弹一张
-  // “有 N 条未读、正文受保护”的卡（`+CMTI` 的计数推送**比正文早**），随后正文卡再弹一次。
-  var SMS_CONTENT = false;
   // LUCI_SID：父页面（widget.js）拼在 URL 上的 LuCI 会话 ID ⇒ 免登。
   // 也兼容老写法：modemd_widget cookie（浏览器会自动带上，不用管）。
   var LUCI_SID = (function () {
     var m = /[?&]luci_sid=([^&]+)/.exec(location.search || '');
     var sid = m ? decodeURIComponent(m[1]) : '';
     return /^[0-9a-zA-Z_-]{16,128}$/.test(sid) ? sid : '';
-  })();
-  (function () {
-    if (smsToken()) { SMS_CONTENT = true; return; }
-    try {
-      fetch('/api/sms/auth', { cache: 'no-store' }).then(function (r) { return r.json(); })
-        .then(function (j) { if (j && j.data && !j.data.required) SMS_CONTENT = true; })
-        .catch(function () { });
-    } catch (e) { }
   })();
   var ws = null, retry = null;
   var VER = '';               // 跑着的 modemd 版本（供父页面小窗的版本标签显示）
@@ -249,13 +232,6 @@
       VER = (j && j.data && j.data.version) ? String(j.data.version) : '';
       render();
     }).catch(function () { });
-  }
-
-  /* 短信令牌：设备中心解锁后写在同源 localStorage 里（键见 index.html 的 SMS_TOKEN_LS）。
-     ⚠️ 它跨会话不持久：设备中心那只标签页一关就清掉，令牌本身也会闲置 30 分钟失效。 */
-  var TOKEN_LS = 'modemd.smsToken';
-  function smsToken() {
-    try { return localStorage.getItem(TOKEN_LS) || ''; } catch (e) { return ''; }
   }
 
   /* ---------------- 工具 ---------------- */
@@ -491,9 +467,7 @@
 
   function connect() {
     var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-    var tok = smsToken();
     var q = [];
-    if (tok) q.push('sms_token=' + encodeURIComponent(tok));
     // 嵌在 LuCI 页面里时，父页面会把 LuCI 会话 ID 拼在这里传进来（见 widget.js）：
     // 带着它握手就不必再登录设备中心也能收到推送（含带正文的短信）。
     if (LUCI_SID) q.push('luci_sid=' + encodeURIComponent(LUCI_SID));
@@ -523,14 +497,12 @@
           break;
         case 'smscount':
           if (id !== undefined) {
-            var prev = COUNTS[id];
             COUNTS[id] = m.data || {};
             render();
-            onSmsCount(id, prev, COUNTS[id]);
           }
           break;
         case 'sms':
-          /* 带正文的推送：只有握手里带了有效令牌才收得到（服务端 BroadcastSMS 有闸门） */
+          /* 带正文的推送：短信密码取消后与角标一样走普通广播，握手不需要令牌 */
           if (id !== undefined) onSmsPush(id, m.data || []);
           break;
         // 其它推送（流量/小区/配额/日志…）这里都不需要
@@ -544,18 +516,7 @@
     retry = setTimeout(function () { retry = null; connect(); }, 3000);
   }
 
-  /* 令牌来了/没了都要换一条 WS（服务端只在握手那一刻看令牌） */
-  function reconnectWS() {
-    if (ws) { var s = ws; ws = null; try { s.onclose = null; s.close(); } catch (e) { } }
-    if (retry) { clearTimeout(retry); retry = null; }
-    connect();
-  }
-  window.addEventListener('storage', function (e) {
-    if (e && e.key === TOKEN_LS) reconnectWS();
-  }, false);
-
   /* ---------------- 新短信 ---------------- */
-
   // 带正文的 sms 推送：与设备中心同一套“已知索引”差分。
   // 首次只建基线不弹（否则一进页面就把存着的短信全弹一遍）。
   function onSmsPush(id, list) {
@@ -568,26 +529,11 @@
     var had = !!SMS_SEEN[id];
     SMS_SEEN[id] = now;
     if (!had || !fresh.length) return;
-    lastSmsPushAt = Date.now();
-    SMS_CONTENT = true;   // 收到过正文推送 ⇒ 以后不必再靠“未读变多”兜底
     var s = fresh[0] || {};   // 后端按时间倒序，第一条就是最新的
     postSmsNew({
       index: s.index || '', number: s.number || '', timestamp: s.timestamp || '',
       content: s.content || '', rest: fresh.length - 1, unlocked: true
     });
-  }
-
-  // 没有令牌时收不到正文推送 ⇒ 用“未读数变多”当新短信信号（收到的只能提示去看）。
-  function onSmsCount(id, prev, now) {
-    var was = prev ? (Number(prev.unread) || 0) : -1;
-    var n = Number(now && now.unread) || 0;
-    SMS_UNREAD[id] = n;
-    // ⚠️ 有令牌就等正文那条：`+CMTI` 只推条数、**比正文早**（noteSMSArrival 先 +1，
-    //    随后 ReadSMS 才推带正文的列表）—— 两条都当新短信会弹两次。
-    if (SMS_CONTENT) return;
-    if (was < 0 || n <= was) return;                       // 第一拍只当基线；不多就不弹
-    if (Date.now() - lastSmsPushAt < 3000) return;         // 正文卡刚弹过（万一顺序反了）
-    postSmsNew({ unread: n, rest: 0, unlocked: false });
   }
 
   function postSmsNew(sms) {

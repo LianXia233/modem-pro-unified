@@ -10,6 +10,33 @@
 
 ## [1.0.3] - 2026-10-20
 
+### 修复：小窗页仍在调用已删除的 `/api/sms/auth`（接口名对照 modem-pro）
+
+把本仓 `ROUTES`（99 个路径）与 modem-pro `module/kernel/api.go` 的
+`RegisterRoutes`（92 个路径）逐条对照：**88 个共有接口名完全一致，
+没有任何改名**；modem-pro 独有的 4 个（`/api/sms/auth`、`/api/sms/lock`、
+`/api/sms/password`、`/api/sms/unlock`）是 2026-10-19 取消短信密码时
+按设计移除的（见 `http/handlers/wechat.rs` 顶部说明）；本仓新增 11 个
+（`/api/snapshot`、`/api/tasks` 提交/查询/取消、`/api/at/sched`、
+`/api/dial/auto`、`/api/ntp` 及 `set`/`sync`、`/api/timezone`、`GET /api/traffic`），
+均已在 `docs/API.md` 登记，命名沿用 modem-pro 既有约定。
+
+但前端资产里有一处**残留调用**：`rust/web/mini.html`（5G 悬浮小窗内容页）
+开机时仍 `fetch('/api/sms/auth')` 探「短信密码没启用就放行正文推送」——
+该接口已随密码一起删除，请求稳定 404。后果：探不到 ⇒ `SMS_CONTENT`
+永远停在 false ⇒ `+CMTI` 计数推送比正文推送先到 ⇒ **每条新短信弹两次卡**
+（先弹“有 N 条未读、正文受保护”，再弹正文卡），且“受保护”文案在密码
+取消后本身就是错的。
+
+**修复**（`rust/web/mini.html`）：删掉该探测——短信密码取消后
+`push_sms` 与角标一样走普通广播（见 `http/push.rs`），正文恒可拿。
+顺带清掉同源死代码：WS 握手的 `sms_token=` 参数（后端 `ws.rs` 早已
+不读它）、`localStorage['modemd.smsToken']` 的读取与 storage 监听，
+以及只服务「未读变多」兜底的 `onSmsCount` / `SMS_UNREAD` /
+`lastSmsPushAt` / `SMS_CONTENT` / `reconnectWS`。计数推送（`smscount`）
+仍用于角标渲染，只是不再充当新短信信号——正文必然到达，两条都当新短信
+正是当年要避免的双弹。
+
 ### 修复：内置拨号器在支持的模组上不自动启动
 
 **现象**：插上 QMI/MBIM 模组，页面也识别出了类型，但拨号器始终不起，
@@ -75,7 +102,9 @@ C 实现一致；`QUECTEL_UL_DATA_AGG` 在 modem-pro 的 Makefile 未定义，
   `open` 失败会进退避重试，日志可见）。
 
 测试：`cargo test --locked` 692 项通过（新增 3 项：`ensure_dial_kind`
-缓存优先 / 探不到为空、`qmap_mode` 对不存在网卡返回 0）。
+缓存优先 / 探不到为空、`qmap_mode` 对不存在网卡返回 0）。小窗页改动另经
+`node --check` 校验内联脚本语法，并以脚本复核「前端引用的接口路径
+⊆ `ROUTES`」成立（修复前差 1 个：`/api/sms/auth`）。
 
 ## [1.0.2] - 2026-10-20
 
