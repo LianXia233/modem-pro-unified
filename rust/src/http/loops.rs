@@ -554,21 +554,33 @@ fn spawn_auto_dial(state: &Arc<AppState>) {
                 let req = crate::modem::model::DialRequest {
                     cid: pick.as_ref().map(|c| c.cid).unwrap_or(0),
                     apn: pick.as_ref().map(|c| c.apn.clone()).unwrap_or_default(),
-                    pdp_type: pick.as_ref().map(|c| c.pdp_type.clone()).unwrap_or_default(),
+                    pdp_type: pick
+                        .as_ref()
+                        .map(|c| c.pdp_type.clone())
+                        .unwrap_or_default(),
                     reconnect: false,
                     force: false,
                 };
                 match m.dial(&req, state.dial_enabled(), state.cfg.dial.activate_ims) {
                     Ok(_) => {
                         last_fail.remove(&m.id);
-                        log::info!("[auto-dial] modem #{} 自动拨号成功（此前 state={}）", m.id, st.state);
+                        log::info!(
+                            "[auto-dial] modem #{} 自动拨号成功（此前 state={}）",
+                            m.id,
+                            st.state
+                        );
                     }
                     Err(e) => {
                         // busy 不算失败：手动拨号正在进行，下一轮再看
                         let s = e.to_string();
                         if !s.contains("进行中") {
                             last_fail.insert(m.id, Instant::now());
-                            log::warn!("[auto-dial] modem #{} 自动拨号失败（{} 秒后重试）: {}", m.id, FAIL_BACKOFF, s);
+                            log::warn!(
+                                "[auto-dial] modem #{} 自动拨号失败（{} 秒后重试）: {}",
+                                m.id,
+                                FAIL_BACKOFF,
+                                s
+                            );
                         }
                     }
                 }

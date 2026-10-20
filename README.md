@@ -53,13 +53,13 @@ make package/modem-pro/compile V=s MODEM_PRO_HOST_RUST=1   # 宿主 rustup 直�
 
 ## 文档
 
-- [docs/INTEGRATION.md](docs/INTEGRATION.md) — 整合方案：目录结构、依赖关系、命名与版本、向后兼容。
-- [docs/BUILD.md](docs/BUILD.md) — SDK/feeds 编译与安装验证。
-- [docs/API.md](docs/API.md) — `modemd` HTTP 接口契约。
-- [docs/PORTING.md](docs/PORTING.md) — 接口级迁移清单（逐条路由的迁移状态）。
-- [docs/PROGRESS.md](docs/PROGRESS.md) — 完整进度文档与后续提示词要求。
-- [docs/HANDOFF.md](docs/HANDOFF.md) — 阶段交接表与硬性要求。
+- [docs/README.md](docs/README.md) — 文档索引（含哪些历史文档已被删除、现在的权威来源）。
+- [docs/UPSTREAM_AUDIT.md](docs/UPSTREAM_AUDIT.md) — 上游源码审计、功能迁移矩阵、验证结果与真机待办。
+- [docs/SUPPORT_MATRIX.md](docs/SUPPORT_MATRIX.md) — 逐型号支持矩阵与厂商数据通道指令。
 - [CHANGELOG.md](CHANGELOG.md) — 变更记录。
+
+> 早先 README 里列的 `docs/INTEGRATION.md`、`docs/API.md` 等文件已在提交 `66853b8`
+> 中整体删除（描述的是删除前的实现，已过时）。现状以代码与上面三份文档为准。
 
 ## 致谢
 

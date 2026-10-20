@@ -832,17 +832,41 @@ fn td_tac_dec_first(raw: &str) -> i32 {
 
 /// 格式 B（旧编码）的信号还原表（移植自 luci-app-mt5700 的 convert*）。
 fn td_convert_rsrp(raw: i32) -> i32 {
-    if raw == 0 { -140 } else if raw >= 97 { -44 } else { -140 + raw }
+    if raw == 0 {
+        -140
+    } else if raw >= 97 {
+        -44
+    } else {
+        -140 + raw
+    }
 }
 fn td_convert_rsrq(raw: i32) -> i32 {
-    if raw == 0 { -19 } else if raw >= 34 { -3 } else { -19 + raw / 2 }
+    if raw == 0 {
+        -19
+    } else if raw >= 34 {
+        -3
+    } else {
+        -19 + raw / 2
+    }
 }
 fn td_convert_sinr(raw: i32) -> i32 {
-    let v = if raw == 0 { -20 } else if raw >= 251 { 30 } else { -20 + raw / 5 };
+    let v = if raw == 0 {
+        -20
+    } else if raw >= 251 {
+        30
+    } else {
+        -20 + raw / 5
+    };
     v.clamp(-20, 30)
 }
 fn td_convert_rssi(raw: i32) -> i32 {
-    if raw == 0 { -120 } else if raw >= 96 { -25 } else { -121 + raw }
+    if raw == 0 {
+        -120
+    } else if raw >= 96 {
+        -25
+    } else {
+        -121 + raw
+    }
 }
 
 /// 解析一行 `^MONSC: …`（服务小区）。
@@ -879,7 +903,10 @@ pub fn parse_monsc(line: &str) -> Option<CellInfo> {
             cell.mcc = f.get(1).cloned().unwrap_or_default();
             cell.mnc = f.get(2).cloned().unwrap_or_default();
             cell.tac = td_tac_dec_first(f.get(3).map(|x| x.as_str()).unwrap_or(""));
-            cell.cell_id = f.get(4).map(|x| x.trim().to_ascii_uppercase()).unwrap_or_default();
+            cell.cell_id = f
+                .get(4)
+                .map(|x| x.trim().to_ascii_uppercase())
+                .unwrap_or_default();
             cell.pcid = td_pci_hex(f.get(5).map(|x| x.as_str()).unwrap_or(""), 503);
             cell.earfcn = f.get(6).and_then(|x| x.trim().parse().ok()).unwrap_or(0);
             cell.rsrp = f.get(7).and_then(|x| x.trim().parse().ok()).unwrap_or(0);
@@ -890,7 +917,10 @@ pub fn parse_monsc(line: &str) -> Option<CellInfo> {
             cell.mcc = f.get(1).cloned().unwrap_or_default();
             cell.mnc = f.get(2).cloned().unwrap_or_default();
             cell.earfcn = f.get(3).and_then(|x| x.trim().parse().ok()).unwrap_or(0);
-            cell.cell_id = f.get(5).map(|x| x.trim().to_ascii_uppercase()).unwrap_or_default();
+            cell.cell_id = f
+                .get(5)
+                .map(|x| x.trim().to_ascii_uppercase())
+                .unwrap_or_default();
             cell.pcid = td_pci_hex(f.get(6).map(|x| x.as_str()).unwrap_or(""), 1007);
             cell.tac = td_tac_dec_first(f.get(7).map(|x| x.as_str()).unwrap_or(""));
             cell.rsrp = f.get(8).and_then(|x| x.trim().parse().ok()).unwrap_or(0);
@@ -938,7 +968,9 @@ pub fn parse_monnc_rows(resp: &str) -> Vec<CellInfo> {
         }
         // 行前缀是 ^MONNC:，复用服务小区解析前先换成 ^MONSC:
         let line = line.replacen("^MONNC:", "^MONSC:", 1);
-        let Some(mut c) = parse_monsc(&line) else { continue };
+        let Some(mut c) = parse_monsc(&line) else {
+            continue;
+        };
         if c.tech != "LTE" && c.tech != "NR" {
             continue;
         }
@@ -960,9 +992,13 @@ pub fn parse_cellscan_rows(resp: &str) -> Vec<CellInfo> {
     const INVALID: i32 = 99;
     let mut out = Vec::new();
     for line in resp.lines() {
-        let Some(idx) = line.find("^CELLSCAN:") else { continue };
+        let Some(idx) = line.find("^CELLSCAN:") else {
+            continue;
+        };
         let body = line[idx + "^CELLSCAN:".len()..].trim();
-        if body.is_empty() || body.eq_ignore_ascii_case("STARTED") || body.eq_ignore_ascii_case("OK")
+        if body.is_empty()
+            || body.eq_ignore_ascii_case("STARTED")
+            || body.eq_ignore_ascii_case("OK")
             || body.eq_ignore_ascii_case("RUNNING")
         {
             continue;
@@ -1011,7 +1047,11 @@ pub fn parse_cellscan_rows(resp: &str) -> Vec<CellInfo> {
         c.rssi = dec(&f[7]).unwrap_or(0);
         c.rsrp = measure(&f[11], 1.0);
         c.rsrq = measure(&f[12], 0.5);
-        c.sinr = if rat == 2 { measure(&f[14], 0.125) } else { measure(&f[13], 0.5) };
+        c.sinr = if rat == 2 {
+            measure(&f[14], 0.125)
+        } else {
+            measure(&f[13], 0.5)
+        };
         let op = operator_name(&c.mcc, &c.mnc);
         c.operator = (!op.is_empty()).then_some(op);
         if !valid_plmn(&c.mcc, &c.mnc) {
@@ -1182,7 +1222,7 @@ pub fn mark_intra_frequency(serving: &[CellInfo], neighbours: &mut [CellInfo]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_cellscan_rows, parse_monsc, parse_monnc_rows};
+    use super::{parse_cellscan_rows, parse_monnc_rows, parse_monsc};
 
     // ---------- 鼎桥 MT5700（^MONSC / ^MONNC / ^CELLSCAN）----------
 
@@ -1278,7 +1318,6 @@ mod tests {
         assert_eq!(c.sinr, 12, "NR 的 SINR 取 f[13]（×0.5：25×0.5=12）");
         assert_eq!(c.rsrq, -4, "-8×0.5=-4");
     }
-
 
     use super::{
         band_from_earfcn, mark_intra_frequency, operator_name, parse_cell_line, parse_cell_lines,

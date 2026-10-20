@@ -414,12 +414,23 @@ pub fn list_modem_usb_devices() -> Vec<ModemUsbDevice> {
         dev.drivers = dedup_strings(drivers);
         dev.has_serial_driver = has_serial_driver_name(&dev.drivers) || !dev.ttys.is_empty();
 
-        let Some(fam) = is_known_modem_usb(&vid, &pid, &dev.classes) else {
-            continue;
-        };
-        dev.known = true;
-        dev.family = fam.vendor.as_str().to_string();
-        dev.vendor_cn = fam.vendor.label().to_string();
+        // ① 厂商身份表命中；② 否则看端口规则（QModem 登记过的 VID:PID 也算模组）——
+        //    否则「按 VID:PID 绑定命令口」的页面上根本选不到这台设备。
+        match is_known_modem_usb(&vid, &pid, &dev.classes) {
+            Some(fam) => {
+                dev.known = true;
+                dev.family = fam.vendor.as_str().to_string();
+                dev.vendor_cn = fam.vendor.label().to_string();
+            }
+            None => match crate::modem::ports::lookup(&vid, &pid) {
+                Some(rule) => {
+                    dev.known = true;
+                    dev.family = rule.model.clone();
+                    dev.vendor_cn = "端口规则登记".to_string();
+                }
+                None => continue,
+            },
+        }
         out.push(dev);
     }
     out.sort_by(|a, b| a.bus_path.cmp(&b.bus_path));
@@ -480,6 +491,102 @@ pub fn identity_for_tty(tty: &str) -> Option<crate::modem::detect::UsbIdentity> 
 #[cfg(not(unix))]
 pub fn identity_for_tty(_tty: &str) -> Option<crate::modem::detect::UsbIdentity> {
     None
+}
+
+/// 列出「端口规则要求补 option 驱动、但还没出串口」的 USB 设备。
+///
+/// 与 [`list_modem_usb_devices`] 的区别：这里**不要求**设备在本模块的厂商身份表里，
+/// 只看 QModem 端口规则（`option_driver=1`）。用途是发现流程开始前先把 tty 建出来 ——
+/// QModem 的 `modem_scand.c:570` 也是在枚举接口**之前**写 `option1/new_id`。
+#[cfg(unix)]
+pub fn option_bind_candidates() -> Vec<ModemUsbDevice> {
+    use std::path::Path;
+
+    let Ok(entries) = std::fs::read_dir(USB_DEVICES_ROOT) else {
+        return Vec::new();
+    };
+    // 串口枚举只做一次：每个设备的 tty 归属都在同一份名单里查
+    let ports = super::ports_list();
+    let mut tty_owner: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for p in &ports {
+        if let Some(base) =
+            usb_device_dir(p).and_then(|d| d.file_name().map(|s| s.to_string_lossy().to_string()))
+        {
+            tty_owner.insert(base, p.clone());
+        }
+    }
+    let mut out = Vec::new();
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.contains(':') {
+            continue;
+        }
+        let dir = Path::new(USB_DEVICES_ROOT).join(&name);
+        let vid = read_sysfs_id(&dir.join("idVendor"));
+        let pid = read_sysfs_id(&dir.join("idProduct"));
+        if vid.is_empty() || pid.is_empty() {
+            continue;
+        }
+        let Some(rule) = crate::modem::ports::lookup(&vid, &pid) else {
+            continue;
+        };
+        if !rule.option_driver {
+            continue;
+        }
+        // 已经有 tty 就不用补
+        if tty_owner.contains_key(&name) {
+            continue;
+        }
+        out.push(ModemUsbDevice {
+            vid,
+            pid,
+            bus_path: name.clone(),
+            product: read_sysfs_line(&dir.join("product")),
+            serial: read_sysfs_line(&dir.join("serial")),
+            known: true,
+            family: rule.model.clone(),
+            vendor_cn: "端口规则登记（需补 option 驱动）".to_string(),
+            ..ModemUsbDevice::default()
+        });
+    }
+    out
+}
+
+/// 非 unix：没有 sysfs，不补驱动。
+#[cfg(not(unix))]
+pub fn option_bind_candidates() -> Vec<ModemUsbDevice> {
+    Vec::new()
+}
+
+/// 软重插：把 USB 设备的 `authorized` 置 0 再置 1，让内核重新枚举。
+///
+/// 用途只有一个：设备明明在、却一个 AT 口都认不出（固件跑飞 / 枚举卡死）。
+/// 这是**破坏性**操作（数据面会短暂断开），调用方必须自带开关与冷却，
+/// 不能放进常规巡检路径。
+#[cfg(unix)]
+pub fn reauthorize(bus_path: &str) -> Result<(), String> {
+    let name = bus_path.trim();
+    if name.is_empty() || name.contains('/') || name.contains("..") {
+        return Err(format!("USB 设备名不合法：{bus_path:?}"));
+    }
+    let path = std::path::Path::new(USB_DEVICES_ROOT)
+        .join(name)
+        .join("authorized");
+    if !path.exists() {
+        return Err(format!(
+            "{} 不存在（内核不支持 authorized？）",
+            path.display()
+        ));
+    }
+    std::fs::write(&path, b"0").map_err(|e| format!("写 {} 失败：{e}", path.display()))?;
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::fs::write(&path, b"1").map_err(|e| format!("写 {} 失败：{e}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn reauthorize(_bus_path: &str) -> Result<(), String> {
+    Err("本平台不支持 USB 软重插".to_string())
 }
 
 /// 给一个「插上了但没有串口」的模组补上 usb-serial 驱动。

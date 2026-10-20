@@ -11,8 +11,8 @@
 //! 主动扫小区只有部分固件提供（实测芯讯通 `AT+CNWSEARCH`）；没有就给 `cell_note`，
 //! 界面会照原话显示，不假装扫到了东西。
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use crate::modem::vendor::Vendor;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

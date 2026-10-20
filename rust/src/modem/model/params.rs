@@ -148,7 +148,9 @@ impl Modem {
         let unchanged = contexts
             .iter()
             .find(|c| c.cid == cid)
-            .map(|c| c.apn.eq_ignore_ascii_case(apn) && c.pdp_type.to_ascii_uppercase() == want_type)
+            .map(|c| {
+                c.apn.eq_ignore_ascii_case(apn) && c.pdp_type.to_ascii_uppercase() == want_type
+            })
             .unwrap_or(false);
 
         let was_active;
@@ -347,8 +349,14 @@ pub fn build_contexts(defined: &str, activated: &str) -> Vec<Context> {
 /// （拨号器没有 -s 直接退出）会陷入「算不出计划 → 5 秒退避 → 再来」的死循环，
 /// 死循环，明明模组里就存着可用的上下文。
 pub fn pick_dial_context(ctxs: &[Context]) -> Option<Context> {
-    let usable = || ctxs.iter().filter(|c| !c.internal && !c.apn.trim().is_empty());
-    usable().find(|c| c.active).cloned().or_else(|| usable().next().cloned())
+    let usable = || {
+        ctxs.iter()
+            .filter(|c| !c.internal && !c.apn.trim().is_empty())
+    };
+    usable()
+        .find(|c| c.active)
+        .cloned()
+        .or_else(|| usable().next().cloned())
 }
 
 /// 内部专用 APN（IMS / sos / mms）不上网。
@@ -390,7 +398,10 @@ pub fn cgact_state(resp: &str, cid: i32) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_contexts, cgact_state, is_internal_apn, pick_dial_context, valid_apn, valid_plmn_text, Context};
+    use super::{
+        build_contexts, cgact_state, is_internal_apn, pick_dial_context, valid_apn,
+        valid_plmn_text, Context,
+    };
 
     #[test]
     fn merge_contexts() {
@@ -449,10 +460,18 @@ mod tests {
             internal,
         };
         // 有已激活的非 IMS → 选它（哪怕排后面）
-        let ctxs = [mk(0, "", false, false), mk(3, "ims", true, true), mk(5, "cmnet", true, false)];
+        let ctxs = [
+            mk(0, "", false, false),
+            mk(3, "ims", true, true),
+            mk(5, "cmnet", true, false),
+        ];
         assert_eq!(pick_dial_context(&ctxs).unwrap().cid, 5);
         // 没有已激活的 → 任意已定义非 IMS（选先出现的）
-        let ctxs = [mk(0, "", false, false), mk(2, "ims", true, true), mk(4, "3gnet", false, false)];
+        let ctxs = [
+            mk(0, "", false, false),
+            mk(2, "ims", true, true),
+            mk(4, "3gnet", false, false),
+        ];
         assert_eq!(pick_dial_context(&ctxs).unwrap().cid, 4);
         // 全是 IMS / 空 APN → None（调用方回落默认）
         let ctxs = [mk(0, "", false, false), mk(1, "ims", true, true)];

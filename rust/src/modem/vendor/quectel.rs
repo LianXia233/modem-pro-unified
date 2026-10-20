@@ -104,6 +104,44 @@ impl VendorSpec for Spec {
         ("AT+QNWPREFCFG=\"mode_pref\"", "qcf")
     }
 
+    /// `AT+QNETDEVCTL` 家族：参数形状随平台变，写错会被回 `ERROR`。
+    ///
+    /// 依据 QModem `modem_dial.sh:1298-1319`（at_dial）与 `:1130-1133`（ecm_hang）：
+    /// - 海思：`AT+QNETDEVCTL=1,1,1`（不支持指定 cid）；
+    /// - 展锐：`AT+QNETDEVCTL=1,<cid>,1`；
+    /// - 高通及其它：`AT+QNETDEVCTL=3,<cid>,1`（3 = NDIS/ECM 接入）。
+    fn data_channel(
+        &self,
+        ctx: &super::datacall::DataCallCtx<'_>,
+    ) -> Option<super::datacall::DataChannel> {
+        use super::datacall::{AtStep, DataChannel};
+        let cid = ctx.cid;
+        let (cmd, why) = match ctx.platform {
+            "hisilicon" => (
+                "AT+QNETDEVCTL=1,1,1".to_string(),
+                "海思平台：QNETDEVCTL 不支持指定 cid，固定承载 1",
+            ),
+            "unisoc" => (
+                format!("AT+QNETDEVCTL=1,{cid},1"),
+                "展锐平台：QNETDEVCTL=<cid>,<op>,<urc>",
+            ),
+            _ => (
+                format!("AT+QNETDEVCTL=3,{cid},1"),
+                "高通/其它平台：connect_type=3（NDIS/ECM 接入）",
+            ),
+        };
+        Some(DataChannel {
+            pdp_first: false,
+            activate: vec![AtStep::slow(cmd, why)],
+            deactivate: vec![AtStep::new(
+                format!("AT+QNETDEVCTL={cid},2,1"),
+                "QNETDEVCTL op=2 = 断开数据通道",
+            )],
+            cgact_fallback: true,
+            note: "移远 ECM/RNDIS/NCM 由 QNETDEVCTL 激活；只发 CGACT 时网卡常常没有 carrier",
+        })
+    }
+
     fn at_plan_commands(
         &self,
         ctx: &crate::modem::atplan::PlanCtx,

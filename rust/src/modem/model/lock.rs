@@ -205,7 +205,12 @@ impl Dialect {
             Dialect::Qnw => &[Dialect::Qnw, Dialect::Simcom, Dialect::Fibocom],
             Dialect::Simcom => &[Dialect::Simcom, Dialect::Qnw, Dialect::Fibocom],
             Dialect::Fibocom => &[Dialect::Fibocom, Dialect::Qnw, Dialect::Simcom],
-            Dialect::Tdtech => &[Dialect::Tdtech, Dialect::Qnw, Dialect::Simcom, Dialect::Fibocom],
+            Dialect::Tdtech => &[
+                Dialect::Tdtech,
+                Dialect::Qnw,
+                Dialect::Simcom,
+                Dialect::Fibocom,
+            ],
         }
     }
 
@@ -861,9 +866,14 @@ impl Modem {
             // 解锁：=0 同时解除 Band/频点/小区（手册：0=关闭锁功能）
             let cmd = format!(
                 "{0}=0",
-                if tech == "NR" { "AT^NRFREQLOCK" } else { "AT^LTEFREQLOCK" }
+                if tech == "NR" {
+                    "AT^NRFREQLOCK"
+                } else {
+                    "AT^LTEFREQLOCK"
+                }
             );
-            let resp = self.with_at_prio(Prio::Bulk, |p| p.command(&cmd, Duration::from_secs(10)))?;
+            let resp =
+                self.with_at_prio(Prio::Bulk, |p| p.command(&cmd, Duration::from_secs(10)))?;
             if !is_ok(&resp) {
                 return Err(msg(format!("下发失败：{}", resp.trim())));
             }
@@ -1326,19 +1336,32 @@ impl Modem {
         let arg = if unlock {
             "=0".to_string()
         } else {
-            let mut v: Vec<i64> = bands.iter().copied().map(|b| b as i64).filter(|b| *b > 0).collect();
+            let mut v: Vec<i64> = bands
+                .iter()
+                .copied()
+                .map(|b| b as i64)
+                .filter(|b| *b > 0)
+                .collect();
             v.sort_unstable();
             v.dedup();
             if v.is_empty() {
                 return Err(msg("要么勾几个频段，要么显式解除锁定"));
             }
-            format!("=3,0,{},{}", v.len(), v.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","))
+            format!(
+                "=3,0,{},{}",
+                v.len(),
+                v.iter()
+                    .map(|b| b.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
         };
         let cmd = format!("{cmd_base}{arg}");
 
         // 手册备注 1：切飞行模式才生效。首尾 best-effort，中间失败冒泡并拉回在线。
         let _ = self.at_cmd_prio(Prio::Bulk, "AT+CFUN=0");
-        let resp = match self.with_at_prio(Prio::Bulk, |p| p.command(&cmd, Duration::from_secs(10))) {
+        let resp = match self.with_at_prio(Prio::Bulk, |p| p.command(&cmd, Duration::from_secs(10)))
+        {
             Ok(r) => r,
             Err(e) => {
                 let _ = self.at_cmd_prio(Prio::Bulk, "AT+CFUN=1");
@@ -1362,7 +1385,12 @@ impl Modem {
                 )));
             }
         } else {
-            let want: Vec<i64> = bands.iter().copied().map(|b| b as i64).filter(|b| *b > 0).collect();
+            let want: Vec<i64> = bands
+                .iter()
+                .copied()
+                .map(|b| b as i64)
+                .filter(|b| *b > 0)
+                .collect();
             let got: Vec<i64> = back.bands.iter().copied().map(|b| b as i64).collect();
             if back.operatetype != 3 || got != want {
                 return Err(msg(format!(
@@ -1370,10 +1398,16 @@ impl Modem {
                     if got.is_empty() {
                         "空".to_string()
                     } else {
-                        got.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
+                        got.iter()
+                            .map(|b| b.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
                     },
                     back.operatetype,
-                    want.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
+                    want.iter()
+                        .map(|b| b.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
                 )));
             }
         }
@@ -1538,7 +1572,6 @@ mod tests {
         assert_eq!(l.operatetype, 1);
         assert!(l.bands.is_empty(), "abc 不是频段行");
     }
-
 
     use super::{
         band_lock_restricted, band_value, gtact_family, gtact_lte_code, gtact_nr_code,

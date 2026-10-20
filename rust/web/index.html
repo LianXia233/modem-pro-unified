@@ -5598,6 +5598,13 @@ $('#btnUsbBind').onclick = e => run(e.target, async () => {
    连 IMEI/型号都读不出来 ⇒ 按“模组身份”指定那套也救不了，只能按**设备身份**钉死。 */
 let atpBindView = null;
 
+// atpKeyParts：`vid:pid` 或 `vid:pid@bus` → {vid,pid,bus}
+function atpKeyParts(key) {
+  const [vpid, bus] = (key || '').split('@');
+  const [vid, pid] = (vpid || '').split(':');
+  return { vid: vid || '', pid: pid || '', bus: bus || '' };
+}
+
 async function loadAtpBind() {
   atpBindView = await api('/api/atport/bind');
   renderAtpBind();
@@ -5613,8 +5620,11 @@ function atpBindDevOptions() {
 //   · 设备在场上 ⇒ 用**它自己**交出的串口（与下面新建绑定同一套口径）；
 //   · 设备不在 ⇒ 只列它现在绑的那个口（此时没有别的合理候选，别让人误改到别的设备的口上）；
 //   · 原本绑的口一定放进列表，否则浏览器会把它显示成第一项（看着像"已经被改了"）。
-function atpBindPortOptionsHtml(vid, pid, cur) {
-  const dev = atpBindDevOptions().find(d => d.vid === vid && d.pid === pid);
+function atpBindPortOptionsHtml(key, cur) {
+  // key 可能是 `vid:pid` 或 `vid:pid@bus`：同型号多台设备只能靠 bus 区分
+  const [vpid, bus] = key.split('@');
+  const [vid, pid] = vpid.split(':');
+  const dev = atpBindDevOptions().find(d => d.vid === vid && d.pid === pid && (!bus || d.bus_path === bus));
   const ports = dev ? (dev.ttys || []).slice() : [];
   if (cur && ports.indexOf(cur) < 0) ports.push(cur);
   if (!ports.length) ports.push(cur || '');
@@ -5636,15 +5646,15 @@ function renderAtpBind() {
     <thead><tr><th>设备（VID:PID）</th><th>命令口</th><th>状态</th><th></th></tr></thead>
     <tbody>${binds.map(b => `<tr>
       <td><code>${esc(b.key)}</code></td>
-      <td><select data-atpport="${esc(b.vid)}|${esc(b.pid)}" title="换一个串口 = 改这条绑定（不用先解绑），改完立刻重新发现">${atpBindPortOptionsHtml(b.vid, b.pid, b.port)}</select></td>
+      <td><select data-atpkey="${esc(b.key)}" title="换一个串口 = 改这条绑定（不用先解绑），改完立刻重新发现">${atpBindPortOptionsHtml(b.key, b.port)}</select></td>
       <td>${b.present ? '<span class="pill on">在</span>' : '<span class="pill seg">当前不在</span>'}</td>
-      <td><button class="act ghost sm" data-atpdel="${esc(b.vid)}|${esc(b.pid)}">解绑</button></td>
+      <td><button class="act ghost sm" data-atpdel="${esc(b.key)}">解绑</button></td>
     </tr>`).join('')}</tbody></table>` : '<span class="muted">还没有绑定（下面选一台设备 + 一个串口，绑上之后就不再自动扫描）</span>';
   // 已绑定的那几条：串口下拉里换一个口 = 直接改绑定（后端同一个键覆盖写，不必先解绑）
-  $('#atpBinds').querySelectorAll('[data-atpport]').forEach(sel => {
+  $('#atpBinds').querySelectorAll('[data-atpkey]').forEach(sel => {
     sel.onchange = async () => {
-      const [vid, pid] = sel.dataset.atpport.split('|');
-      const r = await post('/api/atport/bind', { vid, pid, port: sel.value });
+      const { vid, pid, bus } = atpKeyParts(sel.dataset.atpkey);
+      const r = await post('/api/atport/bind', { vid, pid, bus_path: bus, port: sel.value });
       $('#atpBindMsg').textContent = r.note || 'ok';
       toast(r.note || ('已改为 ' + vid + ':' + pid + ' → ' + sel.value));
       await Promise.all([loadAtpBind(), loadUsb()]);
@@ -5652,16 +5662,16 @@ function renderAtpBind() {
   });
   $('#atpBinds').querySelectorAll('[data-atpdel]').forEach(btn => {
     btn.onclick = async () => {
-      const [vid, pid] = btn.dataset.atpdel.split('|');
-      const r = await post('/api/atport/bind', { vid, pid, port: '' });
-      toast(r.note || ('已解绑 ' + vid + ':' + pid));
+      const { vid, pid, bus } = atpKeyParts(btn.dataset.atpdel);
+      const r = await post('/api/atport/bind', { vid, pid, bus_path: bus, port: '' });
+      toast(r.note || ('已解绑 ' + btn.dataset.atpdel));
       await Promise.all([loadAtpBind(), loadUsb()]);
     };
   });
   // 设备 / 串口下拉
   const devs = atpBindDevOptions();
   $('#atpBindDev').innerHTML = devs.length
-    ? devs.map(d => `<option value="${esc(d.vid + ':' + d.pid)}">${esc((d.vendor_cn || '未知') + '  ' + d.vid + ':' + d.pid + (d.product ? '  ' + d.product : ''))}</option>`).join('')
+    ? devs.map(d => `<option value="${esc(d.vid + ':' + d.pid + '|' + (d.bus_path || ''))}">${esc((d.vendor_cn || '未知') + '  ' + d.vid + ':' + d.pid + (d.bus_path ? ' @' + d.bus_path : '') + (d.product ? '  ' + d.product : ''))}</option>`).join('')
     : '<option value="">（没发现带串口的模组 USB 设备）</option>';
   fillAtpBindPorts();
 }
@@ -5669,7 +5679,8 @@ function renderAtpBind() {
 // fillAtpBindPorts：串口下拉 = 所选设备当前交出的串口（取不到就拿全局串口列表兑底）
 function fillAtpBindPorts() {
   const sel = ($('#atpBindDev').value || '');
-  const dev = atpBindDevOptions().find(d => (d.vid + ':' + d.pid) === sel);
+  const [vpid, bus] = sel.split('|');
+  const dev = atpBindDevOptions().find(d => (d.vid + ':' + d.pid) === vpid && (d.bus_path || '') === (bus || ''));
   const ports = (dev && dev.ttys) || (atpBindView && atpBindView.ports) || [];
   $('#atpBindPort').innerHTML = ports.length
     ? ports.map(p => `<option value="${esc(p)}">${esc(p)}</option>`).join('')
@@ -5681,10 +5692,11 @@ $('#btnAtpBind').onclick = e => run(e.target, async () => {
   const dev = ($('#atpBindDev').value || '').trim();
   const port = ($('#atpBindPort').value || '').trim();
   if (!dev || !port) { toast('先选一台设备和一个串口', true); return; }
-  const [vid, pid] = dev.split(':');
-  const r = await post('/api/atport/bind', { vid, pid, port });
+  const [vpid, bus] = dev.split('|');
+  const [vid, pid] = vpid.split(':');
+  const r = await post('/api/atport/bind', { vid, pid, bus_path: bus || '', port });
   $('#atpBindMsg').textContent = r.note || 'ok';
-  toast(r.note || ('已绑定 ' + dev + ' → ' + port));
+  toast(r.note || ('已绑定 ' + vpid + ' → ' + port));
   await Promise.all([loadAtpBind(), loadUsb()]);
 });
 

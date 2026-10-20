@@ -4,6 +4,72 @@
 
 ## [未发布] - 2026-10-20
 
+### 上游融合（一）：端口规则进发现流程 + 厂商数据通道指令
+
+**发现流程不再「见 tty 就探」**
+
+- 新增 `discovery/plan.rs`：按 USB 设备分组（`1-1`），按 QModem 端口规则的
+  `include` 接口号白名单筛选，剔除语音 PCM 口；同组只选一个命令口，其余留作回退。
+  以前 RM520N-GL 这类 4 口模组会被登记成 2~3 台「模组」，抢同一块网卡。
+- 新增 `AtPort::probe_identity()`：`AT` 回 `OK` 不再当作命令口，必须
+  `AT+CGMM`/`AT+CGMI`/`ATI` 有一条内容行（对齐上游 Go 版
+  `module/netdev/ports.go:165-252` 的真机结论）。
+- `option_driver=1` 的设备在枚举串口**之前**补绑（`option1/new_id`），
+  按 5 分钟冷却避免刷日志；受 `[serial] usb_autobind` 控制。
+- PCIe/MHI 的 AT 口（`/dev/mhi_*DUN*`、`/dev/mhi_*AT*`、`/dev/wwan*at*`）并入候选；
+  `AtPort` 增加裸字符设备后端（这些节点不是 tty，`serialport` 打不开）。
+
+**ECM/RNDIS/NCM 的拨号改成按厂商发指令**
+
+- 新增 `vendor/datacall.rs`：`AT+QNETDEVCTL`（移远，按平台三套参数）、
+  `AT+GTRNDIS`（广和通高通/展锐）、`AT^NDISDUP`（华为/鼎桥）、`AT^SETAUTODIAL`
+  （华为展锐自拨）、`AT$QCRMCALL`（美格）、`AT$MYUSBNETACT`（有方）、
+  `AT#ICMAUTOCONN`（Telit）、`AT+ZECMCALL`（高新兴）、`AT+RNDISCALL`（合宙）。
+  以前一律 `AT+CGACT`，移远/华为/美格这类机型 PDP 显示 active 但网卡没有 carrier。
+- 挂断与激活**严格对称**：断开时发同族的 deactivate 指令，不再只停 PDP；
+  合宙（模组自持 PDP）按上游口径只停主机接口，并在步骤里注明。
+- FM350/RW350（广和通 MTK）与芯讯通保持 `AT+CGACT`，不发 `GTRNDIS`；
+  私有指令被拒时回退 CGACT 并记录，不会把失败伪装成成功。
+- 平台未识别（型号不在清单里）时只走 3GPP 通用路径，不发任何私有指令。
+
+**文档**
+
+- 新增 `docs/UPSTREAM_AUDIT.md`（审计 + 迁移矩阵 + 真机待办）与
+  `docs/SUPPORT_MATRIX.md`（91 型号 × 形态 × 平台）；`docs/README.md` 说明
+  `66853b8` 删除的历史文档不再作为设计依据，README 的失效链接同步修正。
+
+- 非 AT 口否定缓存：15s→30s→60s→120s→240s→300s 退避，端口消失即清空。
+  巡检 3 秒一轮，否则每个「不是模组」的 tty 每轮都要白等 4 条 AT 超时。
+
+测试：`cargo test --locked` 722 项通过（新增 19 项，含厂商命令字面量、平台回退、
+cid 替换、激活/挂断对称、端口白名单与物理分组、退避曲线）。真机验证待办见审计文档 §5。
+
+### 上游融合（二）：多 tty 拓扑 / PCIe 补绑 / 救援 / 退避
+
+- **多 tty 拓扑对上层可见**：`ModemView.tty_list` 以前恒为「当前口自己」，
+  现在按发现分组写入「首选 + 回退」；手动切口后新口排到最前，其余保留。
+- **同型号多台设备的命令口绑定**：新增 `vid:pid@1-1` 绑定键（`/api/atport/bind`
+  增加可选 `bus_path`），两台 RM520N 不会再共用一条绑定；旧键继续有效。
+  WebUI 的设备下拉按物理路径区分，已绑定行改口/解绑都带 `bus_path`。
+- **PCIe 模组自动补驱动**：`[serial] pcie_autobind`（默认 true）在发现前对
+  未绑定驱动的模组尝试 `mhi_pci_generic` / `mtk_t7xx`，5 分钟冷却。
+- **卡死救援**：`[serial] auto_rescue`（默认 **false**）。一台模组都认不出持续
+  150s 后，对无 tty 的 USB 设备写 `authorized 0→1`、对未绑定 PCIe 设备做
+  remove+rescan；5 分钟冷却、每轮最多 3 次。默认关闭：会短暂断开数据面。
+- **拨号失败退避**：原生 QMI/MBIM 建立失败从固定 5s 改为 5/10/20/40/60s
+  指数退避，成功即清零（持续故障不再每 5 秒刷一次控制口）。
+- **清单形态核对**：支持清单里该型号 USB/PCIe 都不含当前识别出的形态时，
+  在拨号步骤里写一条提示（不拦截），避免「清单说 A、实际是 B」时无从排查。
+- USB 设备清单（`/api/usb`）纳入端口规则登记过的设备，否则绑定页选不到它。
+- 新增探活预热窗口：设备 sysfs mtime < 90s 时固定 15s 重探，不参与指数退避
+  （5G 模组开机慢，退避到 5 分钟等于永远认不出）。
+- **断开后清旧地址/旧路由**：`POST /api/dial/disconnect` 成功后，逐条删除经该模组
+  网卡的默认路由并 `ip -4 addr flush`（只动这台模组的网卡）。以前只改状态，
+  内核里的旧 `default` 还在，页面显示「已断开」但流量继续往黑洞网卡发。
+
+测试：`cargo test --locked` 732 项通过（本阶段新增 10 项：救援判定、预热、
+形态核对、物理路径绑定键、多 tty 排序、拨号退避曲线、断开路由清理）。
+
 ### 强制下发 DNS（`[net] wan_dns`，默认 223.5.5.5 119.29.29.29）
 
 实机「获取 IP 异常 / APN 异常」的真凶是 `resolv.conf.auto` 为空 —— 蜂窝链路

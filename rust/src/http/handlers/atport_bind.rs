@@ -45,6 +45,7 @@ pub fn handle(mut req: Request, state: &AppState, query: &HashMap<String, String
     let params = request::merge_form(query, &request::read_body(&mut req));
     let vid = params.get("vid").cloned().unwrap_or_default();
     let pid = params.get("pid").cloned().unwrap_or_default();
+    let bus_path = params.get("bus_path").cloned().unwrap_or_default();
     let port = params.get("port").cloned().unwrap_or_default();
     let port = port.trim().to_string();
 
@@ -52,14 +53,17 @@ pub fn handle(mut req: Request, state: &AppState, query: &HashMap<String, String
         return response::fail(req, -1, &format!("串口 {port} 不在本机串口列表里"));
     }
 
-    let Some(key) = crate::runtime::store::at_port_bind_key(&vid, &pid) else {
+    // 可选 `bus_path`（如 `1-1`）：同型号多台设备时必须给，否则两台会共用一条绑定
+    let Some(key) = crate::runtime::store::at_port_bind_key_scoped(&vid, &pid, bus_path.trim())
+    else {
         return response::fail(
             req,
             -1,
             &format!(
-                "VID/PID 认不出来（要求 0e8d / 7126 这样的四位十六进制）: {}:{}",
+                "VID/PID 认不出来（要求 0e8d / 7126 这样的四位十六进制）或 bus_path 非法: {}:{}/{}",
                 vid.trim(),
-                pid.trim()
+                pid.trim(),
+                bus_path.trim()
             ),
         );
     };
@@ -97,11 +101,14 @@ fn bind_list(state: &AppState, ports: &[String]) -> Vec<serde_json::Value> {
         .list()
         .into_iter()
         .map(|(key, port)| {
-            let (vid, pid) = key.split_once(':').unwrap_or((key.as_str(), ""));
+            // 键可以是 `vid:pid` 或 `vid:pid@bus`
+            let (vid_pid, bus) = key.split_once('@').unwrap_or((key.as_str(), ""));
+            let (vid, pid) = vid_pid.split_once(':').unwrap_or((vid_pid, ""));
             json!({
                 "key": key,
                 "vid": vid,
                 "pid": pid,
+                "bus_path": bus,
                 "port": port,
                 "present": ports.iter().any(|p| p == &port),
             })

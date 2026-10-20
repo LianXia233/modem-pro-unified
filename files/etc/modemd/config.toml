@@ -39,6 +39,15 @@ cmd_timeout = "3s"
 # ⚠️ 只在 Linux/OpenWrt 生效（Windows 的串口由驱动 inf 决定，做不到自动绑定）。
 usb_autobind = true
 
+# PCIe 模组没绑驱动时，是否自动尝试 mhi_pci_generic / mtk_t7xx。默认 true：
+# 没驱动就没有 AT 口和数据网卡，等于设备不存在。
+pcie_autobind = true
+
+# 一台模组都认不出、持续 150 秒后，是否做一次「软重插」：
+# USB 写 authorized 0→1、PCIe remove+rescan。默认 false —— 这会让数据面短暂断开，
+# 需要显式打开；打开后仍受 5 分钟冷却与「每轮最多 3 次」限制。
+auto_rescue = false
+
 [sms]
 # 短信存储区偏好（SM / ME / MT）。`POST /api/sms/storage` 切换成功后写回这里，
 # 进程启动后**第一次读短信时**应用（失败只 warn、沿用当前区）。

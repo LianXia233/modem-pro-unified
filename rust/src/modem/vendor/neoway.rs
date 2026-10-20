@@ -67,6 +67,31 @@ impl VendorSpec for Spec {
         UsbnetWrite::Deny("有方没有可写的 USB 网卡模式指令（只能查看）")
     }
 
+    /// 有方展锐平台：`AT$MYUSBNETACT=0,1` 打开 USB 网卡数据，`=0,0` 关闭
+    /// （QModem `modem_dial.sh:1453-1461`、`:1150-1153`）。
+    fn data_channel(
+        &self,
+        ctx: &super::datacall::DataCallCtx<'_>,
+    ) -> Option<super::datacall::DataChannel> {
+        use super::datacall::{AtStep, DataChannel};
+        if ctx.platform != "unisoc" {
+            return None;
+        }
+        Some(DataChannel {
+            pdp_first: false,
+            activate: vec![AtStep::new(
+                "AT$MYUSBNETACT=0,1",
+                "有方展锐：打开 USB 网卡数据通道",
+            )],
+            deactivate: vec![AtStep::new(
+                "AT$MYUSBNETACT=0,0",
+                "关闭 USB 网卡数据通道（模组侧需要几秒才真正停）",
+            )],
+            cgact_fallback: true,
+            note: "有方展锐平台由 AT$MYUSBNETACT 激活；断开后固件要 3 秒左右才落定",
+        })
+    }
+
     fn at_plan_commands(
         &self,
         ctx: &crate::modem::atplan::PlanCtx,

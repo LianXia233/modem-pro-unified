@@ -61,6 +61,33 @@ impl VendorSpec for Spec {
         ("AT+QNWPREFCFG=\"mode_pref\"", "qcf")
     }
 
+    /// 美格高通平台：`AT$QCRMCALL=1,0,3,2,<cid>` 激活（QModem `modem_dial.sh:1443-1451`）。
+    ///
+    /// 只有 qualcomm 平台有这条；展锐平台的 SRM 系列走 3GPP 通用路径。
+    fn data_channel(
+        &self,
+        ctx: &super::datacall::DataCallCtx<'_>,
+    ) -> Option<super::datacall::DataChannel> {
+        use super::datacall::{AtStep, DataChannel};
+        if ctx.platform != "qualcomm" {
+            return None;
+        }
+        let cid = ctx.cid;
+        Some(DataChannel {
+            pdp_first: false,
+            activate: vec![AtStep::slow(
+                format!("AT$QCRMCALL=1,0,3,2,{cid}"),
+                "美格高通：QCRMCALL=1,0,3,2,<cid> 建立 USB 数据呼叫",
+            )],
+            deactivate: vec![AtStep::new(
+                format!("AT$QCRMCALL=0,0,3,2,{cid}"),
+                "QCRMCALL=0 关闭同一条数据呼叫",
+            )],
+            cgact_fallback: true,
+            note: "美格高通平台由 AT$QCRMCALL 激活数据通道",
+        })
+    }
+
     fn at_plan_commands(
         &self,
         ctx: &crate::modem::atplan::PlanCtx,

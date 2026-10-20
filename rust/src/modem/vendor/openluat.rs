@@ -72,6 +72,30 @@ impl VendorSpec for Spec {
         UsbnetWrite::Deny("合宙的 USB 切换（AT+SETUSB）未逐档取证，只支持查看")
     }
 
+    /// 合宙展锐：`AT+RNDISCALL=1` 打开模组自拨（QModem `modem_dial.sh:1497-1503`、`:1569-1574`）。
+    ///
+    /// Air724UG 自己维护 PDP：断开时上游**故意不动模组**（`auto_dial_hang_openluat_unisoc`
+    /// 直接 return 0），只停主机侧接口。这里照做，`deactivate` 留空并注明。
+    fn data_channel(
+        &self,
+        ctx: &super::datacall::DataCallCtx<'_>,
+    ) -> Option<super::datacall::DataChannel> {
+        use super::datacall::{AtStep, DataChannel};
+        if ctx.platform != "unisoc" {
+            return None;
+        }
+        Some(DataChannel {
+            pdp_first: false,
+            activate: vec![AtStep::new(
+                "AT+RNDISCALL=1",
+                "合宙展锐：打开 RNDIS/ECM 自拨",
+            )],
+            deactivate: Vec::new(),
+            cgact_fallback: false,
+            note: "合宙模组自持 PDP：断开只停主机接口，不向模组发断开指令（上游同口径）",
+        })
+    }
+
     fn at_plan_commands(
         &self,
         ctx: &crate::modem::atplan::PlanCtx,

@@ -168,10 +168,7 @@ fn same_family(a: Vendor, b: Vendor) -> bool {
     if a == b {
         return true;
     }
-    matches!(
-        (a, b),
-        (Huawei, TDTech) | (TDTech, Huawei)
-    )
+    matches!((a, b), (Huawei, TDTech) | (TDTech, Huawei))
 }
 
 /// 清单里的厂商标识 → `Vendor`，并处理共线型号的归属。
@@ -233,7 +230,11 @@ pub fn identify(usb: Option<&UsbIdentity>, at_lines: &[String]) -> Identify {
                 ev.push(format!(
                     "端口规则 {} → {}（AT 接口 {}）",
                     u.id_text(),
-                    if r.model.is_empty() { "未标型号" } else { &r.model },
+                    if r.model.is_empty() {
+                        "未标型号"
+                    } else {
+                        &r.model
+                    },
                     if r.at_interfaces.is_empty() {
                         "不限".to_string()
                     } else {
@@ -389,7 +390,10 @@ mod tests {
 
     #[test]
     fn at_model_wins_and_is_confirmed() {
-        let id = identify(None, &lines(&["Quectel", "RM520N-GL", "Revision: RM520NGLAAR03A03M4G"]));
+        let id = identify(
+            None,
+            &lines(&["Quectel", "RM520N-GL", "Revision: RM520NGLAAR03A03M4G"]),
+        );
         assert_eq!(id.vendor, "quectel");
         assert_eq!(id.model.as_deref(), Some("rm520n-gl"));
         assert_eq!(id.matched_by, MatchedBy::CatalogModel);

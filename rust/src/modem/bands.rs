@@ -283,10 +283,7 @@ pub fn declared(model: &str, tech: Tech) -> Declared {
     }
     let bands = b.supported(tech);
     let note = if bands.is_empty() {
-        format!(
-            "Modem-Pro 频段表里这个型号没有 {} 频段记录",
-            tech.as_str()
-        )
+        format!("Modem-Pro 频段表里这个型号没有 {} 频段记录", tech.as_str())
     } else {
         // 中文排版：`NR（NSA/SA 并集）` 后面不再多一个空格，`LTE 频段` 仍保留空格
         let gap = if tech.note_label().ends_with('）') {
@@ -547,7 +544,10 @@ fn subtract(a: &[i32], b: &[i32]) -> Vec<i32> {
         return Vec::new();
     }
     let drop: std::collections::HashSet<i32> = b.iter().copied().collect();
-    merge(&[a]).into_iter().filter(|n| !drop.contains(n)).collect()
+    merge(&[a])
+        .into_iter()
+        .filter(|n| !drop.contains(n))
+        .collect()
 }
 
 /// 频段号列表 → `B1 B3 B41` / `n41 n78`。
@@ -572,7 +572,11 @@ mod tests {
         // 频段号已归一：升序、去重、无 0
         for b in entries() {
             for list in [&b.wcdma, &b.lte, &b.nr_nsa, &b.nr_sa] {
-                assert!(list.windows(2).all(|w| w[0] < w[1]), "{} 未升序去重", b.model);
+                assert!(
+                    list.windows(2).all(|w| w[0] < w[1]),
+                    "{} 未升序去重",
+                    b.model
+                );
                 assert!(list.iter().all(|n| *n > 0));
             }
         }
@@ -586,7 +590,10 @@ mod tests {
         assert_eq!(b.platform, "mediatek");
         assert_eq!(b.lte.len(), 19);
         assert!(b.lte.contains(&41));
-        assert_eq!(b.supported(Tech::Nr), vec![1, 3, 7, 8, 20, 28, 38, 40, 77, 78]);
+        assert_eq!(
+            b.supported(Tech::Nr),
+            vec![1, 3, 7, 8, 20, 28, 38, 40, 77, 78]
+        );
 
         // 鼎桥 MT5700M-CN：NR SA 比 NSA 多 n28
         let b = lookup("MT5700M-CN").expect("MT5700M-CN 在频段表里");
@@ -699,7 +706,10 @@ mod tests {
         let t = b.text();
         assert!(t.starts_with("WCDMA B1"), "{t}");
         assert!(t.contains("B41"), "{t}");
-        assert!(t.contains("NR-SA n1 n3 n7 n8 n20 n28 n38 n40 n77 n78"), "{t}");
+        assert!(
+            t.contains("NR-SA n1 n3 n7 n8 n20 n28 n38 n40 n77 n78"),
+            "{t}"
+        );
         assert!(b.note().contains("LTE 19 个"));
     }
 }

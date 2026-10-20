@@ -72,6 +72,31 @@ impl VendorSpec for Spec {
         ("AT+WS46?", "ws46")
     }
 
+    /// Telit 高通平台：`AT#ICMAUTOCONN=1,<cid>` 激活（QModem `modem_dial.sh:1466-1473`）。
+    ///
+    /// ⚠️ 上游**没有**给 Telit 的断开指令（`ecm_hang` 的 `*)` 分支只发 ATI），
+    /// 这里按 3GPP 用 `AT+CGACT=0` 收尾，并如实注明。
+    fn data_channel(
+        &self,
+        ctx: &super::datacall::DataCallCtx<'_>,
+    ) -> Option<super::datacall::DataChannel> {
+        use super::datacall::{cgact_deactivate, AtStep, DataChannel};
+        if ctx.platform != "qualcomm" {
+            return None;
+        }
+        let cid = ctx.cid;
+        Some(DataChannel {
+            pdp_first: false,
+            activate: vec![AtStep::slow(
+                format!("AT#ICMAUTOCONN=1,{cid}"),
+                "Telit 高通：ICMAUTOCONN 让该 cid 自动连到 USB 网卡",
+            )],
+            deactivate: vec![cgact_deactivate(cid)],
+            cgact_fallback: true,
+            note: "Telit 由 AT#ICMAUTOCONN 激活；上游未登记断开指令，按 3GPP CGACT 收尾",
+        })
+    }
+
     fn at_plan_commands(
         &self,
         ctx: &crate::modem::atplan::PlanCtx,

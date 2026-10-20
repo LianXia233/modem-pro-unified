@@ -374,6 +374,28 @@ pub fn at_port_bind_key(vid: &str, pid: &str) -> Option<String> {
     Some(format!("{}:{}", norm(&v)?, norm(&p)?))
 }
 
+/// 带**物理路径**的绑定键：`vid:pid@1-1`。
+///
+/// 为什么需要：同一型号的两台模组 `vid:pid` 完全相同，只按 `vid:pid` 绑定会让
+/// 第二台也被切到第一台的串口（等于把两台设备的命令口串起来）。USB 拓扑
+/// 路径（`1-1` / `2-3.4`）在**同一台机器内唯一**，加进键里就能区分。
+///
+/// 兼容：老键（不带 `@`）仍然有效；发现流程先查带路径的，再退回老键。
+pub fn at_port_bind_key_scoped(vid: &str, pid: &str, bus_path: &str) -> Option<String> {
+    let base = at_port_bind_key(vid, pid)?;
+    let bus = bus_path.trim();
+    if bus.is_empty() {
+        return Some(base);
+    }
+    if !bus
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+    {
+        return None;
+    }
+    Some(format!("{base}@{bus}"))
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct AtPortBindFile {
     #[serde(default)]
@@ -748,8 +770,9 @@ impl SchedStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        at_port_bind_key, atport_bind_file, atport_file, imei_file, quota_file, schedule_file,
-        AtPortBindStore, AtPortStore, ImeiBackup, ImeiStore, QuotaRecord, QuotaStore, SchedStore,
+        at_port_bind_key, at_port_bind_key_scoped, atport_bind_file, atport_file, imei_file,
+        quota_file, schedule_file, AtPortBindStore, AtPortStore, ImeiBackup, ImeiStore,
+        QuotaRecord, QuotaStore, SchedStore,
     };
     use crate::modem::model::schedule::{Action, Run, Task, KIND_BAND_LOCK};
 
@@ -787,6 +810,24 @@ mod tests {
         assert!(at_port_bind_key("abc", "7126").is_none());
         assert!(at_port_bind_key("0e8d1", "7126").is_none());
         assert!(at_port_bind_key("zzzz", "7126").is_none());
+    }
+
+    #[test]
+    fn scoped_bind_key_separates_identical_models() {
+        assert_eq!(
+            at_port_bind_key_scoped("2c7c", "0801", "1-1").as_deref(),
+            Some("2c7c:0801@1-1")
+        );
+        assert_eq!(
+            at_port_bind_key_scoped("2c7c", "0801", "").as_deref(),
+            Some("2c7c:0801"),
+            "没给路径时退回老键"
+        );
+        assert!(
+            at_port_bind_key_scoped("2c7c", "0801", "../evil").is_none(),
+            "路径里有穿越字符必须拒绝"
+        );
+        assert!(at_port_bind_key_scoped("bad", "0801", "1-1").is_none());
     }
 
     #[test]
