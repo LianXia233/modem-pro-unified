@@ -8,6 +8,75 @@
 > 本文件历史条目中提到的 `PORTING.md` / `PROGRESS.md` / `HANDOFF.md` / `PRIVACY.md` /
 > `DIAL_AUDIT.md` **均已被删除**，只是历史记录，不得作为当前设计依据。
 
+## [1.0.3] - 2026-10-20
+
+### 修复：内置拨号器在支持的模组上不自动启动
+
+**现象**：插上 QMI/MBIM 模组，页面也识别出了类型，但拨号器始终不起，
+`wwan0` / `wwan0_1` 的 `link_state` 一直是 0，手动点一次拨号才动。
+
+**根因**：`DialerSupervisor::reconcile` 判断「这个模组要不要交给内置拨号器」
+用的是 `Modem::cached_dial_kind()`，而它只返回 `dial_state.kind` —— 这个字段
+**只在拨过号、或页面拉过 `/api/dial`（`dial_status` 第 ⑥ 步）之后才有值**。
+全新模组插入后用户还没拨号、页面也没开，`dial_state.kind` 是空串，
+`native_takes()` 把每个模组都判成「不归内置拨号器管」，拨号器永远不启动。
+即：把拨号的**产物**当成了拨号的**前置条件**（鸡生蛋）。
+
+**修复**：
+
+- 新增 `Modem::ensure_dial_kind()`：`dial_state.kind` 没有时走
+  `usb_type(false)`（自带 30 秒缓存，组网循环本来就会调它，命中缓存零 AT），
+  按 `dial_status` ⑥ 的同一口径回写 `kind` / `type_name`，**不动 `state`**
+  （没拨号就是没拨号，不能因为探明了链路类型就假装在拨）；探不到
+  （unknown / 空）返回空串，调用方按「不接管」处理。`native_takes()` 与
+  `reconcile_native_one()` 改用它。
+- 顺带修掉「算不出计划」路径的退避失效：原实现在 `plan_native` 失败时先调
+  `stop_native()`，把 `native_retry` / `native_fails` 一并清掉，指数退避
+  （5/10/20/40/60s）永远停在第一档，持续故障（缺 APN / 控制口未出现 /
+  网卡未被 netifd 拉起）会被 15 秒一轮地硬刷。现在退避状态跨轮保留，
+  错误**变化**时才清零（情况有变，值得立刻再试）。
+- 组网循环改为「先跑一轮再进 15 秒节拍」（quota 循环同一模式）：启动时
+  立即建接口、立即让拨号器托管看到模组，插上模组后不必空等一个节拍。
+
+### 对照厂商 C 拨号器补的两处缺口（modem-pro `files/third_party/`）
+
+与 quectel-CM 1.6.8 / fibocom-dial / meig-cm / simcom-cm 源码逐条对照后：
+
+- **`qmap_mode` 探测补齐两条兜底路径**：C 版 `ql_qmi_qmap_mode_detect()`
+  （`qmap_bridge_mode.c:241-259`）读三条路径（网卡属性 → 模块参数 → 按设备
+  定位的模块参数）；原实现只读第一条。OpenWrt 的 `qmi_wwan_q` / `qmi_wwan_f`
+  只把参数挂在模块上，漏读即漏判 QMAP，进而不下发 `WDA Set Data Format` 与
+  `Bind Mux`，驱动不 `add_mux`，`wwan0_1` 永远 NO-CARRIER。
+- **控制口反查补齐 `usb` 子目录分支**：C 版 `detect_path_cdc_wdm_or_qcqmi()`
+  （`device.c:198-252`，fibocom-dial 同构）在 `<接口>/{GobiQMI,usbmisc,usb}`
+  三级里找控制口；原实现只认 `usbmisc`。新版 qmi_wwan 把节点挂到接口的
+  `usb` 子目录下，只认 `usbmisc` 会找不到控制口，拨号器以 `NoWdm` 退避，
+  现象与「模组不支持」无异。
+
+**对照结论（一致，无需改动）**：QMI 流程（CTL Sync → Get Client ID
+WDS / WDS_IPV6 / WDA → WDA Set Data Format + Bind Mux ×2 → Set Autoconnect(0)
+→ WDS Start v4/v6 → Get Runtime Settings）、全部 TLV 类型与顺序
+（WDA 0x10/0x11/0x12/0x13/0x15/0x16/0x17，Bind Mux 0x10/0x11/0x13，
+Start 0x30/0x14/0x17/0x18/0x16/0x19/0x31）、QMAP mux 规则
+（`qmap_mode==1` 给 `0x81`，`>1` 给 `PDN+0x80`）、MBIM Basic Connect
+（OPEN → SUBSCRIBER_READY → CONNECT → IP_CONFIGURATION → CLOSE）均与
+C 实现一致；`QUECTEL_UL_DATA_AGG` 在 modem-pro 的 Makefile 未定义，
+聚合门限 TLV（0x19/0x1B/0x1C）同样不发。
+
+**已知差异（有意保留，非缺陷）**：
+
+- WDS Start 的 Profile Index：C 版默认下发 `0x31 = 1`（`CONFIG_DEFAULT_PDP`），
+  本项目 `[net] host_dial_pdn` 默认 0 = 不指定，由固件选默认 profile
+  （单 profile 模组等价；多 profile 需显式配置 `host_dial_pdn`）。
+- MBIM Session ID：C 版默认 `profile->pdp = 1`，本项目厂商策略给 0
+  （MBIM 默认会话；C 版实机 log `cdc_mbim.txt` 中 session 0 工作正常）。
+- C 版在 `/dev` 下没有控制口节点时会按 uevent 的 MAJOR/MINOR `mknod` 兜底；
+  OpenWrt 有 devtmpfs/udev 自动建节点，本项目不复制该行为（节点缺失时
+  `open` 失败会进退避重试，日志可见）。
+
+测试：`cargo test --locked` 692 项通过（新增 3 项：`ensure_dial_kind`
+缓存优先 / 探不到为空、`qmap_mode` 对不存在网卡返回 0）。
+
 ## [1.0.2] - 2026-10-20
 
 ### 上游融合（一）：端口规则进发现流程 + 厂商数据通道指令

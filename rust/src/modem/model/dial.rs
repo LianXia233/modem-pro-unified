@@ -2035,6 +2035,49 @@ impl Modem {
         self.dial_state.lock().unwrap().kind.trim().to_string()
     }
 
+    /// 拨号器托管要的「这个模组是什么链路」：没有就探测一次再答。
+    ///
+    /// `cached_dial_kind` 只回答「拨号状态里记了什么」—— 它**只在拨过号、
+    /// 或页面拉过 `/api/dial`（`dial_status` 的 ⑥）之后才有值**。而内置拨号器
+    /// 托管恰恰要在「从没拨过号」时判断要不要拉起：用户插上 QMI/MBIM 模组后
+    /// 没点拨号、页面也没开，`dial_state.kind` 是空串，`native_takes` 于是把
+    /// 每个模组都判成「不归内置拨号器管」，拨号器**永远不启动** —— 这是
+    /// 「检测到支持的模组却不起拨号」的根因：把拨号的**产物**当成了拨号的
+    /// **前置条件**（鸡生蛋）。
+    ///
+    /// 探测走 `usb_type(false)`：它自带 30 秒缓存（组网循环本来就会调它，
+    /// 命中缓存时一个 AT 都不发），所以不会突破「不额外发 AT」的边界。
+    /// 探到了按 `dial_status` ⑥ 的同一口径回写 `kind` / `type_name`，
+    /// **但不碰 `state`**：没拨号就是没拨号，不能因为探明了链路类型就
+    /// 假装在拨。探不到（unknown / 空）返回空串，调用方按「不接管」处理。
+    ///
+    /// 唯一调用方是 `runtime::dialer`（`#[cfg(unix)]`）：Windows 侧没有
+    /// sysfs / 控制口，编译目标上它无人使用，与 `pcidev.rs` 同款处理。
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn ensure_dial_kind(&self) -> String {
+        let cached = self.cached_dial_kind();
+        if !cached.is_empty() {
+            return cached;
+        }
+        let t = self.usb_type(false);
+        if t.kind.is_empty() || t.kind == "unknown" {
+            return String::new();
+        }
+        self.dial_update(|s| {
+            if s.kind.is_empty() {
+                s.kind = t.kind.clone();
+                if s.type_name.is_empty() {
+                    s.type_name = if t.name.is_empty() {
+                        t.kind.to_ascii_uppercase()
+                    } else {
+                        t.name.clone()
+                    };
+                }
+            }
+        });
+        t.kind
+    }
+
     /// 在锁内改状态。
     fn dial_update(&self, f: impl FnOnce(&mut DialState)) {
         let mut st = self.dial_state.lock().unwrap();
@@ -3177,5 +3220,38 @@ mod tests {
         assert!(r.apn.is_empty());
         assert!(!r.reconnect);
         assert!(!r.force);
+    }
+
+    // ---------- 拨号器托管：链路类型兜底（ensure_dial_kind） ----------
+
+    #[test]
+    fn ensure_dial_kind_answers_from_cache_without_probing() {
+        // 拨号状态里已有类型（拨过号 / 页面拉过 / 上一轮探到过）⇒ 直接答，
+        // 不再探测。cached 非空这条路必须保持零开销。
+        let m = Modem::new(
+            0,
+            "ttyUSB0".into(),
+            115_200,
+            Duration::from_secs(1),
+            crate::modem::vendor::Vendor::Quectel,
+        );
+        m.dial_update(|s| s.kind = "qmi".into());
+        assert_eq!(m.ensure_dial_kind(), "qmi");
+        assert_eq!(m.cached_dial_kind(), "qmi");
+    }
+
+    #[test]
+    fn ensure_dial_kind_empty_when_nothing_can_be_probed() {
+        // 没有 AT 口、sysfs 里也没有这个「端口」名对应的网卡 ⇒ 探不到 ⇒ 空串。
+        // 调用方（拨号器托管）按「不接管」处理；这条同时钉住「探不到不猜」。
+        let m = Modem::new(
+            1,
+            "definitely-not-a-real-port".into(),
+            115_200,
+            Duration::from_secs(1),
+            crate::modem::vendor::Vendor::Unknown,
+        );
+        assert_eq!(m.ensure_dial_kind(), "");
+        assert_eq!(m.cached_dial_kind(), "", "探不到就不回写，状态干净");
     }
 }

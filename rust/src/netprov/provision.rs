@@ -350,11 +350,41 @@ pub(crate) fn pick_device(modem: &Modem, occupied: &[String]) -> String {
 /// 读 `/sys/class/net/<name>/qmap_mode`（不存在或读不到 = 0）。
 ///
 /// `pub(crate)`：拨号器托管靠它决定要不要兜底传 `-n 1`（见 `[net] host_dial_pdn`）。
+///
+/// 三条路径与 quectel-CM `ql_qmi_qmap_mode_detect()`（`qmap_bridge_mode.c:241-259`）
+/// 一致：
+///   ① `/sys/class/net/<name>/qmap_mode`（最常见，qmi_wwan 每网卡一个属性）；
+///   ② `/sys/module/<驱动>/parameters/qmap_mode`（属性没导出时的模块参数）；
+///   ③ `/sys/class/net/<name>/device/driver/module/parameters/qmap_mode`（②的
+///      按设备定位版，多驱动共存时不会读到别人的）。
+/// 早先只有 ①：OpenWrt 的 `qmi_wwan_q` / `qmi_wwan_f` 只把参数挂在模块上，
+/// ① 不存在 ⇒ 漏判 QMAP ⇒ 不下发 `WDA Set Data Format` + `Bind Mux` ⇒
+/// 驱动不 `add_mux`，`wwan0_1` 永远 NO-CARRIER（接口初始化不出来的典型根因）。
 pub(crate) fn qmap_mode(name: &str) -> i64 {
-    std::fs::read_to_string(format!("/sys/class/net/{name}/qmap_mode"))
+    let direct = format!("/sys/class/net/{name}/qmap_mode");
+    if let Ok(s) = std::fs::read_to_string(&direct) {
+        if let Ok(v) = s.trim().parse() {
+            return v;
+        }
+    }
+    // ②/③ 需要驱动名：从网卡的 device/driver 符号链接取最后一段
+    let driver = std::fs::read_link(format!("/sys/class/net/{name}/device/driver"))
         .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0)
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .unwrap_or_default();
+    if !driver.is_empty() {
+        for p in [
+            format!("/sys/module/{driver}/parameters/qmap_mode"),
+            format!("/sys/class/net/{name}/device/driver/module/parameters/qmap_mode"),
+        ] {
+            if let Ok(s) = std::fs::read_to_string(&p) {
+                if let Ok(v) = s.trim().parse() {
+                    return v;
+                }
+            }
+        }
+    }
+    0
 }
 
 /// 跑一轮组网（`http/loops.rs::spawn_netprov` 调用）。
@@ -443,5 +473,12 @@ mod tests {
     #[test]
     fn sanity_plan_name_matches_helper() {
         assert!(sanity());
+    }
+
+    #[test]
+    fn qmap_mode_of_missing_iface_is_zero() {
+        // 三条 sysfs 路径都不存在（测试机 / 非 Linux）时必须是 0，不能 panic：
+        // 0 的语义是「不是 QMAP」，拨号器据此跳过 WDA/BindMux，行为确定。
+        assert_eq!(qmap_mode("definitely-not-an-iface"), 0);
     }
 }

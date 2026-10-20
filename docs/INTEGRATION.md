@@ -72,10 +72,24 @@ wechat/           企业微信推送（纯逻辑 + 传输 + 运行期状态）
      └─ ECM/RNDIS/NCM：按配方发私有激活指令，失败回退 CGACT
    状态机 phase：session → iface_pending → route_pending → online
 
-⑤ 组网（netprov，15s 一轮）
+⑤ 组网（netprov，15s 一轮，启动先跑一轮再进节拍）
    选本模组 USB 设备下的网卡 → 写 UCI（network.modem<id>）→ ifup
    地址：DHCP / FM350 静态（模组上报地址）/ v6 兄弟接口
    地址、路由、DNS 落地后回写拨号状态
+
+⑤b 拨号器托管（同一轮，无条件跑，不受 auto_wan / uci 影响）
+   这两个开关管「建不建接口」，托管管「QMI/MBIM 的数据呼叫谁来做」
+   判定链（缺一环就按「不接管」收起，不退出的重试交给 reconcile）：
+     is_running（AT 口已开）
+       → native_takes：ensure_dial_kind（dial_state.kind 为空时走
+         usb_type 30s 缓存探测一次并回写 kind/type_name，不动 state）
+       → 厂商策略 supports(vendor, link)
+       → APN 三级回退（拨号状态 → last_dial_apn → 模组已配置上下文）
+       → pick_device（同 UCI 口径选网卡，多模组不串）
+       → plan_native：控制口 sysfs 反查（usbmisc/usb/GobiQMI/mhi 四级，
+         绝不猜 /dev/cdc-wdm0）+ qmap_mode 三路径 + QMAP 参数
+   会话探活：QMI Get Packet Service Status / MBIM ActivationState；
+   掉线重建；失败指数退避 5/10/20/40/60s（错误变化才清零）
 
 ⑥ 断开（/api/dial/disconnect）
    先停拨号器 → 模组侧按配方挂断 → 清该网卡旧默认路由与地址 → manual_stop

@@ -128,11 +128,24 @@ pub fn find_control(iface: &str) -> Option<ControlDev> {
 
 /// `qmi_wwan` 的布局是 `<usb interface>/usbmisc/cdc-wdmN`；不同内核/驱动层级
 /// 差一层，所以逐级向上找。
+///
+/// 子目录清单与 quectel-CM `detect_path_cdc_wdm_or_qcqmi()`
+/// （`device.c:198-252`）、fibocom-dial 同名函数（`src/main.c:745-765`）对齐：
+/// 两家都在 `<接口>/{GobiQMI,usbmisc,usb}` 三级里找控制口。GobiQMI 里放的是
+/// `qcqmiX`（由 [`find_gobinet`] 扫 `/dev` 处理），这里只处理 `cdc-wdm*`，
+/// 所以子目录取 `usbmisc` 与 `usb` 两个；早先漏了 `usb` —— 新版 qmi_wwan
+/// 把 usbmisc 节点挂到接口的 `usb` 子目录下，只认 `usbmisc` 会找不到控制口，
+/// 拨号器直接以 `NoWdm` 退避，看起来像「模组不支持」。
 fn find_cdc_wdm(iface: &str) -> Option<String> {
     let base = parent_iface(iface);
     let mut dir = PathBuf::from(format!("/sys/class/net/{base}/device"));
     for _ in 0..4 {
-        for sub in [dir.join("usbmisc"), dir.join("../usbmisc")] {
+        for sub in [
+            dir.join("usbmisc"),
+            dir.join("../usbmisc"),
+            dir.join("usb"),
+            dir.join("../usb"),
+        ] {
             if let Ok(rd) = std::fs::read_dir(&sub) {
                 let mut names: Vec<String> = rd
                     .flatten()

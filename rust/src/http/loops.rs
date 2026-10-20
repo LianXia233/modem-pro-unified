@@ -492,9 +492,18 @@ pub fn thread_count(state: &AppState) -> usize {
 /// - 但拨号器托管**照跑**：那两个开关管的是「建不建接口」，不是「谁拨号」。
 fn spawn_netprov(state: &Arc<AppState>, interval: u64) {
     let state = state.clone();
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(interval.max(1)));
+    std::thread::spawn(move || {
+        // 先跑一轮再进节拍（quota 循环同一模式）：启动时 HTTP 已就绪、后台
+        // discover 正在收尾，立即跑一轮能让「已经就绪的路径」早 15 秒生效 ——
+        // 接口早建起来，同一轮里的拨号器托管也早 15 秒看到模组（否则插上
+        // QMI/MBIM 模组后要干等一个节拍周期拨号器才可能启动）。
+        // 模组还没就绪时这一轮是空操作（`is_running` / uci diff 都会拦），
+        // 下一节拍自然补上。
         crate::netprov::provision::run_once(&state);
+        loop {
+            std::thread::sleep(Duration::from_secs(interval.max(1)));
+            crate::netprov::provision::run_once(&state);
+        }
     });
 }
 

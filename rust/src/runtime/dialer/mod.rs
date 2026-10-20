@@ -107,9 +107,14 @@ pub fn is_native_bin_name(raw: &str) -> bool {
 }
 
 /// 这个模组能不能交给内置后端（链路类型 + 厂商策略都支持才交给它）。
+///
+/// 链路类型走 `ensure_dial_kind` 而不是 `cached_dial_kind`：后者在「没拨过号、
+/// 页面没拉过 `/api/dial`」时是空串，会把刚插上的 QMI/MBIM 模组全部判成
+/// 「不接管」，拨号器永远不启动（根因与修复详见
+/// [`crate::modem::model::Modem::ensure_dial_kind`]）。
 #[cfg(unix)]
 fn native_takes(modem: &Modem) -> bool {
-    let kind = modem.cached_dial_kind();
+    let kind = modem.ensure_dial_kind();
     let link = match kind.trim().to_ascii_lowercase().as_str() {
         "qmi" => native::vendors::DataLink::Qmi,
         "mbim" => native::vendors::DataLink::Mbim,
@@ -264,10 +269,11 @@ impl DialerSupervisor {
             st.apn.clone()
         };
         let device = pick_device(modem, &[]);
+        let kind = modem.ensure_dial_kind();
         let plan = match native::plan_native(
             id,
             modem.vendor(),
-            &modem.cached_dial_kind(),
+            &kind,
             &apn,
             &device,
             state.wan_ipv6(),
@@ -275,13 +281,20 @@ impl DialerSupervisor {
         ) {
             Ok(p) => p,
             Err(e) => {
-                self.stop_native(id);
-                // 错误不变就只在第一次打 warn（否则每 15 秒刷一行）
+                // 算不出计划时**没有会话可停**（压根还没建起来），但原实现在
+                // 这里调了 `stop_native` —— 它会把 `native_retry` /
+                // `native_fails` 一并清掉，于是「错误不变就静默 + 指数退避」
+                // 整体失效：fails 每轮都从 0→1，退避永远停在第一档 5 秒
+                // （循环本身 15 秒一轮，等于每轮硬试）。持续故障（缺 APN /
+                // 控制口还没出现 / 网卡没被 netifd 拉起）必须靠退避压住，
+                // 否则 15 秒一轮地把控制口和 sysfs 刷一遍。
+                // 退避状态跨轮保留；错误**变化**时才清零（情况有变，值得立刻再试）。
                 let mut g = self.native_retry.lock().unwrap();
                 let msg = e.to_string();
                 let changed = g.get(&id).map(|(m, _)| m != &msg).unwrap_or(true);
                 if changed {
                     log::warn!("原生拨号：模组 {id} 算不出计划: {e}");
+                    self.native_fails.lock().unwrap().remove(&id);
                 }
                 g.insert(id, (msg, std::time::Instant::now()));
                 {
