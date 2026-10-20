@@ -14,7 +14,7 @@ OpenWrt 上统一管理 **5G/LTE 模组**（移远 Quectel、广和通 Fibocom�
 | `files/` | netifd 协议脚本、默认 `config.toml`、mp-client wrapper |
 | `luci/` | LuCI 前端：协议 JS、控制器、i18n、视图、菜单、ACL |
 | `packaging/` | init 脚本与安装/卸载脚本 |
-| `docs/` | 集成说明、构建说明、接口契约 |
+| `docs/` | 架构说明、构建说明、接口契约、上游审计与支持矩阵 |
 
 ## 快速开始（设备端）
 
@@ -53,13 +53,17 @@ make package/modem-pro/compile V=s MODEM_PRO_HOST_RUST=1   # 宿主 rustup 直�
 
 ## 文档
 
-- [docs/README.md](docs/README.md) — 文档索引（含哪些历史文档已被删除、现在的权威来源）。
-- [docs/UPSTREAM_AUDIT.md](docs/UPSTREAM_AUDIT.md) — 上游源码审计、功能迁移矩阵、验证结果与真机待办。
+- [docs/README.md](docs/README.md) — 文档索引。
+- [docs/INTEGRATION.md](docs/INTEGRATION.md) — 架构分层、数据流、数据表与扩展指南。
+- [docs/BUILD.md](docs/BUILD.md) — 本机开发、SDK 构建、CI 与安装后验证。
+- [docs/API.md](docs/API.md) — HTTP / WebSocket 接口契约（由路由表导出）。
+- [docs/UPSTREAM_AUDIT.md](docs/UPSTREAM_AUDIT.md) — 上游源码审计、迁移矩阵、验证结果与真机待办。
 - [docs/SUPPORT_MATRIX.md](docs/SUPPORT_MATRIX.md) — 逐型号支持矩阵与厂商数据通道指令。
-- [CHANGELOG.md](CHANGELOG.md) — 变更记录。
+- [CHANGELOG.md](CHANGELOG.md) — 变更记录；[RELEASE_NOTES.md](RELEASE_NOTES.md) — 发版说明。
 
-> 早先 README 里列的 `docs/INTEGRATION.md`、`docs/API.md` 等文件已在提交 `66853b8`
-> 中整体删除（描述的是删除前的实现，已过时）。现状以代码与上面三份文档为准。
+> 2026-10-20 已按**当前代码**重写 `INTEGRATION.md` / `BUILD.md` / `API.md`（旧版在
+> 提交 `66853b8` 被删除，内容已过时，未恢复）。`PORTING.md` / `PROGRESS.md` /
+> `HANDOFF.md` / `PRIVACY.md` / `DIAL_AUDIT.md` 不再维护，见 `docs/README.md` 的说明。
 
 ## 致谢
 

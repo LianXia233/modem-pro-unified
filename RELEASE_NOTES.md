@@ -1,4 +1,22 @@
-# modem-pro v1.0.1 发版说明
+# modem-pro 发版说明
+
+## 未发布（`main` @ 2026-10-20）
+
+> 详细条目见 `CHANGELOG.md` 的 `[未发布]`；逐项依据与真机待办见 `docs/UPSTREAM_AUDIT.md`。
+
+- **设备发现重构**：按 USB 设备分组（一台模组只登记一个命令口）、QModem 端口规则白名单
+  与语音 PCM 口剔除、`include` 外不选、身份级探活（`AT` 回 OK 不算）、`option_driver`
+  枚举前补绑、PCIe/MHI AT 口枚举与裸字符设备读写、非 AT 口 15s→300s 退避（含 90s 预热）。
+- **厂商数据通道**：ECM/RNDIS/NCM 不再一律 `AT+CGACT`，按厂商×平台发
+  `QNETDEVCTL` / `GTRNDIS` / `NDISDUP` / `SETAUTODIAL` / `QCRMCALL` / `MYUSBNETACT` /
+  `ICMAUTOCONN` / `ZECMCALL` / `RNDISCALL`；挂断与激活严格对称；FM350 MTK 与芯讯通保持 CGACT。
+- **拓扑与恢复**：`tty_list` 可见多口；`vid:pid@bus` 绑定区分同型号多台；PCIe 自动补绑；
+  `auto_rescue`（默认关）软重插；拨号失败 5→60s 指数退避；断开后清旧默认路由与地址。
+- **文档**：按当前代码重写 `docs/INTEGRATION.md`、`docs/BUILD.md`、`docs/API.md`（105 条接口全表），
+  新增 `docs/UPSTREAM_AUDIT.md`、`docs/SUPPORT_MATRIX.md` 与文档索引。
+- **测试**：`cargo test --locked` 732 passed；`cargo fmt --check`、`clippy`、`release` 构建通过。
+
+## v1.0.1
 
 发布日期：2026-10-20 ｜ 对应仓库 `LianXia233/modem-pro-unified` 标签 `v1.0.1`
 
@@ -63,7 +81,7 @@ apk add --allow-untrusted /tmp/modem-pro-*.apk
 opkg install /tmp/modem-pro_*.ipk
 ```
 
-完整安装验证清单见仓库 [docs/BUILD.md](../../blob/main/docs/BUILD.md)。
+完整安装验证清单见仓库 [docs/BUILD.md](docs/BUILD.md)。
 
 ## 升级注意
 

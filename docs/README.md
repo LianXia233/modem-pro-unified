@@ -1,30 +1,32 @@
 # 文档索引
 
-本目录在 2026-10-20 的提交 `66853b8`（"Delete docs directory"）里被整体删除，
-当时删掉的是 `API.md`、`BUILD.md`、`DIAL_AUDIT.md`、`HANDOFF.md`、`INTEGRATION.md`、
-`PORTING.md`、`PRIVACY.md`、`PROGRESS.md`、`UPSTREAM_AUDIT.md` 与 `example-config.toml`
-（共 5777 行）。根 `README.md` 与部分源码注释仍引用这些文件名。
-
-**本目录只保留与当前代码一致、且逐条核对过的文档**。历史文档没有恢复：它们描述的是
-删除前的实现，恢复会让人把过时设计当成现状（任务红线明确禁止）。
-
-## 现有文档
+## 现行文档（按当前代码核对）
 
 | 文件 | 内容 |
 | --- | --- |
-| [`UPSTREAM_AUDIT.md`](UPSTREAM_AUDIT.md) | 三仓库源码审计、功能迁移矩阵、代码变更清单、测试结果、真机待办 |
-| [`SUPPORT_MATRIX.md`](SUPPORT_MATRIX.md) | 91 个型号 × 数据形态 × 平台，厂商 × 平台的数据通道指令，验证边界 |
+| [`INTEGRATION.md`](INTEGRATION.md) | 架构分层、一次「插上模组 → 能上网」的数据流、数据表、扩展指南、配置分节、兼容红线 |
+| [`BUILD.md`](BUILD.md) | 本机开发、OpenWrt SDK 构建（feeds rust/host 与宿主直编两条路）、CI、安装后验证、常见问题 |
+| [`API.md`](API.md) | HTTP / WebSocket 契约：响应信封、鉴权、`modem_id` 语义、103 条 `/api/*` 接口全表（外加 2 个 WebSocket；由 `router.rs` 导出） |
+| [`UPSTREAM_AUDIT.md`](UPSTREAM_AUDIT.md) | 三仓库源码审计、功能迁移矩阵（D1–D13 / P1–P12）、代码变更清单、测试结果、真机待办 |
+| [`SUPPORT_MATRIX.md`](SUPPORT_MATRIX.md) | 91 型号 × USB/PCIe 形态 × 平台；厂商 × 平台的数据通道指令；验证边界 |
 
-## 已删除、且**不再作为设计依据**的文档
+## 历史文档说明
 
-| 旧文件 | 现状 | 替代 |
-| --- | --- | --- |
-| `INTEGRATION.md` | 删除 | 目录结构与分层见各模块顶部 `//!` 注释；迁移结论见 `UPSTREAM_AUDIT.md` |
-| `API.md` | 删除 | 接口契约以 `rust/src/http/router.rs` + `http/handlers/*` 为准 |
-| `BUILD.md` | 删除 | 构建入口以根 `Makefile` 与 `.github/workflows/build.yml` 为准 |
-| `PORTING.md` | 删除 | `UPSTREAM_AUDIT.md` §2 的迁移矩阵 |
-| `PROGRESS.md` / `HANDOFF.md` | 删除 | 进度以 `CHANGELOG.md` 与 git 提交为准 |
-| `PRIVACY.md` / `DIAL_AUDIT.md` | 删除 | 脱敏要求见 `scripts/check-desensitize.sh` 与日志模块注释 |
+2026-10-20 的提交 `66853b8`（"Delete docs directory"）删除了当时全部文档（5777 行）。
+其中 `INTEGRATION.md` / `BUILD.md` / `API.md` 已在同日**按现行代码重写**，不是恢复旧文；
+旧文描述的是删除前的实现，不能作为设计依据。
 
-> 源码注释里出现的 `docs/INTEGRATION.md` 等引用保留原样：它们指向的是设计意图，
-> 不是可点击的现状说明。
+以下文件**不再维护**，其职责已被替代：
+
+| 旧文件 | 替代 |
+| --- | --- |
+| `PORTING.md`（逐路由迁移状态） | `API.md` 的接口全表 + `UPSTREAM_AUDIT.md` 的迁移矩阵 |
+| `PROGRESS.md` / `HANDOFF.md` | `CHANGELOG.md` 与 git 提交历史 |
+| `PRIVACY.md` / `DIAL_AUDIT.md` | 脱敏要求见 `scripts/check-desensitize.sh`；拨号审计见 `UPSTREAM_AUDIT.md` §2.2 |
+
+## 维护约定
+
+- 改接口 → 同步 `API.md`（路由全表由 `router.rs` 导出，接口增删必须改）；
+- 改构建/依赖/CI → 同步 `BUILD.md`；
+- 改分层、数据流、数据表字段或扩展步骤 → 同步 `INTEGRATION.md`；
+- 迁移结论与真机状态 → 只写 `UPSTREAM_AUDIT.md` / `SUPPORT_MATRIX.md`，不要在别处重复。

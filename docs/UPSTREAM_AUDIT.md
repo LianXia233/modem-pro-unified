@@ -70,8 +70,8 @@
 
 | # | 问题 | 事实 | 处置 |
 | --- | --- | --- | --- |
-| C1 | README 链接的 `docs/INTEGRATION.md`、`docs/API.md` 等 6 个文件不存在 | `git log` 显示 `66853b8 Delete docs directory` 一次性删掉了 10 个文档（5777 行），README 未同步 | 新增 `docs/README.md` 说明现状；新增本文件与 `docs/SUPPORT_MATRIX.md`；不改写历史文档（内容已过时，恢复会误导） |
-| C2 | 代码注释多处引用 `docs/INTEGRATION.md` | 同上 | 保留注释（指向设计意图），在 `docs/README.md` 里说明该文件已删除 |
+| C1 | README 链接的 `docs/INTEGRATION.md`、`docs/API.md` 等 6 个文件不存在 | `git log` 显示 `66853b8 Delete docs directory` 一次性删掉 10 个文档（5777 行），README 未同步 | 按**当前代码**重写 `INTEGRATION.md` / `BUILD.md` / `API.md`，新增本文件与 `SUPPORT_MATRIX.md`，README 与文档索引同步；旧文不恢复（内容过时） |
+| C2 | 代码注释多处引用 `docs/INTEGRATION.md` / `docs/API.md` | 同上 | 三份文档已重写，引用重新有效；`PORTING.md` 的两处引用改为 `API.md` |
 
 ---
 

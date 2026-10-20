@@ -14,7 +14,7 @@
 //!   · `static_ui`  —— 编译期嵌入的调试台页面
 //!   · `handlers/*` —— 每个接口一个文件
 //!
-//! 接口契约见 docs/API.md，迁移清单见 docs/PORTING.md。
+//! 接口契约见 docs/API.md，迁移清单见 docs/API.md。
 
 mod auth;
 pub(crate) mod cache;

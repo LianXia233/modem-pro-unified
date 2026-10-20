@@ -34,9 +34,10 @@
 
 **文档**
 
-- 新增 `docs/UPSTREAM_AUDIT.md`（审计 + 迁移矩阵 + 真机待办）与
-  `docs/SUPPORT_MATRIX.md`（91 型号 × 形态 × 平台）；`docs/README.md` 说明
-  `66853b8` 删除的历史文档不再作为设计依据，README 的失效链接同步修正。
+- 按**当前代码**重写 `docs/INTEGRATION.md`（分层/数据流/扩展指南）、`docs/BUILD.md`
+  （两条构建路径/CI/验证）、`docs/API.md`（由 `router.rs` 导出的 105 条接口全表）；
+  新增 `docs/UPSTREAM_AUDIT.md`、`docs/SUPPORT_MATRIX.md` 与 `docs/README.md` 索引；
+  README、RELEASE_NOTES 同步，`PORTING.md` 的两处代码引用改为 `API.md`。
 
 - 非 AT 口否定缓存：15s→30s→60s→120s→240s→300s 退避，端口消失即清空。
   巡检 3 秒一轮，否则每个「不是模组」的 tty 每轮都要白等 4 条 AT 超时。
@@ -286,7 +287,7 @@ peerdns 或 static `dns` 提供。
 
 对齐上游拨号实现后确认：方式判定、按类型分派、网口关联、幂等组网都已与
 Go 上游一致；真正缺的是**连接状态分层**。审计明细见
-[`docs/DIAL_AUDIT.md`](docs/DIAL_AUDIT.md)。
+`docs/DIAL_AUDIT.md`（已删除，内容并入 `docs/UPSTREAM_AUDIT.md`）。
 
 #### 🟢 问题
 
