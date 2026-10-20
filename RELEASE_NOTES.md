@@ -1,45 +1,53 @@
-# modem-pro v1.0.2 发版说明
+# modem-pro v1.0.3 发版说明
 
-发布日期：2026-10-20 ｜ 标签 `v1.0.2` ｜ 版本号 `1.0.2-1`（`VERSION`）
+发布日期：2026-10-20 ｜ 标签 `v1.0.3` ｜ 版本号 `1.0.3-3`（`VERSION`）
 
-本版把 QModem 与 Go 版 modem-pro 的**设备发现、端口选择、厂商数据通道**能力并入现有 Rust 架构，
-并补上多模组拓扑、同型号区分、失败退避与断开清理。逐项依据与真机待办见
-[`docs/UPSTREAM_AUDIT.md`](docs/UPSTREAM_AUDIT.md)，逐型号状态见
-[`docs/SUPPORT_MATRIX.md`](docs/SUPPORT_MATRIX.md)。
+本版修复**内置拨号器在支持的 QMI/MBIM 模组上不自动启动**的问题（插上模组、页面识别出类型，
+但拨号器始终不起、`wwan0`/`wwan0_1` 无 carrier，手动点拨号才动），并对照四家厂商 C 拨号器源码
+补齐两处协议缺口；同时清理小窗页对已删除接口的残留调用。逐项依据见
+[`docs/UPSTREAM_AUDIT.md`](docs/UPSTREAM_AUDIT.md) 与 [CHANGELOG.md](CHANGELOG.md) 的 [1.0.3] 条目。
 
 ## 这版做了什么
 
-### 1. 设备发现按「物理设备 + 端口规则」选口
+### 1. 内置拨号器自动启动（本版核心）
 
-- 按 USB 设备分组：一台模组只登记**一个**命令口（RM520N 这类 4 口设备不再变成 2~3 台模组）；
-- 端口规则的 `include` 白名单生效，语音 PCM 口剔除；白名单外宁可等 tty 出现，也不拿 diag 口凑数；
-- 身份级探活：`AT` 回 `OK` 不算命令口，必须 `AT+CGMM`/`AT+CGMI`/`ATI` 有一条内容行；
-- `option_driver=1` 的设备在枚举串口**之前**补绑 `option1/new_id`（5 分钟冷却）；
-- PCIe/MHI 的 AT 口（`mhi_*DUN*`、`mhi_*AT*`、`wwan*at*`）纳入发现；`AtPort` 增加裸字符设备后端；
-- 非 AT 口否定缓存 15s→300s，设备刚插入（<90s）固定 15s 重探。
+**根因**：拨号器托管判定读 `dial_state.kind`，而该字段只在拨过号、或页面拉过 `/api/dial`
+之后才有值——把拨号的**产物**当成了拨号的**前置条件**。全新模组插入后永远判「不接管」，
+拨号器不启动，`link_state` 保持 0。
 
-### 2. ECM / RNDIS / NCM 按厂商下发数据通道指令
+**修复**：
 
-以前一律 `AT+CGACT`，PDP 显示 active 而网卡没有 carrier。现在按「厂商 × 平台」发：
+- 新增 `Modem::ensure_dial_kind()`：`kind` 为空时走 `usb_type`（自带 30 秒缓存，命中零 AT），
+  按 `dial_status` 同口径回写 `kind`/`type_name`，**不伪造拨号状态**；探不到按「不接管」处理；
+- 修掉「算不出计划」路径的退避失效：原实现先清退避计数再重试，指数退避（5→60s）永远停在
+  第一档；现在跨轮保留、错误变化才清零；
+- 组网循环改为「先跑一轮再进 15 秒节拍」：启动即建接口、拨号器托管即见模组。
 
-| 厂商 | 激活 |
-| --- | --- |
-| 移远 | `AT+QNETDEVCTL`（海思 / 展锐 / 高通三套参数） |
-| 广和通 | `AT+GTRNDIS`（MTK 平台仍 `AT+CGACT`，FM350 不走 GTRNDIS） |
-| 华为 / 鼎桥 | `AT^NDISDUP`（华为展锐为 `AT^SETAUTODIAL`） |
-| 美格 / 有方 / Telit / 高新兴 / 合宙 | `AT$QCRMCALL` / `AT$MYUSBNETACT` / `AT#ICMAUTOCONN` / `AT+ZECMCALL` / `AT+RNDISCALL` |
+### 2. 对照厂商 C 拨号器补齐的两处缺口
 
-挂断与激活严格对称；私有指令被拒时回退 `AT+CGACT` 并记录；平台未识别只走 3GPP。
+与 quectel-CM 1.6.8 / fibocom-dial / meig-cm / simcom-cm 源码逐条对照后修复：
 
-### 3. 拓扑、恢复与清理
+- **QMAP 模式漏判**：`qmap_mode` 探测补齐模块参数两条兜底路径。OpenWrt 的
+  `qmi_wwan_q`/`qmi_wwan_f` 只把参数挂模块上，漏读即漏判 QMAP → 不下发
+  `WDA Set Data Format` + `Bind Mux` → 驱动不 `add_mux` → `wwan0_1` 永远 NO-CARRIER；
+- **控制口反查缺 `usb` 子目录**：新版 qmi_wwan 把 `cdc-wdm` 节点挂到接口的 `usb` 子目录，
+  只认 `usbmisc` 会找不到控制口，拨号器以 `NoWdm` 退避（现象与「模组不支持」无异）。
 
-- `tty_list` 显示同一设备的全部 AT 候选口，手动切口后新口排最前；
-- 命令口绑定新增 `vid:pid@1-1`（API `bus_path`），同型号多台不再共用一条绑定，旧键兼容；
-- PCIe 模组自动补绑 `mhi_pci_generic` / `mtk_t7xx`（`[serial] pcie_autobind`，默认开）；
-- 卡死救援：150s 无模组 → USB `authorized 0→1` / PCIe remove+rescan（`[serial] auto_rescue`，**默认关**）；
-- 原生 QMI/MBIM 失败退避 5→60s（成功清零）；
-- 断开后清该网卡旧默认路由与地址，避免「已断开但流量继续进黑洞」；
-- 拨号步骤新增「形态与支持清单核对」（清单形态不符时提示，不拦截）。
+协议层（QMI 全流程、TLV 顺序与常量、QMAP mux 规则、MBIM Basic Connect）经逐条核对与 C 实现一致；
+有意保留的差异（Profile Index、MBIM Session ID、`mknod` 兜底）已在 CHANGELOG 说明。
+
+### 3. 小窗页残留调用清理
+
+- `mini.html` 开机仍在 `fetch('/api/sms/auth')`（接口已随短信密码取消而删除，稳定 404），
+  导致每条新短信弹两次卡（先「正文受保护」再正文卡）。已删除探测并清理同源死代码；
+- 顺带完成与 modem-pro 的**接口名全量对照**：88 个共有接口名完全一致、无任何改名；
+  本版新增的 11 个接口均已在 `docs/API.md` 登记。
+
+### 4. 文档：补齐上游致谢
+
+README 与 `docs/UPSTREAM_AUDIT.md` §7 列出全部参考过的仓库（ouyangzq/modem-pro、
+ouyangzq/luci-proto-modem-pro、FUjr/QModem、LianXia233/luci-app-fm350）。
+内置 QMI/MBIM 拨号器是**独立 Rust 实现**，未使用、未拷贝任何厂商 C 源码。
 
 ## 产物清单
 
@@ -66,23 +74,26 @@ opkg install /tmp/modem-pro_*.ipk
 
 ## 升级注意
 
-- 覆盖安装即可；版本号单一来源 `VERSION`（本版 `1.0.2-1`）。
-- 配置**只新增**两个键，缺省即旧行为：`[serial] pcie_autobind = true`、`[serial] auto_rescue = false`；
-  `/etc/modemd/config.toml` 是 conffiles，升级不会覆盖你的取值。
-- API 只新增可选参数 `bus_path`（`/api/atport/bind`）与若干步骤文案；路径、字段、`code` 语义不变。
-- 升级后模组会重新识别一次（只读 `ATI`/`CGMM`/`CGMR`，不打断已有链路）。
-- 若之前手工绑过 `vid:pid`，继续有效；同型号多台建议改绑 `vid:pid@总线路径`。
+- 覆盖安装即可；版本号单一来源 `VERSION`（本版 `1.0.3-3`）。
+- **无新增配置键、无 API 变更**：接口路径、字段、`code` 语义与 1.0.2 完全一致；
+  `/etc/modemd/config.toml` 是 conffiles，升级不覆盖你的取值。
+- 本版修复只在「插上模组后不发任何拨号指令」的路径上生效，已有链路不受影响；
+  升级后模组重新识别一次（只读 `ATI`/`CGMM`/`CGMR`）。
+- QMI/MBIM 模组升级后建议观察日志：应出现
+  「原生拨号：模组 N 拉起 native <厂商> qmi [cdc-wdm /dev/cdc-wdmX ...]」，
+  且 `wwan0_1` 出现 carrier。
 
 ## 已知边界（如实说明）
 
-- **本版没有做真机验证**：无 5G 模组、SIM 与目标机，厂商数据通道、MHI 裸口、断开清理
-  在 busybox 上的行为、`auto_rescue` 与 `pcie_autobind` 的实际效果均待实机确认；
-- `auto_rescue` 默认关闭（会短暂断开数据面），需要时再打开；
-- 仓库基线仍有 7 条 clippy warning，均在未改动模块，未新增 `#[allow]`；
-- 自动化：`cargo test --locked` 732 passed，`cargo fmt --check` 通过，release 构建通过。
+- **拨号器自动启动未经真机验证**：无 5G 模组、SIM 与目标机；`ensure_dial_kind` 探测、
+  退避行为、QMAP mux 与控制口反查均按源码与既有测试保证，实机效果待确认；
+- `WDS Start` 的 Profile Index 默认 0（不指定，由固件选默认 profile），多 profile 模组
+  需显式配置 `[net] host_dial_pdn`；
+- 自动化：`cargo test --locked` 692 项通过（新增 3 项），`cargo fmt --check` 干净，
+  clippy 无新增警告；小窗页内联脚本经 `node --check` 校验。
 
 ## 文档
 
 `docs/INTEGRATION.md`（架构/数据流）、`docs/BUILD.md`（构建/CI/验证）、
-`docs/API.md`（103 条 `/api/*` + 2 个 WebSocket 全表）、`docs/UPSTREAM_AUDIT.md`、
+`docs/API.md`（`/api/*` + WebSocket 全表）、`docs/UPSTREAM_AUDIT.md`（审计与上游致谢）、
 `docs/SUPPORT_MATRIX.md`；历史文档的处置见 `docs/README.md`。
