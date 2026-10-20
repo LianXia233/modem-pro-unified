@@ -42,15 +42,24 @@ fn probe_allowed(path: &str) -> bool {
 }
 
 /// 第 `tries` 次失败后的退避秒数：15 → 30 → 60 → 120 → 300（封顶）。
-fn backoff_secs(tries: u32) -> u64 {
+///
+/// `young` = 设备还在预热窗口内（刚插上 < 90s）：固定 15s 重探，
+/// 不参与指数退避 —— 5G 模组开机要几十秒才出 AT 口，退避到 5 分钟等于「永远认不出」。
+fn backoff_secs(tries: u32, young: bool) -> u64 {
+    if young {
+        return 15;
+    }
     let shift = tries.saturating_sub(1).min(5);
     (15u64 << shift).min(300)
 }
 
-fn note_probe_failed(path: &str) {
+/// 预热窗口（秒）：上游 Go 版 `probe_warmup` 默认 90s。
+const PROBE_WARMUP_SECS: u64 = 90;
+
+fn note_probe_failed(path: &str, young: bool) {
     let mut g = negative().lock().unwrap_or_else(|e| e.into_inner());
     let tries = g.get(path).map(|n| n.tries + 1).unwrap_or(1);
-    let backoff = Duration::from_secs(backoff_secs(tries));
+    let backoff = Duration::from_secs(backoff_secs(tries, young));
     g.insert(
         path.to_string(),
         Negative {
@@ -82,6 +91,8 @@ pub struct Discovered {
     pub rule_note: String,
     /// 组内被跳过的口与原因。
     pub skipped: Vec<(String, String)>,
+    /// 这台设备可作 AT 口的全部 tty（首选项在前，供页面的「其它 tty」展示）。
+    pub ttys: Vec<String>,
     /// 探活拿到的身份行（ATI/CGMM/CGMI）。
     pub evidence: Vec<String>,
     /// 首选口探不通、退到第几个回退口（0 = 首选）。
@@ -118,14 +129,21 @@ pub fn discover_new(
             if !probe_allowed(cand) {
                 continue;
             }
+            let young = ports::device_age_secs(cand)
+                .map(|age| age < PROBE_WARMUP_SECS)
+                .unwrap_or(false);
             let Some(evidence) = AtPort::probe_identity(cand, baud, probe_timeout) else {
-                note_probe_failed(cand);
+                note_probe_failed(cand, young);
                 continue;
             };
             note_probe_ok(cand);
+            let mut ttys: Vec<String> = Vec::with_capacity(g.fallbacks.len() + 1);
+            ttys.push((*cand).clone());
+            ttys.extend(g.fallbacks.iter().cloned());
             out.push(Discovered {
                 path: (*cand).clone(),
                 group: g.key.clone(),
+                ttys,
                 rule_note: g.rule_note.clone(),
                 skipped: g.skipped.clone(),
                 evidence,
@@ -172,13 +190,21 @@ mod tests {
 
     #[test]
     fn backoff_grows_then_caps() {
-        assert_eq!(backoff_secs(1), 15);
-        assert_eq!(backoff_secs(2), 30);
-        assert_eq!(backoff_secs(3), 60);
-        assert_eq!(backoff_secs(4), 120);
-        assert_eq!(backoff_secs(5), 240);
-        assert_eq!(backoff_secs(6), 300, "封顶 5 分钟");
-        assert_eq!(backoff_secs(99), 300);
+        assert_eq!(backoff_secs(1, false), 15);
+        assert_eq!(backoff_secs(2, false), 30);
+        assert_eq!(backoff_secs(3, false), 60);
+        assert_eq!(backoff_secs(4, false), 120);
+        assert_eq!(backoff_secs(5, false), 240);
+        assert_eq!(backoff_secs(6, false), 300, "封顶 5 分钟");
+        assert_eq!(backoff_secs(99, false), 300);
+    }
+
+    /// 预热窗口内固定 15s：新插的 5G 模组不该被退避到「下一轮 5 分钟后」。
+    #[test]
+    fn warmup_keeps_probe_interval_short() {
+        assert_eq!(backoff_secs(1, true), 15);
+        assert_eq!(backoff_secs(6, true), 15);
+        assert_eq!(backoff_secs(99, true), 15);
     }
 
     /// `discover_new` 在没有串口的机器上必须返回空（CI/开发机）。

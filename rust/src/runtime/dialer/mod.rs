@@ -142,6 +142,19 @@ pub struct DialerSupervisor {
     /// 不影响别的模组，也不会每 15 秒把控制口刷一遍。
     #[cfg(unix)]
     native_retry: Mutex<HashMap<u32, (String, std::time::Instant)>>,
+    /// 连续失败次数（模组 id → 次数）；成功一次即清零。
+    ///
+    /// 用来做指数退避：5 → 10 → 20 → 40 → 60（封顶）。固定 5 秒重试在
+    /// 「SIM 未插 / 套餐欠费 / 频段不可用」这类持续故障上会把控制口刷爆。
+    #[cfg(unix)]
+    native_fails: Mutex<HashMap<u32, u32>>,
+}
+
+/// 第 `fails` 次连续失败后的重试间隔：5 → 10 → 20 → 40 → 60（封顶）。
+#[cfg(unix)]
+fn retry_delay(fails: u32) -> std::time::Duration {
+    let secs = 5u64.saturating_mul(1 << fails.saturating_sub(1).min(4));
+    std::time::Duration::from_secs(secs.min(60))
 }
 
 impl DialerSupervisor {
@@ -205,6 +218,7 @@ impl DialerSupervisor {
     fn stop_native(&self, modem_id: u32) {
         let s = self.native.lock().unwrap().remove(&modem_id);
         self.native_retry.lock().unwrap().remove(&modem_id);
+        self.native_fails.lock().unwrap().remove(&modem_id);
         if let Some(mut s) = s {
             s.stop();
             log::info!("原生拨号：模组 {modem_id} 会话已停止");
@@ -270,6 +284,10 @@ impl DialerSupervisor {
                     log::warn!("原生拨号：模组 {id} 算不出计划: {e}");
                 }
                 g.insert(id, (msg, std::time::Instant::now()));
+                {
+                    let mut f = self.native_fails.lock().unwrap();
+                    *f.entry(id).or_insert(0) += 1;
+                }
                 return;
             }
         };
@@ -296,11 +314,18 @@ impl DialerSupervisor {
             }
         }
 
-        // 失败退避 5 秒（QModem 的重试循环同节奏）
+        // 失败退避：按连续失败次数指数增长（5/10/20/40/60s）
         {
             let g = self.native_retry.lock().unwrap();
+            let fails = self
+                .native_fails
+                .lock()
+                .unwrap()
+                .get(&id)
+                .copied()
+                .unwrap_or(0);
             if let Some((_, at)) = g.get(&id) {
-                if at.elapsed() < std::time::Duration::from_secs(5) {
+                if at.elapsed() < retry_delay(fails.max(1)) {
                     return;
                 }
             }
@@ -309,6 +334,7 @@ impl DialerSupervisor {
         match native::Session::start(plan.clone()) {
             Ok(s) => {
                 self.native_retry.lock().unwrap().remove(&id);
+                self.native_fails.lock().unwrap().remove(&id);
                 log::info!("原生拨号：模组 {id} 拉起 {}", plan.describe());
                 self.native.lock().unwrap().insert(id, s);
             }
@@ -321,6 +347,10 @@ impl DialerSupervisor {
                     .lock()
                     .unwrap()
                     .insert(id, (e, std::time::Instant::now()));
+                {
+                    let mut f = self.native_fails.lock().unwrap();
+                    *f.entry(id).or_insert(0) += 1;
+                }
             }
         }
     }
@@ -350,5 +380,21 @@ mod tests {
         for v in ["quectel-CM", "/usr/bin/native", "natives", "fibocom-dial"] {
             assert!(!is_native_bin_name(v), "{v:?} 不是内置开关");
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod retry_tests {
+    use super::retry_delay;
+
+    /// 固定 5 秒会把「持续失败」变成每 5 秒刷一次控制口；必须指数退避并封顶。
+    #[test]
+    fn retry_delay_backs_off_then_caps() {
+        assert_eq!(retry_delay(1).as_secs(), 5);
+        assert_eq!(retry_delay(2).as_secs(), 10);
+        assert_eq!(retry_delay(3).as_secs(), 20);
+        assert_eq!(retry_delay(4).as_secs(), 40);
+        assert_eq!(retry_delay(5).as_secs(), 60);
+        assert_eq!(retry_delay(99).as_secs(), 60);
     }
 }

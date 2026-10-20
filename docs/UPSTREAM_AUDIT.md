@@ -43,7 +43,10 @@
 | D6 | **PCIe/MHI AT 口**枚举 | Go `ports_unix.go:38-51`、QModem `:695-761` | `is_at_candidate()` 只认 ttyUSB/ttyACM，MHI 口永远发现不了 | 并入 `pcidev::pcie_at_port_candidates()`；`is_at_candidate` 支持 `mhi_*DUN/AT/uci_q`、`wwan*at*` | 已实现 |
 | D7 | **裸字符设备**读写（MHI 口不是 tty） | Go `atdev.go:90-143` | `serialport` 打开即 `ENOTTY`，PCIe 模组一个都认不出 | `AtPort` 后端抽象成 `AtIo`，Linux 上退到非阻塞裸读写 | 已实现 |
 | D8 | 非 AT 口**否定缓存 + 指数退避** | Go `modem_serial.go:307-343` | 无：巡检 3s 一轮，每轮对「不是模组」的 tty 重发 4 条 AT | `scanner.rs` 进程级否定缓存：15→30→60→120→240→300s，端口消失即清（重插立即重探） | 已实现（**无 90s 预热窗口**：上游按 sysfs mtime 判断「新设备」固定 15s 重探，本实现未取 mtime） |
-| D9 | 卡死救援（150s 无 AT → USB `authorized 0→1`） | Go `modem_serial.go:352-428` | 无 | 未实现：属于破坏性操作，需真机验证与开关，不能凭代码推断直接上线 | 未实现 |
+| D9 | 卡死救援（150s 无 AT → USB `authorized 0→1` / PCIe 重扫） | Go `modem_serial.go:352-428` | 无 | `manager.rs`：`[serial] auto_rescue`（**默认关**）＋150s 触发、5 分钟冷却、每轮最多 3 次；判定为纯函数并有测试 | 已实现（默认关闭） |
+| D11 | PCIe 模组**补绑驱动**（MHI / T7xx） | Go `pcie_unix.go:86-104` | 只有 `/api/pcie/bind` 手动 | `manager::auto_bind_pcie()`：`[serial] pcie_autobind`（默认开）＋5 分钟冷却 | 已实现 |
+| D12 | **多 tty 拓扑**对上层可见 | Go `Modem.Ports` | `tty_list` 恒为「当前口自己」 | `Modem::set_ttys()`；发现流程写入「首选＋回退」，切口后重排 | 已实现 |
+| D13 | 同型号多台设备的**物理路径绑定** | QModem 按 UCI slot；Go 仅 `vid:pid` | 只按 `vid:pid`：两台同型号会共用一条绑定 | 新增 `vid:pid@1-1` 键（`at_port_bind_key_scoped`），旧键兼容；API 增 `bus_path`，WebUI 同步 | 已实现 |
 | D10 | 热插拔事件（udev/hotplug） | QModem `etc/hotplug.d/usb/20-modem-usb` | 周期发现 + `reap_gone()` | 保持现状：OpenWrt 上周期发现已覆盖；事件通道是后续项 | 不适用（本期） |
 
 ### 2.2 拨号与数据通道
@@ -59,6 +62,8 @@
 | P7 | QMI/MBIM 会话建立/释放 | Go `hostdial*.go` | 已内化（`runtime/dialer/native/`） | 保持不变 | 已有 |
 | P8 | 连接阶段分层（session / iface / route / online） | 本项目自研（历史修复） | 已实现（`DialState::phase`） | 保持不变 | 已有 |
 | P9 | PPP 数据面 | QModem 无（`ppp` 只是认证命令） | 无 | 不实现，并在支持矩阵里明确标注 | 不适用 |
+| P10 | 拨号**失败退避** | Go `hostdial_run.go:39-45`（10s 起、翻倍、封顶 60s） | 固定 5 秒 | `retry_delay()`：5/10/20/40/60s，成功即清零；纯函数 + 测试 | 已实现 |
+| P11 | 清单形态核对（协议是否被型号支持） | Go `catalog.go:555-585` | 无 | `shape_note()`：清单里 USB/PCIe 形态都不含当前 kind 时写一步提示（不拦截），有测试 | 已实现 |
 
 ### 2.3 文档与契约
 
@@ -86,6 +91,13 @@
 | `rust/src/modem/at/port.rs` | +`probe_identity()`、`AtIo` 后端、裸字符设备 | MHI/wwan AT 口可打开 |
 | `rust/src/modem/at/command.rs` | 去掉不再使用的 `Read/Write` 导入 | 后端抽象后由 `AtIo` 负责 |
 | `docs/UPSTREAM_AUDIT.md` / `docs/SUPPORT_MATRIX.md` / `docs/README.md` | 新增 | 审计与支持矩阵 |
+| `rust/src/modem/manager.rs` | 救援 / PCIe 补绑 / 形态核对接线 | `auto_bind_pcie`、`maybe_rescue`、`set_ttys` |
+| `rust/src/modem/model/modem.rs` | 多 tty 拓扑 | `ttys` 字段、`set_ttys`、`view().tty_list` |
+| `rust/src/runtime/store.rs` | `vid:pid@bus` 绑定键 | `at_port_bind_key_scoped` |
+| `rust/src/runtime/dialer/mod.rs` | 指数退避 | `retry_delay` + 失败计数 |
+| `rust/src/http/handlers/atport_bind.rs` | `bus_path` 参数 | 兼容旧键 |
+| `rust/web/index.html` | 绑定 UI 按设备物理路径 | 下拉值带 `bus_path` |
+| `files/etc/modemd/config.toml` | 新增 `pcie_autobind` / `auto_rescue` | 默认 true / false |
 | `CHANGELOG.md` | 新增条目 | 见 `[未发布]` |
 
 没有改动：HTTP API、WebSocket 字段、配置文件、LuCI 协议、netifd 脚本、打包脚本。
@@ -96,7 +108,7 @@
 
 | 命令 | 结果 |
 | --- | --- |
-| `cargo test --locked` | **722 passed / 0 failed**（基线 703，新增 19） |
+| `cargo test --locked` | **730 passed / 0 failed**（基线 703，新增 27） |
 | `cargo build --release --locked` | 通过（见构建报告） |
 | `cargo clippy --all-targets --locked` | 0 error；7 条 warning **全部在未改动文件**（`cells.rs` 死代码/文档格式、`params.rs` 无用赋值、`route.rs` 比较写法、`siminfo.rs` map 恒等、`dial.rs:1962` contains） |
 | `cargo fmt --check` | 仓库基线本就有 14 个文件 / 48 处不合规；本次改动文件已 `rustfmt` 过，另有一个独立的 `style: cargo fmt` 提交把全仓格式统一 |
@@ -108,7 +120,12 @@
 - `datacall::tests::activate_and_deactivate_are_symmetric`：所有厂商 × 6 个平台，有激活必须有挂断（合宙例外必须在 note 里声明）；
 - `datacall::tests::unknown_platform_never_guesses` / `qmi_and_mbim_have_no_at_plan` / `cid_is_substituted_everywhere`；
 - `discovery::plan::tests::*`：RM520N 白名单 + PCM 剔除、同型号双设备分组、未知设备仍可选口、自然序、白名单缺失时**宁可空等**、MHI 独立分组；
-- `discovery::scanner::tests::backoff_grows_then_caps`：15/30/60/120/240/300 秒退避曲线与封顶；
+- `discovery::scanner::tests::backoff_grows_then_caps` / `warmup_keeps_probe_interval_short`：15→300s 退避与 90s 预热窗口；
+- `manager::tests::rescue_*`：150s 触发、开关、5 分钟冷却、3 次上限；
+- `model::dial::tests::shape_note_only_warns_on_real_mismatch`：清单形态核对；
+- `store::tests::scoped_bind_key_separates_identical_models`：`vid:pid@bus` 键与路径穿越拒绝；
+- `model::modem::tests::tty_list_follows_current_port`：多 tty 拓扑与切口排序；
+- `dialer::retry_tests::retry_delay_backs_off_then_caps`：5→60s 指数退避；
 - `discovery::ports::tests::describe_missing_port_is_empty_but_safe`：无 sysfs 时不 panic。
 
 ---

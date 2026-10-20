@@ -115,6 +115,42 @@ pub fn valid_pdp_type(t: &str) -> bool {
     matches!(t.trim().to_uppercase().as_str(), "IP" | "IPV6" | "IPV4V6")
 }
 
+/// 清单登记的形态与「实际识别到的形态」不一致时，给一句可排查的说明。
+///
+/// 不拦截拨号：清单可能滞后于固件（用户自己用 `AT+QCFG="usbnet"` 切过模式），
+/// 但必须让人看见「清单说 X、实际是 Y」—— 否则拨不通时只能瞎猜。
+///
+/// 返回 `None` = 一致，或清单里根本没这个型号（不在清单的型号不猜）。
+pub fn shape_note(usb: &[String], pcie: &[String], kind: &str) -> Option<String> {
+    let k = kind.trim().to_ascii_lowercase();
+    if k.is_empty() {
+        return None;
+    }
+    if usb.is_empty() && pcie.is_empty() {
+        return None;
+    }
+    let hit = usb
+        .iter()
+        .chain(pcie.iter())
+        .any(|m| m.trim().eq_ignore_ascii_case(&k));
+    if hit {
+        return None;
+    }
+    let list = |v: &[String]| {
+        if v.is_empty() {
+            "—".to_string()
+        } else {
+            v.join("/")
+        }
+    };
+    Some(format!(
+        "清单登记 USB={} PCIe={}，当前识别为 {}；按实际 USB 描述符继续拨号",
+        list(usb),
+        list(pcie),
+        k
+    ))
+}
+
 /// 拨号过程的一步（页面按顺序列出来，失败的那一步一眼能看到）。
 #[derive(Debug, Clone, Serialize)]
 pub struct DialStep {
@@ -2169,6 +2205,15 @@ impl Modem {
             self.dial_step("写入 APN（AT+CGDCONT）", true, "沿用模组已有配置");
         }
 
+        // ②a 清单形态核对：一致就不出声；不一致写一步（不拦截，见 `shape_note`）。
+        if let Some(model) = self.model() {
+            if let Some(e) = crate::modem::catalog::lookup(&model) {
+                if let Some(note) = shape_note(&e.usb, &e.pcie, &info.kind) {
+                    self.dial_step("形态与支持清单核对", true, &note);
+                }
+            }
+        }
+
         // ② 按 USB 类型分派 —— 一台模组只走**一种**拨号方式。
         //
         // QMI/MBIM：数据呼叫归主机侧厂商拨号器（现在由 modemd 托管，见
@@ -2577,6 +2622,27 @@ mod tests {
         assert_eq!(phase_for_connected(false, false, false), PHASE_IFACE);
         // 网卡不在但「有地址」在逻辑上不可能，这里只保证不 panic、给最保守值
         assert_eq!(phase_for_connected(false, true, true), PHASE_IFACE);
+    }
+
+    /// 清单形态核对：只有「清单里有这个型号、且形态对不上」才提示。
+    #[test]
+    fn shape_note_only_warns_on_real_mismatch() {
+        let usb = vec!["rndis".to_string()];
+        let pcie = vec!["mbim".to_string()];
+        assert!(shape_note(&usb, &pcie, "rndis").is_none(), "一致不出声");
+        assert!(
+            shape_note(&usb, &pcie, "mbim").is_none(),
+            "PCIe 形态也算一致"
+        );
+        assert!(
+            shape_note(&usb, &pcie, "ECM").is_some(),
+            "大小写无关，但仍要提示"
+        );
+        assert!(shape_note(&[], &[], "qmi").is_none(), "清单没登记就不猜");
+        assert!(shape_note(&usb, &pcie, "").is_none(), "形态未知不提示");
+        let note = shape_note(&usb, &pcie, "ecm").unwrap();
+        assert!(note.contains("USB=rndis"), "{note}");
+        assert!(note.contains("PCIe=mbim"), "{note}");
     }
 
     #[test]

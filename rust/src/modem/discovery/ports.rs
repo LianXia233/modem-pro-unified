@@ -153,6 +153,28 @@ fn read_trim(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// 这台设备「出现多久了」（秒）；取不到返回 `None`。
+///
+/// 用途是探活退避的**预热窗口**：刚插上的 5G 模组要几十秒才把 AT 口拉起来，
+/// 这段时间里按指数退避（最长 5 分钟）会把新设备压死。上游 Go 版用 sysfs 设备
+/// 目录的 mtime 算年龄（`module/netdev/ports_unix.go:177-190`），
+/// 本函数同一口径：mtime 不受进程重启影响，比「进程启动时刻」可靠。
+#[cfg(unix)]
+pub fn device_age_secs(path: &str) -> Option<u64> {
+    let name = Path::new(path).file_name()?.to_str()?;
+    let link = Path::new("/sys/class/tty").join(name).join("device");
+    let dir = std::fs::canonicalize(link).ok()?;
+    // USB 接口目录的父目录是设备目录；非 USB（MHI 等）直接用自己
+    let dev_dir = dir.parent().unwrap_or(&dir);
+    let modified = std::fs::metadata(dev_dir).ok()?.modified().ok()?;
+    modified.elapsed().ok().map(|d| d.as_secs())
+}
+
+#[cfg(not(unix))]
+pub fn device_age_secs(_path: &str) -> Option<u64> {
+    None
+}
+
 /// 本机是否存在这个串口设备（系统串口列表里有这个名字）。
 ///
 /// 用 sysfs glob（`ttyUSB*` / `ttyACM*` / `mhi_*DUN*` / `wwan*at*`…）列名单；

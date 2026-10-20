@@ -28,6 +28,12 @@ pub struct Modem {
     pub id: u32,
     /// AT 口路径（/dev/ttyUSB0 或 COM3）；切口时整口换掉（见 `repoint`），故加锁保护
     port: Mutex<String>,
+    /// 这台物理设备上的全部**可作 AT 口**的 tty（首选项在前）。
+    ///
+    /// 以前 `ModemView::tty_list` 只回当前口自己 —— 页面看不出「同一个模组还有哪些
+    /// 口可以切」。发现流程现在按 USB 设备分组（见 `discovery/plan.rs`），
+    /// 组内的首选 + 回退口就记在这里；切口（`repoint`）会把它同步成新的顺序。
+    ttys: Mutex<Vec<String>>,
     pub baud: u32,
     pub first_seen: Instant,
     /// 单条 AT 命令超时
@@ -140,7 +146,8 @@ impl Modem {
     pub fn new(id: u32, port: String, baud: u32, cmd_timeout: Duration, vendor: Vendor) -> Self {
         Self {
             id,
-            port: Mutex::new(port),
+            port: Mutex::new(port.clone()),
+            ttys: Mutex::new(vec![port]),
             baud,
             first_seen: Instant::now(),
             cmd_timeout,
@@ -385,6 +392,27 @@ impl Modem {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// 记录这台物理设备的全部 AT 候选口（首选项在前）。
+    ///
+    /// 只影响展示与「还能切哪个口」的提示，不改变当前口 —— 当前口仍由
+    /// [`Self::repoint`] / 发现流程决定。
+    pub fn set_ttys(&self, list: Vec<String>) {
+        if list.is_empty() {
+            return;
+        }
+        *self.ttys.lock().unwrap() = list;
+    }
+
+    /// 当前登记的全部 AT 候选口（首选项在前）。
+    pub fn ttys(&self) -> Vec<String> {
+        let list = self.ttys.lock().unwrap().clone();
+        if list.is_empty() {
+            vec![self.port()]
+        } else {
+            list
+        }
+    }
+
     pub fn set_at_port_manual(&self, manual: bool) {
         self.at_port_manual
             .store(manual, std::sync::atomic::Ordering::Relaxed);
@@ -410,7 +438,14 @@ impl Modem {
         ModemView {
             id: self.id,
             at_port: port.clone(),
-            tty_list: vec![port],
+            tty_list: {
+                let list = self.ttys.lock().unwrap().clone();
+                if list.is_empty() {
+                    vec![port]
+                } else {
+                    list
+                }
+            },
             vendor: self.vendor().as_str(),
             vendor_name: self.vendor().label(),
             model: self.model(),
@@ -597,6 +632,12 @@ impl Modem {
     pub fn repoint(&self, port: &str) -> Result<()> {
         *self.at.lock().unwrap() = None;
         *self.port.lock().unwrap() = port.to_string();
+        {
+            // 切过去的口排到最前，其余保留（页面「其它 tty」据此显示）
+            let mut list = self.ttys.lock().unwrap();
+            list.retain(|p| p != port);
+            list.insert(0, port.to_string());
+        }
         *self.sms.lock().unwrap() = None;
         // 手动指定可能指向另一台机器：IMEI 缓存一并作废
         *self.imei_cache.lock().unwrap() = None;
@@ -1000,6 +1041,30 @@ mod identity_tests {
         m.mark_net_dirty();
         assert!(m.take_net_dirty());
         assert!(!m.take_net_dirty(), "第二次应已清空");
+    }
+
+    /// 一台物理设备的多个 AT 口：`tty_list` 要按「当前口在前」列出全部候选，
+    /// 切口后新口排到最前（页面「其它 tty」就靠这个）。
+    #[test]
+    fn tty_list_follows_current_port() {
+        let m = Modem::new(
+            2,
+            "/dev/ttyUSB2".to_string(),
+            115200,
+            Duration::from_secs(3),
+            Vendor::Quectel,
+        );
+        assert_eq!(m.ttys(), vec!["/dev/ttyUSB2"]);
+        m.set_ttys(vec![
+            "/dev/ttyUSB2".to_string(),
+            "/dev/ttyUSB3".to_string(),
+            "/dev/ttyUSB4".to_string(),
+        ]);
+        assert_eq!(m.view().tty_list.len(), 3);
+        // repoint 会重开串口并识别；这里只验证列表顺序（打开失败不影响顺序）
+        let _ = m.repoint("/dev/ttyUSB3");
+        assert_eq!(m.ttys().first().map(String::as_str), Some("/dev/ttyUSB3"));
+        assert_eq!(m.ttys().len(), 3, "其余候选口不能丢");
     }
 
     #[test]

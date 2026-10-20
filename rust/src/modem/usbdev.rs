@@ -414,12 +414,23 @@ pub fn list_modem_usb_devices() -> Vec<ModemUsbDevice> {
         dev.drivers = dedup_strings(drivers);
         dev.has_serial_driver = has_serial_driver_name(&dev.drivers) || !dev.ttys.is_empty();
 
-        let Some(fam) = is_known_modem_usb(&vid, &pid, &dev.classes) else {
-            continue;
-        };
-        dev.known = true;
-        dev.family = fam.vendor.as_str().to_string();
-        dev.vendor_cn = fam.vendor.label().to_string();
+        // ① 厂商身份表命中；② 否则看端口规则（QModem 登记过的 VID:PID 也算模组）——
+        //    否则「按 VID:PID 绑定命令口」的页面上根本选不到这台设备。
+        match is_known_modem_usb(&vid, &pid, &dev.classes) {
+            Some(fam) => {
+                dev.known = true;
+                dev.family = fam.vendor.as_str().to_string();
+                dev.vendor_cn = fam.vendor.label().to_string();
+            }
+            None => match crate::modem::ports::lookup(&vid, &pid) {
+                Some(rule) => {
+                    dev.known = true;
+                    dev.family = rule.model.clone();
+                    dev.vendor_cn = "端口规则登记".to_string();
+                }
+                None => continue,
+            },
+        }
         out.push(dev);
     }
     out.sort_by(|a, b| a.bus_path.cmp(&b.bus_path));
@@ -545,6 +556,37 @@ pub fn option_bind_candidates() -> Vec<ModemUsbDevice> {
 #[cfg(not(unix))]
 pub fn option_bind_candidates() -> Vec<ModemUsbDevice> {
     Vec::new()
+}
+
+/// 软重插：把 USB 设备的 `authorized` 置 0 再置 1，让内核重新枚举。
+///
+/// 用途只有一个：设备明明在、却一个 AT 口都认不出（固件跑飞 / 枚举卡死）。
+/// 这是**破坏性**操作（数据面会短暂断开），调用方必须自带开关与冷却，
+/// 不能放进常规巡检路径。
+#[cfg(unix)]
+pub fn reauthorize(bus_path: &str) -> Result<(), String> {
+    let name = bus_path.trim();
+    if name.is_empty() || name.contains('/') || name.contains("..") {
+        return Err(format!("USB 设备名不合法：{bus_path:?}"));
+    }
+    let path = std::path::Path::new(USB_DEVICES_ROOT)
+        .join(name)
+        .join("authorized");
+    if !path.exists() {
+        return Err(format!(
+            "{} 不存在（内核不支持 authorized？）",
+            path.display()
+        ));
+    }
+    std::fs::write(&path, b"0").map_err(|e| format!("写 {} 失败：{e}", path.display()))?;
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::fs::write(&path, b"1").map_err(|e| format!("写 {} 失败：{e}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn reauthorize(_bus_path: &str) -> Result<(), String> {
+    Err("本平台不支持 USB 软重插".to_string())
 }
 
 /// 给一个「插上了但没有串口」的模组补上 usb-serial 驱动。

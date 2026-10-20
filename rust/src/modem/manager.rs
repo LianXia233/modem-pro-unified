@@ -34,6 +34,49 @@ pub struct ModemManager {
     /// 补绑后依然没有 tty。不节流的话每个巡检周期都会写一次 `new_id` 并刷日志；
     /// 这里按 5 分钟冷却，仍然不会永久放弃（固件升级/换模式后还能再试）。
     bind_tried: std::sync::Mutex<BTreeMap<String, std::time::Instant>>,
+    /// 「一台模组都没有」从什么时候开始（有模组就清空）。
+    no_at_since: std::sync::Mutex<Option<std::time::Instant>>,
+    /// 上次救援时刻 / 本次故障期内的救援次数（见到模组即清零）。
+    last_rescue: std::sync::Mutex<Option<std::time::Instant>>,
+    rescue_count: std::sync::Mutex<u32>,
+}
+
+/// 「一台都认不出」时的救援判定（纯函数，便于测试）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rescue {
+    /// 还在等（<150s）
+    Wait,
+    /// 开关没开
+    Disabled,
+    /// 距上次救援不足 5 分钟
+    Cooldown,
+    /// 本轮故障已救援 3 次
+    Budget,
+    /// 该动手了
+    Go,
+}
+
+/// 上游 Go 版参数：150s 无 AT 才动手、冷却 5 分钟、一个周期最多 3 次
+/// （`module/kernel/modem_serial.go:352-428`）。
+pub(crate) fn rescue_decision(
+    enabled: bool,
+    idle: std::time::Duration,
+    since_last: Option<std::time::Duration>,
+    count: u32,
+) -> Rescue {
+    if idle < std::time::Duration::from_secs(150) {
+        return Rescue::Wait;
+    }
+    if !enabled {
+        return Rescue::Disabled;
+    }
+    if count >= 3 {
+        return Rescue::Budget;
+    }
+    if since_last.is_some_and(|d| d < std::time::Duration::from_secs(300)) {
+        return Rescue::Cooldown;
+    }
+    Rescue::Go
 }
 
 impl ModemManager {
@@ -47,6 +90,9 @@ impl ModemManager {
             reaped: std::sync::Mutex::new(Vec::new()),
             discovering: std::sync::Mutex::new(()),
             bind_tried: std::sync::Mutex::new(BTreeMap::new()),
+            no_at_since: std::sync::Mutex::new(None),
+            last_rescue: std::sync::Mutex::new(None),
+            rescue_count: std::sync::Mutex::new(0),
         }
     }
 
@@ -74,9 +120,9 @@ impl ModemManager {
         let _serial = self.discovering.lock().unwrap_or_else(|e| e.into_inner());
         let baud = self.cfg.serial.baud;
         // ⓪ 先补 option 驱动：没 tty 的设备到不了后面任何一步
-        let bound = self.auto_bind_option();
+        let bound = self.auto_bind_option() + self.auto_bind_pcie();
         if bound > 0 {
-            log::info!("本轮补绑 {bound} 台设备的 option 驱动，重新枚举串口");
+            log::info!("本轮补绑 {bound} 台设备的驱动，重新枚举串口");
         }
         // ① 先回收消失的模组，**再**统计已知口。
         //
@@ -102,6 +148,7 @@ impl ModemManager {
                 Vendor::Unknown,
             ));
             modem.set_sms_memory_pref(&self.cfg.sms.sms_memory);
+            modem.set_ttys(d.ttys.clone());
             let _ = modem.identify();
             self.apply_saved_at_port(&modem);
             log::info!(
@@ -123,6 +170,8 @@ impl ModemManager {
             self.modems.write().unwrap().insert(id, modem);
             added += 1;
         }
+        // 收尾再判断要不要救援：让本轮新发现的设备先落库，避免刚救完又救
+        self.maybe_rescue();
         added
     }
 
@@ -166,6 +215,101 @@ impl ModemManager {
             }
         }
         n
+    }
+
+    /// PCIe 模组没绑驱动时，按已知驱动表试一遍（MHI / T7xx）。
+    ///
+    /// 与 USB 补绑同一理由：没驱动就没有 AT 口，也就永远发现不了。
+    /// 绑定失败只记日志（驱动没装、设备不支持都可能）。
+    fn auto_bind_pcie(&self) -> usize {
+        if !self.cfg.serial.pcie_autobind {
+            return 0;
+        }
+        let mut n = 0;
+        for dev in crate::modem::pcidev::list_pci_modem_devices() {
+            if dev.bound || !dev.modem {
+                continue;
+            }
+            let key = format!("pci:{}", dev.bdf);
+            {
+                let mut tried = self.bind_tried.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(last) = tried.get(&key) {
+                    if last.elapsed() < std::time::Duration::from_secs(300) {
+                        continue;
+                    }
+                }
+                tried.insert(key, std::time::Instant::now());
+            }
+            for drv in crate::modem::pcidev::PCIE_MODEM_DRIVERS {
+                if crate::modem::pcidev::bind_pci_driver(&dev.bdf, drv).is_ok() {
+                    log::info!("PCIe 模组 {} 已绑定驱动 {drv}", dev.bdf);
+                    n += 1;
+                    break;
+                }
+            }
+        }
+        n
+    }
+
+    /// 一台模组都认不出时，按上游参数做一次「软重插」。
+    ///
+    /// 只在 `[serial] auto_rescue=true` 时动手；默认关（会短暂断开数据面）。
+    fn maybe_rescue(&self) {
+        let has_modem = !self.modems.read().unwrap().is_empty();
+        if has_modem {
+            *self.no_at_since.lock().unwrap() = None;
+            *self.rescue_count.lock().unwrap() = 0;
+            return;
+        }
+        let idle = {
+            let mut since = self.no_at_since.lock().unwrap_or_else(|e| e.into_inner());
+            let start = *since.get_or_insert_with(std::time::Instant::now);
+            start.elapsed()
+        };
+        let since_last = self
+            .last_rescue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|t| t.elapsed());
+        let count = *self.rescue_count.lock().unwrap_or_else(|e| e.into_inner());
+        let decision = rescue_decision(self.cfg.serial.auto_rescue, idle, since_last, count);
+        if decision != Rescue::Go {
+            if decision == Rescue::Disabled && idle.as_secs() >= 150 {
+                log::warn!(
+                    "已 {idle:?} 一台模组都没认出来；需要自动软重插请打开 [serial] auto_rescue"
+                );
+            }
+            return;
+        }
+        {
+            let mut c = self.rescue_count.lock().unwrap_or_else(|e| e.into_inner());
+            *c += 1;
+            log::warn!(
+                "无模组已 {idle:?}，执行第 {} 次软重插（USB authorized / PCIe 重扫）",
+                *c
+            );
+        }
+        *self.last_rescue.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(std::time::Instant::now());
+
+        for dev in crate::modem::usbdev::list_modem_usb_devices() {
+            if !dev.ttys.is_empty() {
+                continue;
+            }
+            match crate::modem::usbdev::reauthorize(&dev.bus_path) {
+                Ok(()) => log::info!("USB 软重插 {}（{}:{}）", dev.bus_path, dev.vid, dev.pid),
+                Err(e) => log::warn!("USB 软重插 {} 失败：{e}", dev.bus_path),
+            }
+        }
+        for dev in crate::modem::pcidev::list_pci_modem_devices() {
+            if dev.bound || !dev.modem {
+                continue;
+            }
+            match crate::modem::pcidev::reset_pci_device(&dev.bdf) {
+                Ok(()) => log::info!("PCIe 重扫完成（{}）", dev.bdf),
+                Err(e) => log::warn!("PCIe 重扫失败（{}）：{e}", dev.bdf),
+            }
+        }
     }
 
     /// 回收「设备已经不在了」的模组，返回被摘掉的 id 列表。
@@ -232,10 +376,22 @@ impl ModemManager {
     /// 简化模型说明：一个 AT 口 = 一个模组，没有 USB 设备分组信息，所以身份键取不到时
     /// 用「当前口自己」当兜底键（不做串口分组）；切口成功后清掉兜底键，免得两份记录打架。
     pub(crate) fn apply_saved_at_port(&self, modem: &Arc<Modem>) {
-        // ① 按 USB 设备身份（vid:pid）绑定的命令口优先
+        // ① 按 USB 设备身份（vid:pid，可带物理路径）绑定的命令口优先
         if let Some(desc) = crate::modem::model::dial::usb_descriptor_for_port(&modem.port()) {
             if let Some(key) = crate::runtime::store::at_port_bind_key(&desc.vid, &desc.pid) {
-                let bound = self.atport_bind.get(&key);
+                // 先查「vid:pid@总线路径」：同型号多台设备时，只有它能区分
+                let bus = crate::modem::usbdev::identity_for_tty(&modem.port())
+                    .map(|u| u.bus_path)
+                    .unwrap_or_default();
+                let scoped =
+                    crate::runtime::store::at_port_bind_key_scoped(&desc.vid, &desc.pid, &bus);
+                let mut bound = scoped
+                    .as_deref()
+                    .map(|k| self.atport_bind.get(k))
+                    .unwrap_or_default();
+                if bound.is_empty() {
+                    bound = self.atport_bind.get(&key);
+                }
                 if !bound.is_empty() {
                     if bound == modem.port() {
                         modem.set_at_port_manual(true);
@@ -339,5 +495,48 @@ impl ModemManager {
         let id = *n;
         *n += 1;
         id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{rescue_decision, Rescue};
+    use std::time::Duration;
+
+    fn d(secs: u64) -> Duration {
+        Duration::from_secs(secs)
+    }
+
+    /// 150s 之前一律不动手（刚开机/刚插上都不该被打断）。
+    #[test]
+    fn rescue_waits_before_acting() {
+        assert_eq!(rescue_decision(true, d(0), None, 0), Rescue::Wait);
+        assert_eq!(rescue_decision(true, d(149), None, 0), Rescue::Wait);
+        assert_eq!(rescue_decision(false, d(149), None, 0), Rescue::Wait);
+    }
+
+    /// 开关关掉时只提示，不碰设备。
+    #[test]
+    fn rescue_respects_switch() {
+        assert_eq!(rescue_decision(false, d(600), None, 0), Rescue::Disabled);
+        assert_eq!(rescue_decision(true, d(150), None, 0), Rescue::Go);
+    }
+
+    /// 5 分钟冷却与「本轮最多 3 次」都必须生效，不能无限重插。
+    #[test]
+    fn rescue_is_rate_limited() {
+        assert_eq!(
+            rescue_decision(true, d(600), Some(d(10)), 0),
+            Rescue::Cooldown
+        );
+        assert_eq!(
+            rescue_decision(true, d(600), Some(d(299)), 0),
+            Rescue::Cooldown
+        );
+        assert_eq!(rescue_decision(true, d(600), Some(d(300)), 0), Rescue::Go);
+        assert_eq!(
+            rescue_decision(true, d(600), Some(d(9999)), 3),
+            Rescue::Budget
+        );
     }
 }
