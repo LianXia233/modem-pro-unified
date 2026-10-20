@@ -8,6 +8,122 @@
 > 本文件历史条目中提到的 `PORTING.md` / `PROGRESS.md` / `HANDOFF.md` / `PRIVACY.md` /
 > `DIAL_AUDIT.md` **均已被删除**，只是历史记录，不得作为当前设计依据。
 
+## [未发布]
+
+### 修复：5G NR 锁小区命令参数整体错位（QNWLOCK PCI/频点/SCS 顺序）
+
+**现象**：页面上对 5G 模组「锁小区」选 NR、填频点 + PCI 下发，模组回 OK 但锁不上
+（或锁到一个莫名其妙的小区）；`GET /api/lock/status` 回读也看不懂锁的是什么。
+
+**根因**：移远 QNWLOCK 的 4G 与 5G 是**两套语法**。4G 是
+`AT+QNWLOCK="common/4g",<lock_type>,<earfcn>[,<pci>]`，而 5G 是
+`AT+QNWLOCK="common/5g",<pci>,<arfcn>,<scs>[,<band>]` —— **没有 lock_type，
+且 PCI 在最前**（依据 MikroTik ROS 文档实测回读样本
+`+QNWLOCK: "common/5g",138,628032,30,78`）。原实现把 4G 的
+`1,<earfcn>,<pci>[,<scs>]` 原样搬到了 5G 上，在 5G 固件眼里变成
+`PCI=1、频点=<earfcn>、SCS=<pci>`，最后一个可选格还串到 band 上——
+每个参数都错一位。
+
+**修复**（`rust/src/modem/model/lock.rs`）：
+
+- `parse_qnwlock` 新增 NR 分支：PCI 取第 1 格、频点第 2 格、SCS 第 3 格，
+  与 4G 分支（lock_type 在前）彻底分开；
+- `set_cell_lock` 新增 `band` 参数，NR 命令改为
+  `AT+QNWLOCK="common/5g",<pcid>,<earfcn>[,<scs>][,<band>]`；
+- **NR 只接受 `lock_type=1`（频点+PCI）**：5G 语法没有「仅频点」档位，
+  保存定时任务时就在校验层拦掉（`model/schedule.rs`），不是等到发命令才失败；
+- `band` 留空时用**扫描缓存里的驻网频段**兜底（`cached_serving_band`：
+  只读 `cells_cache()`，60 秒内新鲜，**不发 AT**）——QNWLOCK 5G 语法第 5 格
+  是 band，缺了它部分固件不认；
+- 回读解析同步修正，`unlock_all` 等调用点补齐签名。
+
+全链路同步：`http/handlers/lock_cell.rs` 收可选 `band` 入参；
+`luci/app/js/view/modemd/lock.js` 的「仅频点」选项在 NR 时禁用并提示、
+新增 5G 频段输入框（仅 NR 显示）、提交前拦截 NR+ltype=2；
+`docs/API.md` 的 `/api/lock/cell` 契约行更新。新增测试
+`qnwlock_parse_nr_puts_pci_first`（含 PCI=0 合法值场景）。
+
+> 注：QModem 脚本里另有按平台分的 QNWLOCK 变体（unisoc 用 `common/lte` scope、
+> `lte` 平台的 lock_type 1/2 语义与文档相反），单一来源不可证，本轮不改，
+> 按「未验证不盲写」保留现状并在代码注释里声明。
+
+### 对齐上游：华为展锐挂断前先探自拨状态（QModem `auto_dial_hang_huawei_unisoc`）
+
+QModem `usr/share/qmodem/modem_dial.sh:1546-1568` 的华为展锐（海思平台）
+挂断流程是**先问 `AT^SETAUTODIAL?`**：模组开了自拨时走 `AT^NDISDUP=0,0`，
+没开自拨时不能碰射频、要退通用路径。原实现对所有厂商一律直发挂断指令，
+在「未开启自拨」的海思机型上会把射频状态打乱。
+
+**修复**：`vendor/datacall.rs` 新增 `AutodialProbe { query, fallback }` 挂在
+`DataChannel` 上（10 个厂商文件 12 处字面量同步补 `autodial_probe: None`）；
+`vendor/huawei.rs` 的 unisoc 分支填
+`query="AT^SETAUTODIAL?"` / `fallback="AT^NDISDUP=0,0"`；
+`model/dial.rs` 的 hangup 路径先发 query，仅当应答含 `SETAUTO` 且 `:1`
+（自拨开着）才走厂商配方，否则整组步骤替换为 fallback 并记 `dial_step`。
+新增测试 `huawei_unisoc_probes_autodial_before_hangup`（含「其它厂商
+不被波及」的遍历断言）。
+
+### 对齐上游：发现退避的「年轻期」失败不计入退避（Go `nonATNextProbe`）
+
+Go 原版 `module/kernel/modem_serial.go:307-343` 的非 AT 口退避分两段：
+设备刚出现（年轻期）失败不积累，出预热期后才从基值重数。原实现把年轻期
+的失败也计入 `tries`，一个新插入的慢启动模组如果头几轮没应答，一进
+成年期退避就直接跳到很高的档位。
+
+**修复**（`discovery/scanner.rs`）：`tries` 改为「年轻期恒为 1，
+出预热期从基值重数」。新增测试
+`young_failures_do_not_leak_into_adult_backoff`（4 次年轻失败后 tries
+仍为 1，成年失败后才累加）。
+
+### 重构：9 处重复实现收敛为一处
+
+| 重复点 | 原来 | 现在 |
+| --- | --- | --- |
+| sysfs 小工具 | `usbdev.rs` / `pcidev.rs` 各存一份 `read_sysfs_line` / `read_sysfs_id` / `is_dir_or_symlink` 等（且已开始漂移） | 共享 `modem::sysfs`（185 行含 3 个测试；usbdev −110 行、pcidev −23 行） |
+| JSON 台账读写 | 6 个 store（quota / imei / atport / atport_bind / sched / hostnic）各写一遍「读文件→解析→坏账降级」「tmp+rename」 | `runtime::store::{load_json, write_json_atomic}` |
+| 速率文案 `fmt_bps` | `ifstat.rs`（主机侧）与 `model/traffic.rs`（模组侧）两份实现 | 只留 `model::fmt_bps`，ifstat 复用（文案必须一致，有测试钉住） |
+| 锁频段入参 | `lock_band.rs` 与定时任务 `lock.band` 各解析一遍 `bands` | `handlers::{parse_bands, band_lock_params}` |
+| IMEI 收尾 | `imei_set.rs` / `imei_restore.rs` 各写一遍「落备份→回状态→回包」 | `handlers::imei_done` |
+| 串口写字节 | `at/command.rs` 两个写入口各写一遍 `write_all`+flush | `AtPort::write_bytes` |
+| `DialRequest` 构造 | `dial_connect.rs` 与 `tasks.rs` 的 `dial.connect` 分支口径各一份 | `dial_connect::dial_request_from_params` |
+| 会话校验 | `auth.rs` 与 `ws.rs` 各判一次 ubus session | `auth::session_valid`（ubus 不可用时统一放行 + warn，防认证半边缺口） |
+| 死代码 / 未用变量 | `ca.rs::empty_note`、`mbim.rs` 的 `v6_gw_off`、`params.rs` 的 `was_active` | 删除 |
+
+### 注释：上游依据落到行号，有意差异显式声明
+
+- **上游引用精确化**：`model/dial.rs` 原来引用的 `cmds/modem_dial.sh:454-481`
+  指向的是 14 行 helper 存根，实际依据在 `usr/share/qmodem/modem_dial.sh`——
+  已改并核对（`check_dial_prepare` = `:570-624`、`at_dial` = `:1285`、
+  `AT+COPS=0,0` = `:1291`、华为探针 = `:1546-1568`）；
+- **逐字段补上游依据**：`netprov/mod.rs`（Go `netprov_proto.go:102-111`）、
+  `model/schedule.rs`（Go `sched_view.go:110-145` 六个常量逐个对行号）、
+  `model/cells.rs` / `model/ca.rs` / `model/signal.rs`（Go `cell.go` 的
+  `ParseServingCell` / `FindRSRPToken` / `ParseCESQSignal` / `cell.go:36`）、
+  `model/network.rs`（Go `net.go:35/157/651/667-678/679-687/773`）、
+  `model/params.rs`（Go `data_validate.go:23/43`）、`netprov/uci.rs`
+  （QModem `modem_dial.sh:690-708` 的 zone 名还原）、`dialer/mbim.rs`
+  （MBIM 1.0 §10.5.29 偏移量表）、`runtime/store.rs`（六本台账的并发 /
+  降级 / 原子性约定）；
+- **有意差异写进注释**（不擅自改口径，改一行全体机型的取值就变）：
+  CESQ 换算与上游差 1 dB（取下界不上界）、QENG 服务小区信号用固定列
+  不随上游改量纲定位、`wan_mode` 没有上游的 `modemProtoOK` 开关、
+  QCAINFO 带宽列无量纲手册不猜、拨号不发 `AT+COPS=0,0`（会冲掉手动锁网）
+  与 `AT+QCFG="nat"`、体检只读 `AT+CFUN?` 不补 `=1`（飞行模式是显式用户动作）；
+- 顺带把 `NetworkStatus` / `CellInfo` / `SignalInfo` 等对外 JSON 的
+  **每个字段**补了量纲与「0 = 未上报」口径说明。
+
+### 质量：fmt / clippy / 测试全绿
+
+- `cargo fmt`：本批改动文件（含脚本注入的代码块）全部统一；
+- `cargo clippy --all-targets --locked`：**0 warning** —— 清掉 4 条存量
+  （`cells.rs` 的 doc 注释空行 / 懒连续、`route.rs` 空串比较、
+  `siminfo.rs` map 恒等、`dial.rs` manual_contains）；
+- `cargo test --locked`：**740 passed / 0 failed**（起点为 HEAD 的 735；
+  新增 7 个：sysfs 模块 3、华为探针 / 退避清零 / QNW NR 解析 / fmt_bps
+  单位各 1；删除 2 个：随 `parse_bands` 去重移除的重复用例
+  `bands_accept_json_and_colon`、fmt_bps 搬迁后遗留的空测试桩）；
+- 全部改动文件 LF 换行（仓库红线）。
+
 ## [1.0.3] - 2026-10-20
 
 ### 文档：补齐上游致谢（只列参考过的仓库）

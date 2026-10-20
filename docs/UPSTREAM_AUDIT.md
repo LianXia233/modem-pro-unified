@@ -22,7 +22,7 @@
 | 厂商方言 | `cmds/*.sh`（12 家）+ `vendor/*.sh`（12 家） | 14 个厂商包 + `modelquirk` | 14 个 `vendor/*.rs` |
 | 拨号 | `modem_dial.sh`（62 KB，`at_dial` / `ecm_hang` / `qmi_dial`） | `dial_engine.go` + `hostdial*.go` | `model/dial.rs` + `runtime/dialer/` |
 | 组网 | `modem_dial.sh:757-1020`、`qmodem_runtime.sh` | `netprov_*.go` | `netprov/` + `files/lib/netifd/proto/modem_pro.sh` |
-| 测试 | `tests/*.sh`、C 单测 | 91 个 `_test.go` / 1084 个 `Test*` | 721 个 Rust 单测（本次前 703） |
+| 测试 | `tests/*.sh`、C 单测 | 91 个 `_test.go` / 1084 个 `Test*` | 740 个 Rust 单测（迁移前 703） |
 
 ---
 
@@ -111,10 +111,10 @@
 
 | 命令 | 结果 |
 | --- | --- |
-| `cargo test --locked` | **732 passed / 0 failed**（基线 703，新增 29） |
+| `cargo test --locked` | **740 passed / 0 failed**（703 → 732 → 738 → 740；本任务新增 7 个测试、删除 2 个重复/空壳用例） |
 | `cargo build --release --locked` | 通过（见构建报告） |
-| `cargo clippy --all-targets --locked` | 0 error；7 条 warning **全部在未改动文件**（`cells.rs` 死代码/文档格式、`params.rs` 无用赋值、`route.rs` 比较写法、`siminfo.rs` map 恒等、`dial.rs:1962` contains） |
-| `cargo fmt --check` | 仓库基线本就有 14 个文件 / 48 处不合规；本次改动文件已 `rustfmt` 过，另有一个独立的 `style: cargo fmt` 提交把全仓格式统一 |
+| `cargo clippy --all-targets --locked` | **0 warning**（原迁移时存量 7 条，本轮全部清零：`cells.rs` 注释结构、`route.rs` 空串比较、`siminfo.rs` map 恒等、`dial.rs` manual_contains） |
+| `cargo fmt --check` | 全仓干净（原迁移后曾用独立提交统一过格式；本轮新增/改动的 15+ 个文件含脚本注入代码块，已重新统一并复验） |
 | `make package/modem-pro/compile` | **未执行**：本沙箱没有 OpenWrt SDK/feeds 与交叉工具链（`STAGING_DIR`、`TOOLCHAIN_DIR` 均不存在）。属环境限制，不是跳过 |
 
 新增测试的覆盖点：
@@ -159,7 +159,58 @@
 
 ---
 
-## 7. 上游致谢
+## 7. 追加审计（2026-10-21）：上游对齐实改、冗余收敛与引用卫生
+
+在 §1–§6 的基础上继续逐条核对，本轮落地的结论如下。**原则不变**：
+能落到行号的才写；单一来源不可证的写成「有意差异」或「未验证」，不改代码。
+
+### 7.1 上游对齐实改（3 处，均有测试）
+
+| # | 改动 | 上游依据 | 性质 |
+| --- | --- | --- | --- |
+| U1 | **QNW 5G 锁小区参数错位修复**：4G/5G 两套语法混用导致 NR 锁小区每个参数错一位。`parse_qnwlock` 增 NR 分支（PCI 在最前）、`set_cell_lock` 增 `band` 参数、NR 只接受 `lock_type=1`、band 缺省用缓存驻网频段兜底（不发 AT）；API/LuCI/文档/校验层全链路同步 | MikroTik ROS 文档实测回读 `+QNWLOCK: "common/5g",138,628032,30,78` | **重大 bug 修复** |
+| U2 | **华为展锐挂断前先探自拨状态**：`AutodialProbe { query, fallback }` 挂到 `DataChannel`，unisoc 填 `AT^SETAUTODIAL?` / `AT^NDISDUP=0,0`；未开自拨时不碰射频 | QModem `modem_dial.sh:1546-1568` `auto_dial_hang_huawei_unisoc` | 行为对齐 |
+| U3 | **发现退避年轻期清零**：年轻期失败不计入 `tries`，出预热期从基值重数 | Go `modem_serial.go:307-343` `nonATNextProbe` | 参数对齐 |
+
+QModem 按平台分的 QNWLOCK 变体（unisoc 的 `common/lte` scope、`lte` 平台
+lock_type 1/2 反向语义）**单一来源不可证**，按「未验证不盲写」保留现状，
+已在 `lock.rs` 注释里声明。
+
+### 7.2 冗余收敛（9 处重复实现合一，均不改变对外契约）
+
+sysfs 小工具 → `modem::sysfs`；JSON 台账读写 → `store::{load_json,
+write_json_atomic}`；`fmt_bps` → 只留 `model::fmt_bps`（主机侧/模组侧
+文案必须一致）；锁频段入参 → `handlers::band_lock_params`（页面与定时
+任务共用，杜绝「一半入口生效」）；IMEI 收尾 → `handlers::imei_done`；
+串口写字节 → `AtPort::write_bytes`；`DialRequest` 构造 →
+`dial_request_from_params`；会话校验 → `auth::session_valid`（ubus 不可用
+时统一放行 + warn，防认证半边缺口）；删除死代码 3 处
+（`ca.rs::empty_note`、`mbim.rs` `v6_gw_off`、`params.rs` `was_active`）。
+
+### 7.3 引用卫生与有意差异文档化
+
+- 修正 1 处**错误文件前缀**：代码注释原引用 `cmds/modem_dial.sh:454-481`，
+  实际 `cmds/` 下只有 14 行 helper 存根，主脚本在
+  `usr/share/qmodem/modem_dial.sh`（1844 行）——引用已改，并抽查
+  `cell.go:36` / `net.go:667-678` / `net.go:157` 确认其余引用准确；
+- 逐文件补上游行号依据（Go `sched_view.go` / `cell.go` / `net.go` /
+  `data_validate.go` / `netprov_proto.go`、QModem `modem_dial.sh`、
+  MBIM 1.0 §10.5.29），并把 5 处**有意差异**写进注释：CESQ 换算差 1 dB
+  （取下界）、QENG 信号固定列不改量纲定位、`wan_mode` 无 `modemProtoOK`
+  开关、拨号不发 `AT+COPS=0,0` / `AT+QCFG="nat"`、体检只读
+  `AT+CFUN?` 不补 `=1`。
+
+### 7.4 剩余可调研项（已记录为有意差异，未实改）
+
+| 项 | 现状 | 阻塞原因 |
+| --- | --- | --- |
+| QModem 按平台分的 QNWLOCK 变体 | 文档化保留 | 单一来源不可证 |
+| 移远 `AT+MGAUTH` / 华为 `AT^AUTHDATA` 的 PAP/CHAP | 不做 | `DialRequest` 无 auth 字段，属新增契约，需先定 API |
+| neoway 挂断后 `sleep 3` 的节拍 | 不做 | 节拍类差异无功能收益，且会拖慢所有挂断路径 |
+
+---
+
+## 8. 上游致谢
 
 本项目在开发过程中参考了以下仓库（按对齐基准排序）：
 
