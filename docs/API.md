@@ -205,6 +205,11 @@
 | POST | `/api/dial/connect` | `dial_connect::handle` | apn 留空 = 沿用模组里已有的配置；reconnect = 已激活的先断开再连（让刚写入的 APN 生效） |
 | POST | `/api/dial/disconnect` | `dial_disconnect::handle` | cid 省略（或 0）时用当前拨号的 cid，再不行用数据默认 cid |
 
+`DialState`（`/api/dial` 的 `state` 字段、任务 `dial.connect` 的结果）新增可选字段
+`backend`：`at` 表示芯片侧 AT 配方，`native-qmi` / `native-mbim` 表示主机侧内置拨号器，
+空串表示没连过或链路不是本程序拨的。**新增字段、旧前端可忽略**；其余字段与语义未变。
+生命周期（谁决定连、何时重连、退避）见 `docs/DIAL_STATE_MACHINE.md`。
+
 ### `/api/usbnet`
 
 | 方法 | 路径 | handler | 说明 |

@@ -20,8 +20,9 @@
 ```
 http/             HTTP + WebSocket（路由、鉴权、handlers、静态页、推送）
   └─ 调用 modem/ 与 netprov/，自身不碰串口、不改网络
-runtime/          运行期：拨号器托管（dialer/）、主机网卡台账（hostnic）、
-                  巡检（scheduler）、存储（store）、NTP/时区、流量统计
+runtime/          运行期：拨号协调器（dialer/，全仓唯一连接决策点）、
+                  主机网卡台账（hostnic）、巡检（scheduler）、存储（store）、
+                  NTP/时区、流量统计
   └─ dialer/native 内置 QMI/MBIM 链路（qmi_link / mbim_link）
 netprov/          自动组网：纯策略（provision/route/v6）+ UCI 薄 IO（uci）+ 编排（mod）
 modem/            模组域
@@ -63,13 +64,15 @@ wechat/           企业微信推送（纯逻辑 + 传输 + 运行期状态）
    所有命令走 AtPort + Scheduler（User > Signal > Data > Bulk 优先级 + 25ms 节奏）
    串口打不开有冷却闸；URC 由 LineGate 过滤，不污染命令应答
 
-④ 拨号（/api/dial/connect）
+④ 拨号（/api/dial/connect，或任务 dial.connect）
    dial_inner
+     ├─ 取连接代次（Modem::dial_epoch，bump 后作为本次意图）
      ├─ 校验 cid / APN / PDP 类型
      ├─ usb_type：AT 方言 → USB 描述符 → 主机驱动（30s 缓存）
      ├─ vendor::datacall 取配方（厂商 × 平台）
-     ├─ QMI/MBIM：交办主机侧拨号器（modem 侧绝不 AT+CGACT=1）
+     ├─ QMI/MBIM：交办拨号协调器（modem 侧绝不 AT+CGACT=1），state=dialing
      └─ ECM/RNDIS/NCM：按配方发私有激活指令，失败回退 CGACT
+   每次「宣布成功」前都比对代次：用户中途点断开 / 新拨号接手 ⇒ 本次结果作废
    状态机 phase：session → iface_pending → route_pending → online
 
 ⑤ 组网（netprov，15s 一轮，启动先跑一轮再进节拍）
@@ -77,22 +80,28 @@ wechat/           企业微信推送（纯逻辑 + 传输 + 运行期状态）
    地址：DHCP / FM350 静态（模组上报地址）/ v6 兄弟接口
    地址、路由、DNS 落地后回写拨号状态
 
-⑤b 拨号器托管（同一轮，无条件跑，不受 auto_wan / uci 影响）
-   这两个开关管「建不建接口」，托管管「QMI/MBIM 的数据呼叫谁来做」
-   判定链（缺一环就按「不接管」收起，不退出的重试交给 reconcile）：
-     is_running（AT 口已开）
-       → native_takes：ensure_dial_kind（dial_state.kind 为空时走
-         usb_type 30s 缓存探测一次并回写 kind/type_name，不动 state）
-       → 厂商策略 supports(vendor, link)
-       → APN 三级回退（拨号状态 → last_dial_apn → 模组已配置上下文）
-       → pick_device（同 UCI 口径选网卡，多模组不串）
-       → plan_native：控制口 sysfs 反查（usbmisc/usb/GobiQMI/mhi 四级，
-         绝不猜 /dev/cdc-wdm0）+ qmap_mode 三路径 + QMAP 参数
-   会话探活：QMI Get Packet Service Status / MBIM ActivationState；
-   掉线重建；失败指数退避 5/10/20/40/60s（错误变化才清零）
+⑤b 拨号协调器 reconcile（同一轮，无条件跑，不受 auto_wan / uci 影响）
+   这两个开关管「建不建接口」，协调器管「谁拨号、什么时候重拨」
+   每台模组二选一，**决策只在这里做一次**：
+     ├─ 原生（QMI/MBIM）
+     │   is_running → native_takes（ensure_dial_kind + 厂商策略 supports）
+     │   → APN 三级回退（拨号状态 → last_dial_apn → 模组已配置上下文）
+     │   → pick_device（同 UCI 口径选网卡，多模组不串）
+     │   → plan_native：控制口 sysfs 反查（usbmisc/usb/GobiQMI/mhi 四级，
+     │     绝不猜 /dev/cdc-wdm0）+ qmap_mode 三路径 + QMAP 参数
+     │   会话探活：QMI Get Packet Service Status / MBIM ActivationState
+     │   建会话前记代次、建好后比对（过期立即拆）；成功后回调
+     │   Modem::note_native_up 写 connected（这是早先缺失的一环）
+     └─ AT（ECM/RNDIS/NCM/unknown）
+         auto_connect_allowed（唯一判定：dial_enabled / auto_dial /
+         manual_stop / connected / dialing+busy / 退避）→ 通过才派工作线程
+         跑 Modem::dial（不阻塞组网循环），结果按状态分类记退避
+   统一退避表（每模组一条）：AT 30/60/120/240/300s，Native 5/10/20/40/60s；
+   同一错误持续则继续退避，错误变化才清零；用户重开开关时清空（立即重试）
 
 ⑥ 断开（/api/dial/disconnect）
-   先停拨号器 → 模组侧按配方挂断 → 清该网卡旧默认路由与地址 → manual_stop
+   先停原生会话 → 模组侧按配方挂断（hangup 首步 bump 代次，作废在途拨号）
+   → 清该网卡旧默认路由与地址 → manual_stop=true（协调器不再自动重拨）
 ```
 
 ## 4. 数据表与匹配规则

@@ -9,6 +9,7 @@
 | [`API.md`](API.md) | HTTP / WebSocket 契约：响应信封、鉴权、`modem_id` 语义、103 条 `/api/*` 接口全表（外加 2 个 WebSocket；由 `router.rs` 导出） |
 | [`UPSTREAM_AUDIT.md`](UPSTREAM_AUDIT.md) | 三仓库源码审计、功能迁移矩阵（D1–D13 / P1–P12）、代码变更清单、测试结果、真机待办、上游致谢清单（§7） |
 | [`SUPPORT_MATRIX.md`](SUPPORT_MATRIX.md) | 91 型号 × USB/PCIe 形态 × 平台；厂商 × 平台的数据通道指令；验证边界 |
+| [`DIAL_STATE_MACHINE.md`](DIAL_STATE_MACHINE.md) | 拨号生命周期审计与统一状态机：旧调用图、问题清单（含代码证据）、新架构、状态迁移表、入口归属、兼容性、测试与回滚 |
 
 ## 历史文档说明
 

@@ -10,6 +10,48 @@
 
 ## [未发布]
 
+### 重构：拨号生命周期统一到一个协调器（AT 与 QMI/MBIM 共用意图、状态与退避）
+
+**问题（都有代码证据，详见 `docs/DIAL_STATE_MACHINE.md`）**：
+
+1. QMI/MBIM 会话建好后**没有任何人**把 `DialState.state` 写成 `connected` ——
+   `dial_inner` 对这两类只做「交办」就返回，页面永远停在「拨号中」；
+2. 两套互不知情的退避：`spawn_auto_dial` 固定 300 秒（仅 AT），
+   `reconcile_native_one` 5→60 秒指数（仅原生）；
+3. 两套「该不该连」的判定各写一遍，新插入的 QMI 模组第一轮会被自动拨号
+   当作 AT 模组喂给 `dial()`（`cached_dial_kind` 为空时）；
+4. **没有代次**：拨号进行中点「断开」，旧流程醒来会把状态写回 `connected`
+   （且与 `manual_stop=true` 并存）；
+5. 模组重启 / 飞行模式 / 配额断网都不碰拨号状态：重启后状态停在 `connected`，
+   自动重拨永远不触发；飞行模式下还会继续尝试重拨并退避到 300 秒。
+
+**改造**（适配器式统一，不重写任何后端）：
+
+- `Modem` 新增**连接代次** `dial_epoch`：`dial_inner` 开始时取号，每次「宣布成功」
+  前比对；`hangup` 第一步 bump（作废在途拨号）；原生后端建会话前记代次、
+  建好后比对，过期立即拆会话。只挡提交，不打断在途 AT（发出去的字节收不回来）。
+- `DialerSupervisor` 升级为**唯一决策点**：`reconcile` 每 15 秒（及 `kick` 立即触发）
+  对每台模组二选一 —— 原生走 `Session::start`，其余走 `auto_connect_allowed` +
+  工作线程 `Modem::dial`（不再阻塞组网循环）。
+- **统一退避表**（每模组一条）：AT 30/60/120/240/300s（持续前置条件），
+  原生 5/10/20/40/60s（瞬时故障）；同一错误持续退避，错误变化清零，成功清空。
+- **状态写入点收敛**：原生后端通过 `note_native_up/down` 写权威状态；
+  策略停用通过 `note_stopped` 落 `disconnected`；外部断链（重启/飞行模式）通过
+  `note_external_break` 拉回 `dialing` 并作废在途流程。
+- 删除 `http::loops::spawn_auto_dial`（30 秒独立决策循环），线程数 8→7。
+- 开关/重启/飞行模式 handler 接入：打开开关、关飞行模式、重启后清退避
+  （不必等完一个已无意义的 5 分钟窗口）；`dial.connect` 任务成功后立即 `kick`。
+- `DialState` 新增可选字段 `backend`（`at` / `native-qmi` / `native-mbim`），
+  其余字段与语义不变。
+
+**兼容性**：HTTP 路径、JSON 字段名、`state` 字符串、厂商配方、`AT+CGACT` 禁用
+约束、FM350 静态地址、netifd/防火墙/metric 逻辑全部未变；`backend` 为可选新增字段。
+
+**测试**：`cargo test --locked` **746 passed**（新增 6 个用例：统一退避序列、
+退避清零规则、自动连接的全部拒绝理由、断开时代次作废、原生状态写入与掉线回退、
+外部断链作废在途拨号）；clippy 0 warning、fmt 干净。真机验证清单见
+`docs/DIAL_STATE_MACHINE.md` §6.2（本沙箱无模组，未执行）。
+
 ### 修复：5G NR 锁小区命令参数整体错位（QNWLOCK PCI/频点/SCS 顺序）
 
 **现象**：页面上对 5G 模组「锁小区」选 NR、填频点 + PCI 下发，模组回 OK 但锁不上
