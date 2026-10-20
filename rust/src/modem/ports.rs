@@ -15,9 +15,11 @@
 //!
 //! `modem_catalog.json` 只有「VID → 厂商」，同一个 VID 底下几十个 PID、型号各不同；
 //! 而 AT 口选错（选到 diag 口）的典型症状是「能打开、发 AT 全部超时」。
-//! QModem 用这 18 条例外把「某 PID 的哪个接口是 AT」钉死，比通用探测快且准。
+//! QModem 用这 18 条例外把「某 PID 的哪个接口是 AT」钉死，比通用探测快且准；
+//! 另有一条 `rg501q-eu`（`2c7c:0800`）来自参考实现 `luci-app-rg501q-eu`
+//! （上游没有），接口号按其 `common.sh` 的接口路径匹配补。
 //!
-//! 表很小（18 条），所以直接内嵌进二进制，运行时不去 `/usr/share` 找文件。
+//! 表很小（19 条），所以直接内嵌进二进制，运行时不去 `/usr/share` 找文件。
 
 use std::sync::OnceLock;
 
@@ -111,14 +113,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn table_is_the_qmodem_port_rules() {
-        assert_eq!(count(), 18, "QModem modem_port_rule.json 共 18 条 USB 规则");
+    fn table_is_the_qmodem_port_rules_plus_documented_extensions() {
+        // 18 条逐字来自 QModem modem_port_rule.json；rg501q-eu（2c7c:0800）是
+        // 参考实现 luci-app-rg501q-eu 登记过的扩展（上游没有这一条）
+        assert_eq!(count(), 19, "QModem 18 条 + RG501Q-EU 扩展 1 条");
         let all = all();
         assert!(all.iter().all(|r| r.vid.len() == 4 && r.pid.len() == 4));
         // 排序稳定：vid 升序
         let mut sorted = all.to_vec();
         sorted.sort_by(|a, b| a.vid.cmp(&b.vid));
         assert_eq!(all[0].vid, sorted[0].vid);
+    }
+
+    #[test]
+    fn rg501q_at_interfaces_follow_the_reference_implementation() {
+        // 依据 luci-app-rg501q-eu common.sh（cee3398）：USB 身份 2c7c:0800，
+        // AT 口按**接口号** 2/3 找（不用 ttyUSB 序号——别的 USB 串口会变号），
+        // QMI 走接口 4。上游 QModem 没有这一条，接口号是本项目按参考实现补的。
+        let r = lookup("2c7c", "0800").expect("rg501q-eu 规则");
+        assert_eq!(r.model, "rg501q-eu");
+        assert_eq!(r.mode, "qmi");
+        assert_eq!(r.at_interfaces, vec!["1.2", "1.3"]);
+        assert!(r.allows_interface("1.2"));
+        assert!(r.allows_interface("1.3"));
+        assert!(!r.allows_interface("1.4"), "1.4 是 QMI 数据口，不是 AT 口");
+        assert!(!r.option_driver, "参考实现不绑 option 驱动");
     }
 
     #[test]

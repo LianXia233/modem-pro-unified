@@ -128,25 +128,44 @@ impl Modem {
                 "LTE" => "AT+SP5GRAN=0".to_string(),
                 other => return Err(msg(format!("展锐不支持的目标模式：{other}"))),
             },
+            // 百旺 QDC507：位标志写入（参考实现 baiwang_control.lua 的 set_network）
+            Vendor::Baiwang => {
+                let Some(code) = baiwang_nwscanmodeex_code(value) else {
+                    return Err(msg(format!("QDC507 不支持的目标模式：{value}")));
+                };
+                format!("AT+QCFG=\"nwscanmodeex\",{code}")
+            }
             _ => format!("AT+QNWPREFCFG=\"mode_pref\",{value}"),
         };
         let resp = self.with_at_prio(Prio::Data, |p| p.command(&cmd, Duration::from_secs(10)))?;
         if !is_ok(&resp) {
             return Err(msg(format!("下发失败：{}", resp.trim())));
         }
+        let matches = |p: &ModePref| !p.value.is_empty() && p.value.eq_ignore_ascii_case(value);
         let pref = self.mode_pref_refresh();
-        if pref.value.is_empty() || !pref.value.eq_ignore_ascii_case(value) {
-            // 回读不到目标值时不算成功：界面会照模组的真实状态显示
-            return Err(msg(format!(
-                "已下发但回读为「{}」（目标 {value}）",
-                if pref.value.is_empty() {
-                    "空"
-                } else {
-                    &pref.value
-                }
-            )));
+        if matches(&pref) {
+            return Ok(pref);
         }
-        Ok(pref)
+        // QDC507 先应答、NAS 偏好后可读还有延迟（参考实现轮询 5×1s 后断言）。
+        // 这里最多再等 3 秒；仍读不回来就按模组真实状态报错，不假报成功。
+        if vendor == Vendor::Baiwang {
+            for _ in 0..3 {
+                std::thread::sleep(Duration::from_secs(1));
+                let p = self.mode_pref_refresh();
+                if matches(&p) {
+                    return Ok(p);
+                }
+            }
+        }
+        // 回读不到目标值时不算成功：界面会照模组的真实状态显示
+        Err(msg(format!(
+            "已下发但回读为「{}」（目标 {value}）",
+            if pref.value.is_empty() {
+                "空"
+            } else {
+                &pref.value
+            }
+        )))
     }
 }
 
@@ -208,6 +227,54 @@ pub fn unisoc_mode_from_sprat(resp: &str) -> Option<&'static str> {
     }
 }
 
+/// 百旺 QDC507 `AT+QCFG="nwscanmodeex"` 应答 → 语义值。
+///
+/// 位标志来自参考实现 `baiwang_control.lua` 的 `values` 表（`2G=4` / `3G=8` /
+/// `4G=16`，实机 `QDC507GLEFM21`）：`+QCFG: "nwscanmodeex",24` = 4G + 3G。
+/// 0（没有任何制式）与未知位一律返回 `None` —— 宁可不显示，也不显示错的数据。
+pub fn baiwang_mode_from_nwscanmodeex(resp: &str) -> Option<String> {
+    let field = extract_field(resp, "+QCFG")?;
+    let parts = csv(&field);
+    if parts.first()?.trim_matches('"') != "nwscanmodeex" {
+        return None;
+    }
+    let n: i32 = parts.get(1)?.trim().parse().ok()?;
+    baiwang_mode_from_bits(n)
+}
+
+/// 位标志 → 归一化语义值（制式从高到低，与 `LTE:NR5G` 的写法一致）。
+fn baiwang_mode_from_bits(n: i32) -> Option<String> {
+    // 只认 2G/3G/4G 三位（4/8/16）；0 = 没开任何制式，未知位不猜
+    if n <= 0 || n & !0b1_1100 != 0 {
+        return None;
+    }
+    let mut v = Vec::new();
+    if n & 16 != 0 {
+        v.push("LTE");
+    }
+    if n & 8 != 0 {
+        v.push("WCDMA");
+    }
+    if n & 4 != 0 {
+        v.push("GSM");
+    }
+    Some(v.join(":"))
+}
+
+/// 语义值 → `AT+QCFG="nwscanmodeex"` 位标志（与 [`baiwang_mode_from_bits`] 互逆）。
+pub fn baiwang_nwscanmodeex_code(value: &str) -> Option<i32> {
+    let mut n = 0;
+    for part in value.to_ascii_uppercase().split(':') {
+        n |= match part.trim() {
+            "LTE" => 16,
+            "WCDMA" => 8,
+            "GSM" => 4,
+            _ => return None,
+        };
+    }
+    (n > 0).then_some(n)
+}
+
 /// 从应答里取模式取值。
 pub fn parse_mode_value(resp: &str, source: &str) -> Option<String> {
     match source {
@@ -227,6 +294,8 @@ pub fn parse_mode_value(resp: &str, source: &str) -> Option<String> {
         "ws46" => telit_mode_from_ws46(resp),
         // Sierra：`!SELRAT: <n>`
         "selrat" => sierra_mode_from_selrat(resp),
+        // 百旺 QDC507：`+QCFG: "nwscanmodeex",<位标志>`
+        "baiwang_nwscan" => baiwang_mode_from_nwscanmodeex(resp),
         _ => {
             let field = extract_field(resp, "+QNWPREFCFG")?;
             let parts = csv(&field);
@@ -294,6 +363,11 @@ pub fn mode_text(value: &str) -> String {
         "LTE:NR5G" | "NR5G:LTE" => "4G + 5G".to_string(),
         "WCDMA" => "仅 3G WCDMA".to_string(),
         "GSM" => "仅 2G GSM".to_string(),
+        // 百旺 QDC507 的组合写法（制式从高到低）
+        "LTE:WCDMA" => "4G + 3G".to_string(),
+        "LTE:GSM" => "4G + 2G".to_string(),
+        "LTE:WCDMA:GSM" => "4G + 3G + 2G".to_string(),
+        "WCDMA:GSM" => "3G + 2G".to_string(),
         "" => String::new(),
         other => other.to_string(),
     }
@@ -334,6 +408,26 @@ pub fn mode_options_for(vendor: Vendor) -> Vec<ModeOption> {
                 label: "仅 4G".into(),
             },
         ],
+        // 百旺 QDC507 是 LTE 模组：位标志只给含 LTE 的组合（参考实现
+        // baiwang_control.lua 允许 2G/3G/4G 任意非空组合，实机是 LTE 硬件）
+        Vendor::Baiwang => vec![
+            ModeOption {
+                value: "LTE".into(),
+                label: "仅 4G LTE".into(),
+            },
+            ModeOption {
+                value: "LTE:WCDMA".into(),
+                label: "4G + 3G".into(),
+            },
+            ModeOption {
+                value: "LTE:GSM".into(),
+                label: "4G + 2G".into(),
+            },
+            ModeOption {
+                value: "LTE:WCDMA:GSM".into(),
+                label: "4G + 3G + 2G".into(),
+            },
+        ],
         _ => mode_options(),
     }
 }
@@ -341,11 +435,63 @@ pub fn mode_options_for(vendor: Vendor) -> Vec<ModeOption> {
 #[cfg(test)]
 mod tests {
     use super::{
+        baiwang_mode_from_bits, baiwang_mode_from_nwscanmodeex, baiwang_nwscanmodeex_code,
         cnmp_code, huawei_mode_from_acq, mode_options_for, mode_text, parse_mode_value,
         parse_syscfgex, sierra_mode_from_selrat, tdtech_acq_order, tdtech_mode_from_acq,
         telit_mode_from_ws46, unisoc_mode_from_sprat,
     };
     use crate::modem::vendor::Vendor;
+
+    /// 百旺 QDC507：`AT+QCFG="nwscanmodeex"` 位标志 ↔ 语义值互逆。
+    ///
+    /// 位标志依据参考实现 `baiwang_control.lua` 的 values 表（2G=4 / 3G=8 / 4G=16）。
+    #[test]
+    fn baiwang_nwscanmodeex_bits_round_trip() {
+        // 读：应答 → 语义值
+        assert_eq!(
+            baiwang_mode_from_nwscanmodeex("+QCFG: \"nwscanmodeex\",16\r\nOK").as_deref(),
+            Some("LTE")
+        );
+        assert_eq!(
+            baiwang_mode_from_nwscanmodeex("+QCFG: \"nwscanmodeex\",24\r\nOK").as_deref(),
+            Some("LTE:WCDMA")
+        );
+        assert_eq!(
+            baiwang_mode_from_nwscanmodeex("+QCFG: \"nwscanmodeex\",28\r\nOK").as_deref(),
+            Some("LTE:WCDMA:GSM")
+        );
+        assert_eq!(
+            parse_mode_value("+QCFG: \"nwscanmodeex\",20\r\nOK", "baiwang_nwscan").as_deref(),
+            Some("LTE:GSM")
+        );
+        // 0 = 没开任何制式（参考实现拒绝 mode=0），未知位不猜
+        assert_eq!(baiwang_mode_from_bits(0), None);
+        assert_eq!(baiwang_mode_from_bits(32), None, "未知位不猜");
+        assert_eq!(baiwang_mode_from_bits(-1), None);
+        // 不是 nwscanmodeex 的 QCFG 应答不接
+        assert_eq!(
+            baiwang_mode_from_nwscanmodeex("+QCFG: \"usbnet\",1\r\nOK"),
+            None
+        );
+        // 写：语义值 → 位标志，与读互逆
+        for v in [
+            "LTE",
+            "LTE:WCDMA",
+            "LTE:GSM",
+            "LTE:WCDMA:GSM",
+            "WCDMA",
+            "GSM",
+        ] {
+            let code = baiwang_nwscanmodeex_code(v).expect(v);
+            assert_eq!(baiwang_mode_from_bits(code).as_deref(), Some(v));
+        }
+        assert_eq!(baiwang_nwscanmodeex_code("AUTO"), None);
+        assert_eq!(baiwang_nwscanmodeex_code(""), None);
+        // 下拉只给含 LTE 的组合（实机是 LTE 硬件）
+        let opts = mode_options_for(Vendor::Baiwang);
+        assert!(opts.iter().all(|o| o.value.starts_with("LTE")));
+        assert_eq!(mode_text("LTE:WCDMA"), "4G + 3G");
+    }
 
     #[test]
     fn new_vendor_mode_parsers() {

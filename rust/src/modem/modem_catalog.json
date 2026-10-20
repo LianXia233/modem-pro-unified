@@ -2147,5 +2147,21 @@
       "note": "Modem-Pro 没有提供该厂商的 PCIe 形态切换指令"
     },
     "vid": "305a"
+  },
+  {
+    "vendor": "baiwang",
+    "model": "qdc507",
+    "platform": "qualcomm",
+    "usb": [
+      "ecm"
+    ],
+    "usb_at": {
+      "query": "AT+QCFG=\"usbnet\"",
+      "modes": {
+        "ecm": "AT+QCFG=\"usbnet\",1"
+      },
+      "note": "QDC507 只有 ECM 一种形态（参考实现 modes=[\"ecm\"]；实机 QDC507GLEFM21 / USB 2c7c:0125）"
+    },
+    "vid": "2c7c"
   }
 ]

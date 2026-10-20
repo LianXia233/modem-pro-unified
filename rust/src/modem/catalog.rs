@@ -61,6 +61,7 @@ pub fn vendor_label(vendor: &str) -> String {
         "thales" => "Thales".into(),
         "neoway" => "有方 Neoway".into(),
         "gosuncn" => "高新兴 Gosuncn".into(),
+        "baiwang" => "Baiwang（QDC507）".into(),
         other => other.to_string(),
     }
 }
@@ -80,10 +81,13 @@ pub fn platform_label(platform: &str) -> String {
     }
 }
 
-/// 厂商在清单里的排列顺序（= QModem 支持列表的排列）。
-pub const VENDOR_ORDER: [&str; 12] = [
+/// 厂商在清单里的排列顺序（= QModem 支持列表的排列 + 本项目扩展）。
+///
+/// `baiwang`（大疆 QDC507）不在 QModem 清单里，来自参考实现
+/// `ainuoyan/QDC507-Modem-Support`（`bb57bb7`），排在最后。
+pub const VENDOR_ORDER: [&str; 13] = [
     "openluat", "huawei", "quectel", "fibocom", "meig", "sierra", "telit", "simcom", "foxconn",
-    "thales", "neoway", "gosuncn",
+    "thales", "neoway", "gosuncn", "baiwang",
 ];
 
 /// 一种形态（USB / PCIe）下的模式切换指令。
@@ -392,14 +396,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_is_the_full_qmodem_list() {
+    fn catalog_is_the_qmodem_list_plus_documented_extensions() {
         let (models, usb, pcie, vendors) = stats();
-        assert_eq!(models, 91, "QModem support_list 共 91 个型号");
+        // 91 个来自 QModem support_list；qdc507 是参考实现登记过的扩展
+        assert_eq!(models, 92, "QModem 91 + QDC507 扩展 1");
         assert_eq!(pcie, 41, "其中 41 个有 PCIe 形态");
-        assert_eq!(vendors, 12);
+        assert_eq!(vendors, 13, "QModem 12 家 + 百旺（QDC507）");
         assert!(usb >= 89, "绝大多数型号有 USB 形态");
         // 厂商顺序与清单一致
         assert_eq!(vendor_counts().first().map(|v| v.0), Some("openluat"));
+        // 扩展条目：不在 QModem 清单、有实机依据
+        let e = lookup("QDC507GLEFM21").expect("qdc507 扩展条目");
+        assert_eq!(e.vendor, "baiwang");
+        assert_eq!(e.usb, vec!["ecm".to_string()], "QDC507 只有 ECM");
+        assert!(e.pcie.is_empty(), "QDC507 没有 PCIe 形态");
     }
 
     #[test]
@@ -446,16 +456,18 @@ mod tests {
 
     #[test]
     fn vid_is_migrated_and_drives_vendor_lookup() {
-        // 86/91 条登记了 VID（其余 5 条上游本来就没有）
+        // 87/92 条登记了 VID（其余 5 条上游本来就没有）
         let with_vid = entries().iter().filter(|e| !e.vid.is_empty()).count();
-        assert_eq!(with_vid, 86, "VID 迁移自 QModem 的 manufacturer_id");
+        assert_eq!(with_vid, 87, "VID 迁移自 QModem 的 manufacturer_id");
 
         assert_eq!(vendor_by_vid("2c7c"), Some("quectel"));
         assert_eq!(vendor_by_vid("0e8d"), Some("fibocom"));
         assert_eq!(vendor_by_vid("1e0e"), None, "清单里没有的 VID 不猜");
 
-        // 独占 VID 可当证据，多厂商 VID 只能当提示
-        assert!(vendor_is_exclusive("2c7c"), "2c7c 名下全是移远");
+        // 独占 VID 可当证据，多厂商 VID 只能当提示。
+        // 2c7c 曾经「名下全是移远」，QDC507（实机 2c7c:0125）进来之后共享该 VID
+        // —— 这正是「VID 只能当提示、不能当证据」的活例。
+        assert!(!vendor_is_exclusive("2c7c"), "2c7c 现在挂移远与百旺两家");
         assert!(!vendor_is_exclusive("1782"), "1782 挂广和通/美格/合宙三家");
         assert!(!vendor_is_exclusive(""), "空 VID 不是证据");
 

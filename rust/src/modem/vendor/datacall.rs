@@ -285,6 +285,22 @@ mod tests {
         assert_eq!(p.deactivate, vec![cgact_deactivate(3)]);
     }
 
+    /// 百旺 QDC507：LTE 移远方言，拨号只有 `AT+CGACT`（参考实现 baiwang_dial
+    /// 逐字如此），不能因为它平台是 qualcomm 就给它发移远的 QNETDEVCTL。
+    /// 通用配方的 `deactivate` 为空，由拨号器按 `cgact_fallback` 补 `CGACT=0`
+    /// （见 `model/dial.rs` 挂断步骤组装）。
+    #[test]
+    fn baiwang_stays_on_3gpp_cgact() {
+        for kind in ["ecm", "rndis", "ncm"] {
+            let p = plan(Vendor::Baiwang, &ctx(kind, "qualcomm", "qdc507", 1));
+            assert!(p.pdp_first, "{kind} 先发 AT+CGACT=1");
+            assert!(p.activate.is_empty(), "QDC507 没有私有激活指令");
+            assert!(p.cgact_fallback, "挂断由拨号器补 CGACT=0");
+            assert!(p.deactivate.is_empty(), "通用配方不预置挂断步骤");
+            assert!(p.note.contains("未登记私有数据通道指令"));
+        }
+    }
+
     /// 芯讯通两大平台也是 CGACT；高通平台的 CNMP 保活不写死。
     #[test]
     fn simcom_stays_on_3gpp() {
@@ -333,6 +349,7 @@ mod tests {
             Vendor::Openluat,
             Vendor::TDTech,
             Vendor::Unisoc,
+            Vendor::Baiwang,
             Vendor::Unknown,
         ];
         for v in vendors {

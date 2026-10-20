@@ -6,6 +6,7 @@
 //! vendor/
 //!   mod.rs      —— Vendor 枚举 + VendorSpec 统一接口 + 注册表（本文件）
 //!   quectel.rs  —— 移远：识别关键字 / AT 预设 / 流量 / 温度 / 厂商指令
+//!   baiwang.rs  —— 百旺（大疆 QDC507）：LTE 移远方言 + 通用 CGACT 拨号
 //!   fibocom.rs  —— 广和通（含 FM350 的 MTK 平台差异）
 //!   simcom.rs   —— 芯讯通（CNMP 模式、CNWSEARCH 扫小区、CPMUTEMP 温度）
 //!   meig.rs     —— 美格
@@ -36,6 +37,7 @@ use serde::Serialize;
 
 use crate::modem::at::AtPreset;
 
+pub mod baiwang;
 pub mod datacall;
 pub mod fibocom;
 pub mod foxconn;
@@ -57,6 +59,10 @@ pub mod unknown;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Vendor {
+    /// 百旺（大疆 QDC507）：与移远**同 VID**（`2c7c`，实机 `2c7c:0125`），
+    /// 但固件是 **LTE 代**移远方言：只认 `AT+CGACT`，不认 RM5xx 的
+    /// `AT+QNETDEVCTL`（依据 QDC507-Modem-Support `baiwang.sh`）。
+    Baiwang,
     Quectel,
     Fibocom,
     Simcom,
@@ -85,11 +91,16 @@ pub enum Vendor {
 /// 识别顺序：先中先得。
 /// 识别顺序：**先具体后宽泛**。
 ///
+/// `Baiwang` 排在 `Quectel` **之前**：QDC507 与移远同 VID，ATI 也可能只回
+/// `Quectel`，但探测链第一条 `AT+CGMM` 会给出含 `QDC507` 的型号 —— 先认百旺
+/// 才能拿到「只发 CGACT」的正确方言（错认成移远会去发 `QNETDEVCTL`）。
+///
 /// 关键：`TDTech` 排在 `Huawei` **之前** —— `MT5700M` 是两家共线型号，
 /// 项目原有归属是鼎桥（`AT^MONSC` / `AT^CHIPTEMP` 那一族），华为模块因此
 /// 不认 `MT5700M`（只认 `HUAWEI` / `MH5000` / `MT5710`）。
 /// 同理 `Foxconn` 的 `T99W*` 与 Thales（共用 `AT^DEBUG`）要先认富士康。
-pub const DETECT_ORDER: [Vendor; 14] = [
+pub const DETECT_ORDER: [Vendor; 15] = [
+    Vendor::Baiwang,
     Vendor::Quectel,
     Vendor::Fibocom,
     Vendor::Simcom,
@@ -214,6 +225,7 @@ impl Vendor {
     /// 取这家厂商的能力表（编译期常量，无分配）。
     pub fn spec(&self) -> &'static dyn VendorSpec {
         match self {
+            Vendor::Baiwang => &baiwang::Spec,
             Vendor::Quectel => &quectel::Spec,
             Vendor::Fibocom => &fibocom::Spec,
             Vendor::Simcom => &simcom::Spec,
@@ -247,6 +259,7 @@ impl Vendor {
     /// 清单里 `huawei` 同时含华为与鼎桥：MT5700/MT5710 归 `TDTech`（ATI 也这么认）。
     pub fn from_key(key: &str) -> Option<Vendor> {
         Some(match key.trim().to_ascii_lowercase().as_str() {
+            "baiwang" => Vendor::Baiwang,
             "quectel" => Vendor::Quectel,
             "fibocom" => Vendor::Fibocom,
             "simcom" => Vendor::Simcom,
@@ -268,6 +281,7 @@ impl Vendor {
 
     pub fn as_str(&self) -> &'static str {
         match self {
+            Vendor::Baiwang => "baiwang",
             Vendor::Quectel => "quectel",
             Vendor::Fibocom => "fibocom",
             Vendor::Simcom => "simcom",
@@ -382,6 +396,48 @@ mod tests {
         );
         assert_eq!(Vendor::detect(&lines(&["ums9620_modem"])), Vendor::Unisoc);
         assert_eq!(Vendor::detect(&lines(&["+CME ERROR: 4"])), Vendor::Unknown);
+    }
+
+    #[test]
+    fn baiwang_qdc507_wins_over_quectel() {
+        // QDC507 与移远同 VID（2c7c，实机 2c7c:0125），ATI 可能只回 Quectel，
+        // 但探测链第一条 AT+CGMM 给出含 QDC507 的型号（参考实现 quectel_base_info
+        // 同样用 CGMM 取型号）。先认百旺才能拿到「只发 CGACT」的方言。
+        assert_eq!(Vendor::detect(&lines(&["QDC507GLEFM21"])), Vendor::Baiwang);
+        assert_eq!(
+            Vendor::detect(&lines(&["Quectel", "QDC507GLEFM21", "Revision: x"])),
+            Vendor::Baiwang,
+            "同一行里两家关键字时按 DETECT_ORDER 先中先得"
+        );
+        // 只有厂名没有型号关键字时，不给百旺（可能是真移远）
+        assert_eq!(
+            Vendor::detect(&lines(&["Quectel", "RM520N-GL"])),
+            Vendor::Quectel
+        );
+        assert_eq!(Vendor::from_key("baiwang"), Some(Vendor::Baiwang));
+        assert_eq!(Vendor::Baiwang.as_str(), "baiwang");
+    }
+
+    #[test]
+    fn baiwang_capability_surface_is_read_only() {
+        use crate::modem::vendor::{UsbnetWrite, Vendor};
+        let s = Vendor::Baiwang.spec();
+        assert_eq!(s.id(), Vendor::Baiwang);
+        assert!(!s.label().is_empty());
+        // 温度有取证（复用移远 QTEMP）；流量没有（参考实现不查）
+        assert_eq!(s.temperature_cmds(false), &["AT+QTEMP"]);
+        assert!(s.traffic_candidates().is_empty(), "未取证就不发");
+        // USB 模式：读走 QCFG 方言，写只认 ECM
+        assert!(s.at_presets().len() >= 5);
+        assert_eq!(s.usbnet_write(1), UsbnetWrite::Allow);
+        for v in [0u8, 2, 3, 5] {
+            assert!(
+                matches!(s.usbnet_write(v), UsbnetWrite::Deny(why) if !why.is_empty()),
+                "档位 {v} 必须拒绝并给出原因"
+            );
+        }
+        // 组网模式读指令已取证；拨号不登记私有 data_channel（走通用 CGACT）
+        assert_eq!(s.mode_read().0, "AT+QCFG=\"nwscanmodeex\"");
     }
 
     #[test]

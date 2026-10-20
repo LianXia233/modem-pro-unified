@@ -204,8 +204,11 @@ pub fn parse_usbnet(resp: &str) -> Option<i32> {
 }
 
 /// 这家厂商有没有 QCFG 这条查询指令（读也只对这一族有意义）。
+///
+/// 百旺 QDC507 也走这套：`baiwang.sh` 直接 `source quectel.sh`，USB 模式读写
+/// 都是 `AT+QCFG="usbnet"`（写只认 ECM，见 `VendorSpec::usbnet_write`）。
 fn supports_qcfg(vendor: Vendor) -> bool {
-    matches!(vendor, Vendor::Quectel | Vendor::Meig)
+    matches!(vendor, Vendor::Quectel | Vendor::Meig | Vendor::Baiwang)
 }
 
 /// 档位表 + 不可执行档位：**由厂商写策略推导**，不在这里写死 `match vendor`。

@@ -466,13 +466,42 @@ mod tests {
 
     #[test]
     fn exclusive_vid_is_enough_for_vendor() {
-        // 2c7c 在清单里只对应移远（44 个型号），且这个 PID 没有端口规则
-        let u = usb("2c7c", "9999");
+        // 0e8d 在清单里只对应广和通，且这个 PID 没有端口规则
+        let u = usb("0e8d", "9999");
         let id = identify(Some(&u), &[]);
         assert_eq!(id.matched_by, MatchedBy::UsbVid);
-        assert_eq!(id.vendor, "quectel");
+        assert_eq!(id.vendor, "fibocom");
         assert_eq!(id.confidence, 45);
         assert_eq!(id.model, None, "只到厂商，不猜型号");
+    }
+
+    #[test]
+    fn shared_vid_2c7c_no_longer_pins_the_vendor() {
+        // 2c7c 曾经「名下全是移远」，QDC507（实机 USB 2c7c:0125）进来之后
+        // 与移远共享该 VID：只有 VID、没有 AT 自报时不再能定厂商，
+        // 这正是「VID 只能当提示」的活例（见 catalog::vendor_is_exclusive）。
+        let u = usb("2c7c", "0125");
+        let id = identify(Some(&u), &[]);
+        assert_eq!(id.vendor, "unknown", "共享 VID 不足以定结论");
+        assert_eq!(id.confidence, 0);
+        assert!(!id.candidates.is_empty(), "至少给出候选型号");
+    }
+
+    #[test]
+    fn qdc507_is_identified_by_self_reported_model() {
+        // QDC507 探测链第一条 AT+CGMM 给出含 QDC507 的型号（参考实现
+        // quectel_base_info 同样用 CGMM 取型号）。与移远同 VID 也不冲突：
+        // 结论按设备自报走百旺，VID 归属只作提示并记一条证据。
+        let u = usb("2c7c", "0125");
+        let id = identify(Some(&u), &lines(&["QDC507GLEFM21"]));
+        assert_eq!(id.vendor, "baiwang");
+        assert_eq!(id.model.as_deref(), Some("qdc507"));
+        assert_eq!(id.matched_by, MatchedBy::CatalogModel);
+        assert!(id.model_confirmed());
+        // ATI 只回厂名时，DETECT_ORDER 让百旺关键字先中先得
+        let id = identify(Some(&u), &lines(&["Quectel", "QDC507GLEFM21"]));
+        assert_eq!(id.vendor, "baiwang");
+        assert_eq!(id.model.as_deref(), Some("qdc507"));
     }
 
     #[test]
