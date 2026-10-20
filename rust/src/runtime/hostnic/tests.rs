@@ -26,6 +26,10 @@ fn only_fm350_needs_manual_nic() {
     assert!(!quirk("RM520N-GL").0);
     assert!(!quirk("FM160-CN").0);
     assert!(!quirk("").0);
+    // 百旺 QDC507 的 ECM 走模组 DHCP（参考实现口径：复用已绑定的 DHCP 接口），
+    // 与 350 系列「不发 DHCP」相反，绝不能落进同一特例
+    assert!(!quirk("QDC507GLEFM21").0);
+    assert!(!quirk("qdc507").0);
 }
 
 #[test]
