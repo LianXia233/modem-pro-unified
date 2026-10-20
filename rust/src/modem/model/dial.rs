@@ -2066,7 +2066,13 @@ impl Modem {
         if self.dial_epoch_is(epoch) {
             self.dial_fail(err)
         } else {
-            self.dial_status()
+            // 代次已变：**不写**状态，但返回给本次调用方的快照要带上失败原因，
+            // 否则调用方 `msg(st.last_error)` 会拿到空串（页面只看到一句空白错误）。
+            let mut st = self.dial_status();
+            if st.last_error.trim().is_empty() {
+                st.last_error = err.to_string();
+            }
+            st
         }
     }
 
