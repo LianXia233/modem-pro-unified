@@ -232,8 +232,20 @@ impl DialerSupervisor {
             return;
         }
 
+        // APN 三级回退（与一键拨号 / 自动拨号同一套优选语义，见
+        // `params::pick_dial_context`）：拨号状态里记的 → 上次手动拨号用的 →
+        // **模组里已配置的上下文**（走 15 秒缓存，代价可忽略）。
+        // 早先只有前两级：固件里存了 APN 但从没在页面上拨过的 MBIM 模组，
+        // 会陷入「算不出计划（缺 APN）→ 5 秒退避 → 再来」的死循环。
         let apn = if st.apn.trim().is_empty() {
-            modem.last_dial_apn()
+            let last = modem.last_dial_apn();
+            if !last.is_empty() {
+                last
+            } else {
+                crate::modem::model::pick_dial_context(&modem.params().contexts)
+                    .map(|c| c.apn)
+                    .unwrap_or_default()
+            }
         } else {
             st.apn.clone()
         };

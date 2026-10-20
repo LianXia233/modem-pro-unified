@@ -527,6 +527,13 @@ fn spawn_auto_dial(state: &Arc<AppState>) {
                 if !m.is_running() {
                     continue;
                 }
+                // QMI / MBIM 的数据呼叫归拨号器托管（reconcile 15 秒一轮，含掉线
+                // 重拨与失败退避），自动拨号再插一脚只会跟它抢 dial_busy、
+                // 往 steps 里塞一堆无意义的「已交办」。这里只驱动 **AT 路径**
+                // （ECM / NCM / RNDIS）。
+                if crate::modem::model::dial::wan_host_dial_by_daemon(&m.cached_dial_kind()) {
+                    continue;
+                }
                 let st = m.dial_status();
                 if st.state == crate::modem::model::dial::DIAL_CONNECTED
                     || st.state == crate::modem::model::dial::DIAL_DIALING
@@ -541,10 +548,13 @@ fn spawn_auto_dial(state: &Arc<AppState>) {
                 {
                     continue;
                 }
+                // APN 优选（与一键拨号同一套语义）：模组里已配置的上下文
+                // （已激活非 IMS 优先）直接用；没有才回落「沿用模组配置 + 默认 cid」。
+                let pick = crate::modem::model::pick_dial_context(&m.params().contexts);
                 let req = crate::modem::model::DialRequest {
-                    cid: 0,
-                    apn: String::new(),
-                    pdp_type: String::new(),
+                    cid: pick.as_ref().map(|c| c.cid).unwrap_or(0),
+                    apn: pick.as_ref().map(|c| c.apn.clone()).unwrap_or_default(),
+                    pdp_type: pick.as_ref().map(|c| c.pdp_type.clone()).unwrap_or_default(),
                     reconnect: false,
                     force: false,
                 };

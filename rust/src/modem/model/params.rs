@@ -135,41 +135,65 @@ impl Modem {
             return Err(msg("APN 只允许字母 / 数字与 . - _"));
         }
         let mut steps = Vec::new();
-        let cmd = format!("AT+CGDCONT={cid},\"{pdp_type}\",\"{apn}\"");
-        let resp = self.with_at_prio(Prio::Bulk, |p| p.command(&cmd, self.cmd_timeout))?;
-        if !is_ok(&resp) {
-            return Err(msg(format!("写入失败：{}", resp.trim())));
-        }
-        steps.push(format!("已下发 {cmd}"));
 
-        // 回读确认
+        // 幂等闸门：该 cid 已经是同 APN + 同类型时**跳过重写与重激活**。
+        //
+        // 为什么必须做：自动拨号守护在「PDP 已激活、主机链路还没就绪」的窗口里
+        // 会带着同一个 APN 反复走到这里 —— 不做幂等的话，每次都会先断后连，
+        // 30 秒拆一次正常会话（实测会话层看不出来，但流量/时延抖动真实存在）。
+        // 「写入」的语义应该是「确保配置如此」，而不是「无条件重来一遍」。
         let defined = self.at_cmd_prio(Prio::Bulk, "AT+CGDCONT?");
         let contexts = build_contexts(&defined, "");
-        let stored = contexts
+        let want_type = pdp_type.to_ascii_uppercase();
+        let unchanged = contexts
             .iter()
             .find(|c| c.cid == cid)
-            .map(|c| c.apn.clone());
-        if stored.as_deref() != Some(apn) {
-            return Err(msg(format!(
-                "模组回读了不一样的 APN（写入 {apn}，回读 {}）",
-                stored.unwrap_or_else(|| "空".to_string())
-            )));
-        }
-        steps.push("回读确认一致".to_string());
+            .map(|c| c.apn.eq_ignore_ascii_case(apn) && c.pdp_type.to_ascii_uppercase() == want_type)
+            .unwrap_or(false);
 
-        // 之前激活着的就先断后连，让新 APN 立即生效
-        let activated = self.at_cmd_prio(Prio::Bulk, "AT+CGACT?");
-        let was_active = build_contexts(&defined, &activated)
-            .iter()
-            .any(|c| c.cid == cid && c.active);
-        if was_active {
-            let _ = self.at_cmd_prio(Prio::Bulk, &format!("AT+CGACT=0,{cid}"));
-            let resp = self.at_cmd_prio(Prio::Bulk, &format!("AT+CGACT=1,{cid}"));
-            steps.push(if is_ok(&resp) {
-                "已重新激活该上下文（先断后连）".to_string()
-            } else {
-                format!("重新激活被拒：{}", resp.trim())
-            });
+        let was_active;
+        if unchanged {
+            steps.push(format!(
+                "cid {cid} 配置未变化（{pdp_type} {apn}），跳过重写（幂等）"
+            ));
+            was_active = contexts.iter().any(|c| c.cid == cid && c.active);
+        } else {
+            let cmd = format!("AT+CGDCONT={cid},\"{pdp_type}\",\"{apn}\"");
+            let resp = self.with_at_prio(Prio::Bulk, |p| p.command(&cmd, self.cmd_timeout))?;
+            if !is_ok(&resp) {
+                return Err(msg(format!("写入失败：{}", resp.trim())));
+            }
+            steps.push(format!("已下发 {cmd}"));
+
+            // 回读确认
+            let defined = self.at_cmd_prio(Prio::Bulk, "AT+CGDCONT?");
+            let contexts = build_contexts(&defined, "");
+            let stored = contexts
+                .iter()
+                .find(|c| c.cid == cid)
+                .map(|c| c.apn.clone());
+            if stored.as_deref() != Some(apn) {
+                return Err(msg(format!(
+                    "模组回读了不一样的 APN（写入 {apn}，回读 {}）",
+                    stored.unwrap_or_else(|| "空".to_string())
+                )));
+            }
+            steps.push("回读确认一致".to_string());
+
+            // 之前激活着的就先断后连，让新 APN 立即生效
+            let activated = self.at_cmd_prio(Prio::Bulk, "AT+CGACT?");
+            was_active = build_contexts(&defined, &activated)
+                .iter()
+                .any(|c| c.cid == cid && c.active);
+            if was_active {
+                let _ = self.at_cmd_prio(Prio::Bulk, &format!("AT+CGACT=0,{cid}"));
+                let resp = self.at_cmd_prio(Prio::Bulk, &format!("AT+CGACT=1,{cid}"));
+                steps.push(if is_ok(&resp) {
+                    "已重新激活该上下文（先断后连）".to_string()
+                } else {
+                    format!("重新激活被拒：{}", resp.trim())
+                });
+            }
         }
 
         // IMS 是 VoLTE / IMS 短信的前提，顺手拉起来；失败不影响本次写入
@@ -315,6 +339,18 @@ pub fn build_contexts(defined: &str, activated: &str) -> Vec<Context> {
         .collect()
 }
 
+/// 拨号用的 APN 上下文优选（**三方共用**：一键拨号 / 自动拨号守护 / 拨号器托管）。
+///
+/// 优先级：已激活且非 IMS 的 → 任意已定义且非 IMS 的 → None（调用方回落
+/// 「沿用模组配置 + 默认 cid」）。之前这段逻辑只活在前端一键拨号里，
+/// 自动拨号与托管 reconcile 拿不到 APN 时只能空手退避 —— MBIM 模组
+/// （拨号器没有 -s 直接退出）会陷入「算不出计划 → 5 秒退避 → 再来」的死循环，
+/// 死循环，明明模组里就存着可用的上下文。
+pub fn pick_dial_context(ctxs: &[Context]) -> Option<Context> {
+    let usable = || ctxs.iter().filter(|c| !c.internal && !c.apn.trim().is_empty());
+    usable().find(|c| c.active).cloned().or_else(|| usable().next().cloned())
+}
+
 /// 内部专用 APN（IMS / sos / mms）不上网。
 pub fn is_internal_apn(apn: &str) -> bool {
     let a = apn.to_ascii_lowercase();
@@ -354,7 +390,7 @@ pub fn cgact_state(resp: &str, cid: i32) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_contexts, cgact_state, is_internal_apn, valid_apn, valid_plmn_text};
+    use super::{build_contexts, cgact_state, is_internal_apn, pick_dial_context, valid_apn, valid_plmn_text, Context};
 
     #[test]
     fn merge_contexts() {
@@ -401,6 +437,27 @@ mod tests {
         assert!(valid_plmn_text("460011"));
         assert!(!valid_plmn_text("4601"));
         assert!(!valid_plmn_text("4601x"));
+    }
+
+    #[test]
+    fn pick_dial_context_prefers_active_then_any() {
+        let mk = |cid: i32, apn: &str, active: bool, internal: bool| Context {
+            cid,
+            pdp_type: "IPV4V6".into(),
+            apn: apn.into(),
+            active,
+            internal,
+        };
+        // 有已激活的非 IMS → 选它（哪怕排后面）
+        let ctxs = [mk(0, "", false, false), mk(3, "ims", true, true), mk(5, "cmnet", true, false)];
+        assert_eq!(pick_dial_context(&ctxs).unwrap().cid, 5);
+        // 没有已激活的 → 任意已定义非 IMS（选先出现的）
+        let ctxs = [mk(0, "", false, false), mk(2, "ims", true, true), mk(4, "3gnet", false, false)];
+        assert_eq!(pick_dial_context(&ctxs).unwrap().cid, 4);
+        // 全是 IMS / 空 APN → None（调用方回落默认）
+        let ctxs = [mk(0, "", false, false), mk(1, "ims", true, true)];
+        assert!(pick_dial_context(&ctxs).is_none());
+        assert!(pick_dial_context(&[]).is_none());
     }
 
     #[test]
