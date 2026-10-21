@@ -495,11 +495,14 @@ impl DialerSupervisor {
             return;
         }
 
-        // APN 三级回退（与一键拨号 / 自动拨号同一套优选语义，见
-        // `params::pick_dial_context`）：拨号状态里记的 → 上次手动拨号用的 →
-        // **模组里已配置的上下文**（走 15 秒缓存，代价可忽略）。
-        // 早先只有前两级：固件里存了 APN 但从没在页面上拨过的 MBIM 模组，
-        // 会陷入「算不出计划（缺 APN）→ 5 秒退避 → 再来」的死循环。
+        // APN 四级回退（与一键拨号 / 自动拨号同一套优选语义，见
+        // `params::pick_dial_context` 与 `apn_auto::decide`）：拨号状态里记的 →
+        // 上次手动拨号用的 → **模组里已配置的上下文**（走 15 秒缓存）→
+        // **按识别到的运营商下发预制 APN**（只读缓存证据，本线程不发 AT ——
+        // APN 作为拨号器参数直接进 WDS Start / MBIM CONNECT，会话建立即生效）。
+        // 早先只有前三级：固件里存了 APN 但从没在页面上拨过的 MBIM 模组，
+        // 会陷入「算不出计划（缺 APN）→ 5 秒退避 → 再来」的死循环；
+        // 而需要显式下发 APN 的模组（上下文为空）则永远拨不上。
         let apn = if st.apn.trim().is_empty() {
             let last = modem.last_dial_apn();
             if !last.is_empty() {
@@ -507,6 +510,11 @@ impl DialerSupervisor {
             } else {
                 crate::modem::model::pick_dial_context(&modem.params().contexts)
                     .map(|c| c.apn)
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| {
+                        let s = modem.auto_apn_suggestion();
+                        (!s.is_empty()).then_some(s)
+                    })
                     .unwrap_or_default()
             }
         } else {
@@ -646,18 +654,18 @@ impl DialerSupervisor {
         std::thread::spawn(move || {
             let _keep = guard; // 线程结束时（含 panic）自动清标记
             let sup = supervisor();
-            // APN 优选（与一键拨号同一套语义）：模组里已配置的上下文
-            // （已激活非 IMS 优先）直接用；没有才回落「沿用模组配置 + 默认 cid」。
-            // 放在工作线程里做：`params()` 是 AT 查询（15 秒缓存），不能在组网
-            // 循环里同步等它 —— 那会推迟其它模组的接口对账。
-            let pick = crate::modem::model::pick_dial_context(&m.params().contexts);
+            // APN 智能配置：识别运营商（COPS/QNWINFO）→ 需要时下发预制 APN
+            // （cmnet / 3gnet / ctnet / cbnet）→ 回读确认 → 才进拨号。
+            // 识别失败 / 用户显式配置 / 自定义 APN 一律沿用现状（见 apn_auto::decide）。
+            // 放在工作线程里做：这几条 AT 不能在组网循环里发（会推迟其它模组的接口对账）。
+            let prep = m.auto_apn_prepare();
+            if !prep.note.is_empty() {
+                log::info!("[auto-dial] modem #{} APN 准备：{}", m.id, prep.note);
+            }
             let req = crate::modem::model::DialRequest {
-                cid: pick.as_ref().map(|c| c.cid).unwrap_or(0),
-                apn: pick.as_ref().map(|c| c.apn.clone()).unwrap_or_default(),
-                pdp_type: pick
-                    .as_ref()
-                    .map(|c| c.pdp_type.clone())
-                    .unwrap_or_default(),
+                cid: prep.cid,
+                apn: prep.apn,
+                pdp_type: prep.pdp_type,
                 reconnect: false,
                 force: false,
             };

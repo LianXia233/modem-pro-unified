@@ -155,6 +155,18 @@ pub struct Modem {
     pub(super) sim_cooldown_until: Mutex<Option<Instant>>,
     /// 收到过注册态 URC ⇒ 该重查网络状态（`/api/network` 的缓存过期了）
     pub(super) net_dirty: std::sync::atomic::AtomicBool,
+    /// 运营商证据缓存（名称 / PLMN，见 model/apn_auto.rs 的 `CarrierEvidence`）。
+    ///
+    /// 由「网络状态查询」（`sync_dial_state`，采样循环每 3 秒有人看时一拍）与
+    /// 拨号前的轻量探测（`carrier_snapshot`）填充；原生拨号器托管在
+    /// 「协调器线程不发 AT」的约束下，识别运营商**只能**用这里存的事实。
+    pub(super) carrier_cache: Mutex<Option<super::apn_auto::CarrierEvidence>>,
+    /// 最近一次**自动下发**的 APN（见 model/apn_auto.rs 的 `AutoApnRecord`）。
+    ///
+    /// 用途：区分「我们写的」与「用户配置的」—— 运营商切换时只有前者
+    /// 允许被更新，用户的手动配置永远不动。内存态即可：重启后重新识别，
+    /// 决策结果等价（模组里已存的预制 APN 会被「同家预制」分支沿用）。
+    pub(super) auto_apn: Mutex<Option<super::apn_auto::AutoApnRecord>>,
 }
 
 /// 短信缓存：列表 + 未读数。
@@ -212,6 +224,8 @@ impl Modem {
             sim_checked_at: Mutex::new(None),
             sim_cooldown_until: Mutex::new(None),
             net_dirty: std::sync::atomic::AtomicBool::new(false),
+            carrier_cache: Mutex::new(None),
+            auto_apn: Mutex::new(None),
         }
     }
 
@@ -856,9 +870,13 @@ impl Modem {
             cur.iccid
         );
 
-        // 卡都换了：缓存的 ICCID/IMSI/号码整块作废，界面下次一读就是新卡
+        // 卡都换了：缓存的 ICCID/IMSI/号码整块作废，界面下次一读就是新卡；
+        // 「自动下发的 APN」记录与运营商证据同步作废 —— 新卡可能是别的
+        // 运营商，旧记录不能再作为「这个 APN 是我们写的」的证据，
+        // 下一次自动拨号会按新卡重新识别与校验（见 model/apn_auto.rs）。
         *self.imei_cache.lock().unwrap() = None;
         *self.sms.lock().unwrap() = None;
+        self.reset_auto_apn();
         if kind == super::sim::SIM_REMOVED {
             // 卡拔了：别让屏幕/网页还挂着旧卡那几条
             return kind.to_string();

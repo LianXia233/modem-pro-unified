@@ -4,9 +4,11 @@ mod addr;
 
 pub(crate) use addr::format_ipv6_bytes;
 mod airplane;
+pub mod apn_auto;
 mod band;
 mod bind;
 pub mod ca;
+pub mod carrier;
 mod cells;
 pub mod changes;
 mod device;

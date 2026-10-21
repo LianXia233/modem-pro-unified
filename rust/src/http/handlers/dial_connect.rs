@@ -30,12 +30,31 @@ pub(crate) fn dial_request_from_params(params: &HashMap<String, String>) -> Dial
     }
 }
 
+/// 表单三项全空时走**运营商感知的自动 APN**（识别 → 需要时下发预制 APN → 回读
+/// 确认 → 才拨号）。用户显式指定了任何一项就完全不介入 —— 手动配置优先。
+///
+/// 同步接口与异步任务共用（两条路径口径必须一致）。会发几条 AT（COPS / QNWINFO /
+/// CGCONTRDP，按需再加 CGDCONT），手动拨号本来就是同步长操作，可接受。
+pub(crate) fn apply_auto_apn(modem: &crate::modem::model::Modem, req: &mut DialRequest) {
+    if !req.apn.trim().is_empty() || req.cid > 0 || !req.pdp_type.trim().is_empty() {
+        return;
+    }
+    let prep = modem.auto_apn_prepare();
+    if !prep.note.is_empty() {
+        log::info!("手动拨号 modem #{} APN 准备：{}", modem.id, prep.note);
+    }
+    req.apn = prep.apn;
+    req.cid = prep.cid;
+    req.pdp_type = prep.pdp_type;
+}
+
 pub fn handle(mut req: Request, state: &AppState, query: &HashMap<String, String>) -> Result<()> {
     let params = request::merge_form(query, &request::read_body(&mut req));
     let Some(modem) = modem_by_query(state, &params) else {
         return response::fail(req, -1, "modem not found");
     };
-    let dial_req = dial_request_from_params(&params);
+    let mut dial_req = dial_request_from_params(&params);
+    apply_auto_apn(&modem, &mut dial_req);
     match modem.dial(&dial_req, state.dial_enabled(), state.cfg.dial.activate_ims) {
         Ok(st) => {
             // QMI/MBIM 只是「交办」：会话由拨号协调器建。立刻踢一轮，

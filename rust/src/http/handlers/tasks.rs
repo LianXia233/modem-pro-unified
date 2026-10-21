@@ -280,7 +280,9 @@ fn handle_post(
         "dial.connect" => {
             let m = modem.clone();
             let st = state.clone();
-            let dial_req = super::dial_connect::dial_request_from_params(&params);
+            let mut dial_req = super::dial_connect::dial_request_from_params(&params);
+            // 表单三项全空时走运营商感知的自动 APN（与同步接口同口径）
+            super::dial_connect::apply_auto_apn(&m, &mut dial_req);
             let enabled = state.dial_enabled();
             let ims = state.cfg.dial.activate_ims;
             tasks.submit(spec, move |t| {

@@ -1906,6 +1906,10 @@ impl Modem {
     /// 周期推送里那段查询顺手同步过来就行，页面不用为了这几个字段再占一次串口。
     /// 只在已拨号（拨号中/已连接）时同步；没拨过号就不去动状态。
     pub fn sync_dial_state(&self, st: &super::network::NetworkStatus) {
+        // 运营商证据顺手入缓存：原生拨号器托管（reconcile_native_one）在
+        // 「协调器线程不发 AT」的约束下，识别运营商只能用这里存的事实
+        // （名称 / PLMN，带时间戳；过期证据不用于 APN 决策）。
+        self.note_carrier_evidence(st);
         // 模组上报的本机地址与"我们有没有拨过号"无关：设备可能是在开机前就由
         // 别的路径（厂商脚本 / 上次会话）激活了 PDP。组网（`netprov`）正是靠这份
         // 地址给 350 系列配 static 接口 —— 早先整段被 `state != CONNECTED` 挡住，
