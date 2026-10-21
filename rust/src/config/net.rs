@@ -2,6 +2,21 @@
 
 use serde::Deserialize;
 
+/// 强制下发的默认 DNS（**顺序即优先级**：IPv4 首选 / IPv4 备选 / IPv6 首选 / IPv6 备选）。
+///
+/// | 族 | 首选 | 备选 |
+/// | --- | --- | --- |
+/// | IPv4 | `119.29.29.29`（DNSPod） | `223.5.5.5`（阿里） |
+/// | IPv6 | `2402:4e00::`（DNSPod） | `2400:3200::1`（阿里） |
+///
+/// 选这两家而不是海外公共 DNS：蜂窝链路的出口在国内，解析延迟与劫持风险都更低；
+/// 两家都提供 Anycast 的 v4 + v6 双栈，任何一族不可用都有同族的备选顶上。
+///
+/// ⚠️ 改这里要同步三处：本常量、`files/etc/modemd/config.toml` 的 `[net] wan_dns`
+/// 注释、以及 `docs/DIAL_STATE_MACHINE.md` 里提到默认值的地方。
+/// 老机器升级后配置文件里没有这一行也走本常量（`config.toml` 是 conffile，升级不覆盖）。
+pub const DEFAULT_WAN_DNS: &str = "119.29.29.29 223.5.5.5 2402:4e00:: 2400:3200::1";
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct NetConfig {
@@ -21,12 +36,16 @@ pub struct NetConfig {
     pub lan_ipv6: bool,
     pub wan_metric: i64,
     pub wan_zone: String,
-    /// 强制下发到 WAN 接口的 DNS（空格分隔；默认 `223.5.5.5 119.29.29.29`）。
+    /// 强制下发到 WAN 接口的 DNS（空格分隔；默认见 [`DEFAULT_WAN_DNS`]）。
     ///
     /// 蜂窝链路 DHCP 常拿不到 DNS（FM350 系列 RNDIS 尤其如此），导致
     /// `resolv.conf.auto` 为空、域名解析全 REFUSED。插件组网时把它写进
     /// `network.modem<id>.dns`，netifd 拉起接口即经 `interface_add_dns_server`
-    /// 下发到 resolv.conf.auto。取值 `off` / `none` = 不强制，用运营商/DHCP DNS。
+    /// 下发到 resolv.conf.auto（netifd 这一个入口同时认 v4 与 v6 地址）。
+    /// 取值 `off` / `none` / `carrier` = 不强制，用运营商/DHCP DNS。
+    ///
+    /// ⚠️ IPv6 那两条只在 `[net] wan_ipv6` 打开时才下发 —— 链路没有 IPv6
+    /// 时写进 resolv.conf 只会多出两个永远不回应的 nameserver。
     pub wan_dns: String,
     pub dial_enabled: bool,
     pub allow_roaming: bool,
@@ -46,7 +65,7 @@ impl Default for NetConfig {
             lan_ipv6: true,
             wan_metric: 20,
             wan_zone: "wan".to_string(),
-            wan_dns: "223.5.5.5 119.29.29.29".to_string(),
+            wan_dns: DEFAULT_WAN_DNS.to_string(),
             dial_enabled: true,
             allow_roaming: true,
         }
@@ -74,9 +93,10 @@ impl NetConfig {
         if self.host_dial_bin.trim().is_empty() {
             self.host_dial_bin = "native".to_string();
         }
-        // DNS 强制下发：空值回落默认（两个公共 DNS）；off/none = 不强制。
+        // DNS 强制下发：空值回落默认（v4 首选/备选 + v6 首选/备选，见 DEFAULT_WAN_DNS）；
+        // off / none / carrier = 不强制，用运营商或 DHCP 给的 DNS。
         match self.wan_dns.trim().to_ascii_lowercase().as_str() {
-            "" => self.wan_dns = "223.5.5.5 119.29.29.29".to_string(),
+            "" => self.wan_dns = DEFAULT_WAN_DNS.to_string(),
             "off" | "none" | "carrier" => self.wan_dns = String::new(),
             _ => self.wan_dns = self.wan_dns.trim().to_string(),
         }

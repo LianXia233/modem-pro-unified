@@ -29,7 +29,7 @@ use serde::Deserialize;
 pub use dial::DialConfig;
 pub use duration::parse_duration;
 pub use loader::{default_log_file, default_pid_file, load};
-pub use net::NetConfig;
+pub use net::{NetConfig, DEFAULT_WAN_DNS};
 pub use ntp::NtpConfig;
 pub use quota::{QuotaConfig, ACTION_BLOCK, ACTION_BLOCK_RF, ACTION_WARN};
 pub use serial::SerialConfig;

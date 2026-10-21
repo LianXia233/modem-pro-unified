@@ -192,8 +192,61 @@ pub struct PlannedIface {
     /// 强制下发的 DNS（空格分隔；空 = 不写 `dns` 项）。
     ///
     /// 只对主接口有意义 —— DNS 跟着默认路由走，v6 兄弟接口不配 v4 DNS。
-    /// 值由 provision 从 `[net] wan_dns` 注入（默认 `223.5.5.5 119.29.29.29`）。
+    /// 值由 provision 从 `[net] wan_dns` 经 [`effective_wan_dns`] 注入
+    /// （默认 `119.29.29.29 223.5.5.5 2402:4e00:: 2400:3200::1`）。
     pub dns: String,
+}
+
+/// 已被**别的**接口占用的网卡（`pick_device` 的排除名单）。
+///
+/// ⚠️ 关键：本模组自己的接口（`modem<id>` / `modem<id>_6`）**不算占用**。
+/// 第一轮把 `modem0.device` 写成 `wwan0` 之后，现状里就多了 `device=wwan0`
+/// 这一条；若把它也算「被占用」，下一轮 `pick_device` 会跳过 wwan0 落到全局
+/// 兜底（`detect_data_dev`），随手抓一张 `eth2` 或**另一台模组的** `wwan1`
+/// —— diff 于是下发 `set modem0.device=…`，接口漂到别的网卡上直接断网。
+/// 「占用」的语义是「别人在用」：自己占的不算。
+pub fn occupied_by_others(existing: &[ExistingIface], modem_id: u32) -> Vec<String> {
+    let mine = [iface_name(modem_id), iface_name_v6(modem_id)];
+    existing
+        .iter()
+        .filter(|e| !mine.contains(&e.name))
+        .map(|e| e.device.trim().trim_start_matches('@').to_string())
+        .filter(|d| !d.is_empty())
+        .collect()
+}
+
+/// 数据网卡还没探到时该不该建接口（纯策略）。
+///
+/// 返回 `Some(理由)` = 跳过本轮 UCI 操作。没有 `device` 的接口会被 netifd 判
+/// `NO_DEVICE`，`modem_pro.sh` 随即 `proto_block_restart` —— 那是一张起不来、
+/// 还会挡住后续 ifup 的坏接口，不如等网卡出现后再建。
+/// 接口**已经存在**时不跳过（沿用现状里的 device，其余项照常对齐）。
+pub fn skip_without_device(device: &str, iface_exists: bool) -> Option<&'static str> {
+    if !device.trim().is_empty() || iface_exists {
+        return None;
+    }
+    Some("数据网卡还没探到，暂不建接口（避免建出 NO_DEVICE 的坏接口）")
+}
+
+/// 本次真正下发的强制 DNS（纯函数，无 IO）。
+///
+/// 唯一做的事：`[net] wan_ipv6` 关着时**剔掉 IPv6 那几条**。理由 ——
+/// 链路没有 IPv6（不建 v6 兄弟接口、拿不到 v6 地址）时，把 `2402:4e00::`
+/// 这类地址写进 `network.modem<id>.dns` 只会给 `resolv.conf.auto` 添两个
+/// 永远不回应的 nameserver；解析库按顺序试，最坏情况是每次查询都先等一轮超时。
+///
+/// 判据只看「值里有没有冒号」（IPv6 的必要条件），不做地址合法性校验 ——
+/// 非法值由 netifd 的 `interface_add_dns_server` 自己丢掉，本程序不该
+/// 悄悄把用户手填的值改掉或吞掉。
+///
+/// 空 / 只含 IPv6 且关着 v6 ⇒ 返回空串（调用方解释为「不写 dns 项」，
+/// 与 `wan_dns = off` 同义）。
+pub fn effective_wan_dns(cfg_dns: &str, wan_ipv6: bool) -> String {
+    let entries: Vec<&str> = cfg_dns
+        .split_whitespace()
+        .filter(|s| wan_ipv6 || !s.contains(':'))
+        .collect();
+    entries.join(" ")
 }
 
 /// 一个模组的组网计划。
@@ -1502,7 +1555,95 @@ mod tests {
         }
     }
 
+    // ---------- 数据网卡的「被占用」名单与空 device 保护 ----------
+
+    #[test]
+    fn occupied_excludes_the_modems_own_interfaces() {
+        // 第二轮起 `existing` 里就有我们自己建的 modem0（device=wwan0）；
+        // 把它算成「被占用」会让 pick_device 跳过 wwan0 去抓别的网卡。
+        let cur = vec![
+            ExistingIface {
+                name: "lan".into(),
+                device: "br-lan".into(),
+                ..Default::default()
+            },
+            ExistingIface {
+                name: "wan".into(),
+                device: "eth1".into(),
+                ..Default::default()
+            },
+            ExistingIface {
+                name: "modem0".into(),
+                device: "wwan0".into(),
+                ..Default::default()
+            },
+            ExistingIface {
+                name: "modem0_6".into(),
+                device: "@modem0".into(),
+                ..Default::default()
+            },
+            ExistingIface {
+                name: "modem1".into(),
+                device: "wwan1".into(),
+                ..Default::default()
+            },
+        ];
+        let occ = occupied_by_others(&cur, 0);
+        assert_eq!(
+            occ,
+            vec![
+                "br-lan".to_string(),
+                "eth1".to_string(),
+                "wwan1".to_string()
+            ],
+            "自己的 wwan0 / @modem0 不算占用；另一台模组的 wwan1 仍要排除"
+        );
+    }
+
+    #[test]
+    fn skip_without_device_only_when_iface_is_missing() {
+        // 网卡没探到 + 接口不存在 ⇒ 跳过（否则建出 NO_DEVICE 的坏接口）
+        assert!(skip_without_device("", false).is_some());
+        assert!(skip_without_device("   ", false).is_some());
+        // 有网卡 ⇒ 正常往下走
+        assert!(skip_without_device("wwan0", false).is_none());
+        // 接口已在（只是这轮没探到网卡）⇒ 沿用现状，别把已有配置晾着
+        assert!(skip_without_device("", true).is_none());
+    }
+
     // ---------- DNS 强制下发（`[net] wan_dns`） ----------
+
+    /// 默认下发值（v4 首选 / v4 备选 / v6 首选 / v6 备选）。
+    const DEFAULT_DNS: &str = "119.29.29.29 223.5.5.5 2402:4e00:: 2400:3200::1";
+
+    #[test]
+    fn default_is_the_documented_four_servers() {
+        use crate::config::DEFAULT_WAN_DNS;
+        // 配置层与策略层的默认值必须是同一串（改一处忘另一处 = 文档与实机不一致）
+        assert_eq!(DEFAULT_WAN_DNS, DEFAULT_DNS);
+    }
+
+    #[test]
+    fn effective_wan_dns_drops_v6_when_ipv6_is_off() {
+        // 开 IPv6：四条全下发，顺序不变
+        assert_eq!(effective_wan_dns(DEFAULT_DNS, true), DEFAULT_DNS);
+        // 关 IPv6：只留两条 v4（顺序保持「首选在前」）
+        assert_eq!(
+            effective_wan_dns(DEFAULT_DNS, false),
+            "119.29.29.29 223.5.5.5"
+        );
+        // 用户手填的单条 / 多余空白都不受影响（地址用文档段 203.0.113.0/24，
+        // 免得把真实公共 DNS 写进夹具 —— 仓库脱敏守门会拦）
+        assert_eq!(
+            effective_wan_dns("  203.0.113.53   203.0.113.54 ", true),
+            "203.0.113.53 203.0.113.54"
+        );
+        // 只填了 v6、又关着 v6 ⇒ 空（调用方解释为「不写 dns 项」，同 off）
+        assert_eq!(effective_wan_dns("2402:4e00::", false), "");
+        // off / 空值仍是空
+        assert_eq!(effective_wan_dns("", true), "");
+        assert_eq!(effective_wan_dns("   ", false), "");
+    }
 
     #[test]
     fn diff_forces_and_updates_wan_dns() {
@@ -1517,11 +1658,11 @@ mod tests {
             false,
             "10.42.0.16",
         );
-        p.ifaces[0].dns = "223.5.5.5 119.29.29.29".to_string();
+        p.ifaces[0].dns = DEFAULT_DNS.to_string();
 
         // 1) 新建接口：应写 dns
         let ops = diff_plan(&[], &p, FIREWALL_ZONE, "firewall.wan");
-        assert_set(&ops, "modem0", "dns", "223.5.5.5 119.29.29.29");
+        assert_set(&ops, "modem0", "dns", DEFAULT_DNS);
 
         // 2) 已配好同值：零写入（每轮组网循环不重复动手）
         let cur = vec![ExistingIface {
@@ -1533,7 +1674,7 @@ mod tests {
             ipaddr: "10.42.0.16".into(),
             netmask: "255.255.255.0".into(),
             gateway: "10.42.0.1".into(),
-            dns: "223.5.5.5 119.29.29.29".into(),
+            dns: DEFAULT_DNS.into(),
             zones: vec![FIREWALL_ZONE.into()],
             ..Default::default()
         }];
@@ -1541,9 +1682,9 @@ mod tests {
 
         // 3) 值变了：更新
         let mut cur2 = cur.clone();
-        cur2[0].dns = "8.8.8.8".into();
+        cur2[0].dns = "203.0.113.53".into();
         let ops = diff_plan(&cur2, &p, FIREWALL_ZONE, "firewall.wan");
-        assert_set(&ops, "modem0", "dns", "223.5.5.5 119.29.29.29");
+        assert_set(&ops, "modem0", "dns", DEFAULT_DNS);
 
         // 4) 计划不强制（carrier 模式）：清掉现状里的 dns
         let mut p_off = plan_wan(

@@ -38,6 +38,10 @@ pub fn handle(mut req: Request, state: &AppState, query: &HashMap<String, String
     let dial_req = dial_request_from_params(&params);
     match modem.dial(&dial_req, state.dial_enabled(), state.cfg.dial.activate_ims) {
         Ok(st) => {
+            // QMI/MBIM 只是「交办」：会话由拨号协调器建。立刻踢一轮，
+            // 别让用户（或任务线程之外的调用方）等下一次 15 秒节拍。
+            // AT 路径此时已经连上，踢一轮是空操作（`starting` 保证不重复建会话）。
+            crate::runtime::dialer::supervisor().kick();
             push_dial(state, &st);
             push_network(state, &modem);
             response::ok_msg(

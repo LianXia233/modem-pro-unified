@@ -296,3 +296,52 @@
 
 数据面无需迁移：`DialState` 是内存态、`quota.json` 等台账格式未变；
 `backend` 是新增可选字段，回滚后旧代码不会读到它。
+
+---
+
+## 10. 第二轮自检（2026-10-21）：「识别到支持的模块却拨不上 / 接口配歪」
+
+统一之后又从头走了一遍「模组插入 → 自动拨号 → 接口拉起 → 地址/DNS 落地」这条链，
+下面 5 条是本轮新发现的问题（都有代码证据），全部已修。统一状态机本身**没有**再发现
+设计缺陷 —— 问题都在它的**接入点**与**接口侧**。
+
+| # | 现象 | 根因 | 修复 |
+| --- | --- | --- | --- |
+| R1 | QMI/MBIM 在页面上点「拨号」后要干等最多 15 秒才变 `connected` | 只有异步任务 `dial.connect` 调了 `kick()`，**同步接口** `/api/dial/connect` 没有（§3.4 写的行为没落地） | `DialerSupervisor` 新增 `arm(Arc<AppState>)`，`kick()` 不再需要入参；`spawn_all` 装配后 `arm`，`dial_connect::handle` 成功后 `kick()` |
+| R2 | 接口 `device` 漂到别的网卡（`eth2` / 另一台模组的 `wwan1`）⇒ 断网 | `pick_device` 的排除名单把**本模组自己的接口**也算「被占用」：第一轮写完 `modem0.device=wwan0` 后，第二轮起 wwan0 被自己占着 ⇒ 跳过 ⇒ 落到全局兜底 `detect_data_dev` | 新增 `occupied_by_others()`：排除 `modem<id>` / `modem<id>_6` 自己占用的口 |
+| R3 | 网卡还没枚举出来就建了一张没有 `device` 的接口 | device 为空时照常 `Create`；netifd 判 `NO_DEVICE`，`modem_pro.sh` 随即 `proto_block_restart` —— 起不来还会挡后续 ifup | 新增 `skip_without_device()`：无 device 且接口不存在 ⇒ 本轮不动 UCI（接口已存在则沿用现状） |
+| R4 | 从未拨号的 QMI 模组点「断开」：报错、状态不变、过一会儿自己又连上 | `hangup` 用 `cached_dial_kind()`：没拨过号时 kind 是空串 ⇒ 走 AT 分支发 `AT+CGACT=0` ⇒ 模组侧没我们激活的上下文、指令被拒 ⇒ 不置 `idle` / `manual_stop` | `hangup` 改用 `ensure_dial_kind()`（探不到才回落 AT 配方） |
+| R5 | 用户点「断开」后页面短暂显示 `idle`，下一拍又变回 `connected` | `dial_status` ③ 只看「网卡有没有地址」：断开后旧地址要等 netifd 收尾才掉，期间被改判成 connected | ③（改判）与 ②（补地址）都加 `!manual_stop` 门禁 —— 用户刚断开就不再按残留地址推断 |
+
+### 10.1 拨号器与组网必须拨/绑同一张网卡
+
+`pick_device` 的文档里写着「拨号器托管（`runtime/dialer`）也要用它，两边必须是同一个
+网卡」—— 但两边**入参不同**（组网要排除被占用的口、拨号器传空排除名单），同一台模组
+完全可能算出两个结果。QMAP 下「接口绑 `wwan0_1`、拨号器把呼叫建到 `wwan0`」= 父口永远
+NO-CARRIER、地址出不来。
+
+修法：组网每轮把选中的网卡记进 `PLANNED_DEVICE`（`remember_device`），拨号器改走
+`device_for()`（优先跟随，没跑过组网才自己选）；模组回收时 `forget_device`
+（id 会被新模组复用，旧网卡名不能留给下一位）。
+
+### 10.2 接口强制下发的 DNS（`[net] wan_dns`）
+
+| 族 | 首选 | 备选 |
+| --- | --- | --- |
+| IPv4 | `119.29.29.29` | `223.5.5.5` |
+| IPv6 | `2402:4e00::` | `2400:3200::1` |
+
+- 默认值在 `config::net::DEFAULT_WAN_DNS`；`config.toml` 是 conffile（升级不覆盖），
+  所以**没有 `wan_dns` 这一行的老机器也走新默认值**（配置里保留了可直接取消注释的模板）。
+- netifd 的 `interface_add_dns_server()` 对 v4 / v6 是同一个入口，IPv6 地址无需特殊写法。
+- `wan_ipv6 = false` 时**不下发** v6 那两条（`effective_wan_dns`）：链路没有 IPv6，
+  写进 `resolv.conf.auto` 只会多两个永远不回应的 nameserver。
+- `off` / `none` / `carrier` = 不强制，用运营商或 DHCP 给的 DNS。
+
+### 10.3 本轮测试
+
+`cargo test --locked` **764 passed**（新增 5 项：`occupied_by_others` 不含自己、
+`skip_without_device` 只在接口缺失时生效、`effective_wan_dns` 的 v6 裁剪、
+默认值与配置常量一致、拨号器跟随组网选中的网卡）；clippy 0 warning、`cargo fmt` 干净。
+仍需实机验证的（本沙箱无模组、无 OpenWrt）：R2/R3 在多网卡机器上的接口稳定性、
+R1 的「点拨号 → ≤3 秒 connected」、R4 在从未拨号的 QMI 模组上的断开行为。

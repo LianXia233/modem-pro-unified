@@ -1714,7 +1714,9 @@ impl Modem {
 
         // ② 补地址。只查**这一块**网卡（带 5 秒缓存），
         //    不再遍历 `dial_iface_snapshot()` 的所有候选 —— 那会 N 次 fork。
-        if st.host_ips.is_empty() && !st.host_iface.is_empty() {
+        //    `manual_stop`（用户刚断开）时不补：网卡上的旧地址要等 netifd 收尾才掉，
+        //    补回来会让页面在「已断开」的同时顶着上一个会话的地址，看着像没断开。
+        if st.host_ips.is_empty() && !st.host_iface.is_empty() && !st.manual_stop {
             st.host_ips = iface_addrs_cached(&st.host_iface);
         }
 
@@ -1728,7 +1730,13 @@ impl Modem {
         //
         //    判据刻意**不看** `operstate == up`：接口 UP 只说明链路层在，
         //    不代表拿到了地址（DHCP 失败、静态配置写错都会 UP 但没 IP）。
-        if st.state == DIAL_IDLE {
+        //
+        //    ⚠️ `manual_stop`（用户刚点过「断开」）必须挡在门外：断开后网卡上的
+        //    地址不会立刻消失（netifd 的 teardown 与我们的 `flush_stale` 都要
+        //    几十毫秒到几秒），而这里只看「网卡有没有地址」—— 不挡的话，
+        //    用户点断开后页面显示 idle，下一拍又被改判成 connected，
+        //    看上去就是「断开没生效、自己又连上了」。
+        if st.state == DIAL_IDLE && !st.manual_stop {
             st.state = if st.host_iface.is_empty() {
                 // 连该看哪块网卡都不知道（模组没插好 / 驱动没绑）
                 DIAL_UNKNOWN.to_string()
@@ -2582,7 +2590,7 @@ impl Modem {
         //    早先走 `pick_dial_iface(&dial_iface_snapshot())` 的名字匹配，
         //    实机翻车：RNDIS 模组的数据口是 eth2（挂在模组 USB 接口上），
         //    而名字匹配把 SoC 有线口 eth1 认了进去 —— 页面「主机网卡接口 /
-        //    已分配 IPv4」显示的是主路由 LAN 的 eth1 + 192.168.88.x，
+        //    已分配 IPv4」显示的是主路由 LAN 的 eth1 + 192.168.1.x，
         //    与模组毫无关系。数据口一定挂在模组自己的 USB 接口上，
         //    `usb_netifs_for_port` 按 sysfs 归属枚举，天然排除了板载口。
         let usb_names = usb_netifs_for_port(&self.port());
@@ -2680,8 +2688,16 @@ impl Modem {
             return Err(msg(format!("cid 必须在 0~42 之间，当前 {cid}")));
         }
 
-        // QMI/MBIM：数据呼叫归主机侧拨号器，模组侧本来就没有我们激活的上下文
-        if wan_host_dial_by_daemon(&self.cached_dial_kind()) {
+        // QMI/MBIM：数据呼叫归主机侧拨号器，模组侧本来就没有我们激活的上下文。
+        //
+        // ⚠️ 这里必须是 `ensure_dial_kind()` 而不是 `cached_dial_kind()`：后者只在
+        // 「拨过号 / 页面拉过 `/api/dial`」之后才有值。**从未拨号的** QMI 模组点
+        // 「断开」时 kind 是空串，会掉进下面的 AT 分支去发 `AT+CGACT=0` ——
+        // 模组侧上下文不是我们激活的，指令通常被拒 ⇒ `hangup` 直接返回 Err，
+        // 状态**不置 idle、也不置 manual_stop**，协调器下一轮又把会话建回来，
+        // 用户看到的是「点了断开，过一会儿自己又连上了」。
+        let kind = self.ensure_dial_kind();
+        if wan_host_dial_by_daemon(&kind) {
             self.dial_update(|s| {
                 s.state = DIAL_IDLE.to_string();
                 s.state_text = dial_state_text(DIAL_IDLE);
@@ -2709,7 +2725,6 @@ impl Modem {
         // ECM/RNDIS/NCM：断开必须和激活走**同一套配方**（见 `vendor::datacall`）。
         // 早先只会发 AT+CGACT=0：移远/华为/美格那几家根本不断开数据通道，
         // 网卡还在、模组还在往主机送包，页面上却显示「已断开」。
-        let kind = self.cached_dial_kind();
         let plan = self.data_channel_for(&kind, cid);
         let mut steps: Vec<datacall::AtStep> = plan.deactivate.clone();
         // 华为展锐自拨：先问模组「自拨开着吗」，再决定要不要 CFUN 循环。

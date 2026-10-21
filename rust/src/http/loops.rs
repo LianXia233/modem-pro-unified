@@ -30,6 +30,9 @@ const LOG_INTERVAL: u64 = 1;
 
 /// 起全部后台循环（`http::serve` 装配完 `AppState` 后调用一次）。
 pub fn spawn_all(state: &Arc<AppState>) {
+    // 拨号协调器先挂上 AppState：之后任何入口（同步接口 / 异步任务 /
+    // 开关变化）都能 `kick()` 立刻跑一轮协调，不必等 15 秒节拍。
+    crate::runtime::dialer::supervisor().arm(state.clone());
     spawn_urc(state, URC_INTERVAL);
     spawn_netprov(state, NETPROV_INTERVAL);
     // 拨号决策（含 AT 路径的自动重拨）已全部并入 netprov 循环里的

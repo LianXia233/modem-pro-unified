@@ -197,6 +197,25 @@ wan_zone = "wan"
 # 由 netifd 的 odhcp6c 把运营商 /64 经 odhcpd 继续委派给 LAN（内网设备拿到公网地址）。
 # 不想让内网走模组的 IPv6（比如另用隧道）就改成 false。
 lan_ipv6 = true
+# 自动建/对齐 WAN 接口时**强制下发**的 DNS（空格分隔，顺序即优先级）。
+# 写进 `network.modem<id>.dns`，netifd 拉起接口即下发到 resolv.conf.auto ——
+# 蜂窝链路（尤其 FM350 系列 RNDIS）的 DHCP 常年不给 DNS，不写这项就是
+# resolv.conf.auto 为空、域名解析全 REFUSED。
+#
+#   默认值：119.29.29.29 223.5.5.5 2402:4e00:: 2400:3200::1
+#     IPv4 首选 119.29.29.29（DNSPod）   IPv4 备用 223.5.5.5（阿里）
+#     IPv6 首选 2402:4e00::（DNSPod）    IPv6 备用 2400:3200::1（阿里）
+#
+#   · 两家都提供 Anycast 双栈，任何一族不可用都有同族的备选顶上；
+#     选国内而不选海外公共 DNS 是因为蜂窝出口在国内，延迟与劫持风险都更低。
+#   · 关掉上面的 `wan_ipv6` 时，IPv6 那两条会**自动不下发**（链路没有 v6，
+#     写进 resolv.conf 只会多两个永远不回应的 nameserver）。
+#   · 想改用运营商 / DHCP 给的 DNS：整行写成 `wan_dns = "off"`
+#     （`none` / `carrier` 同义）。留空 = 用上面的默认值。
+#   · 只写主接口 `modem<id>`，v6 兄弟接口不配（DNS 跟着默认路由走）。
+#   ⚠️ 这是 conffile：老机器升级**不会**覆盖本文件；没写这一行时同样按上面的
+#      默认值下发（默认值在代码里，改代码才改得动）。
+# wan_dns = "119.29.29.29 223.5.5.5 2402:4e00:: 2400:3200::1"
 
 # 说明：上游的 `qmi_proto` / `qmi_v6_sibling` / `v6_fix_models` / `lan6_fix_models`
 # 未移植到本实现 —— 等价场景由 `wan_mode`（接口形态）+ `wan_ipv6_mode`（取址方式）+

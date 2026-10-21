@@ -14,7 +14,7 @@
 //!   时间戳刷成「刚改过」，触发无谓的 network reload。
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use serde::Serialize;
 
@@ -24,7 +24,10 @@ use crate::modem::model::{usb_netifs_for_port, Modem};
 
 use super::uci;
 use super::v6::{self, V6Mode};
-use super::{diff_plan, plan_wan, ExistingIface, UciOp, V6Plan, FIREWALL_ZONE};
+use super::{
+    diff_plan, effective_wan_dns, iface_name, occupied_by_others, plan_wan, skip_without_device,
+    ExistingIface, UciOp, V6Plan, FIREWALL_ZONE,
+};
 
 /// 一次组网的结果（`/api/dial` 的 `auto_wan` 字段 + 日志）。
 #[derive(Debug, Clone, Serialize, Default)]
@@ -119,34 +122,38 @@ pub fn provision_modem_with(
     rep.mode = mode.as_str().to_string();
 
     // ④ device：按**这个模组的 USB 设备**取网卡，不用全局扫描；
-    //    已被别的接口（lan / wan / br-lan…）占用的口一律排除 —— 不能把用户正在上网的
+    //    已被**别的**接口（lan / wan / br-lan…）占用的口一律排除 —— 不能把用户正在上网的
     //    口当成数据口配掉（实机：eth0 是 LAN、eth1 是 WAN，数据口是 eth2）。
-    let occupied: Vec<String> = existing
-        .iter()
-        .map(|e| e.device.trim().trim_start_matches('@').to_string())
-        .filter(|d| !d.is_empty())
-        .collect();
+    //
+    //    ⚠️ 排除名单里**不能有本模组自己的接口**（`modem<id>` / `modem<id>_6`）：
+    //    第一轮建好 `modem0.device=wwan0` 之后，`existing` 里就有了 `device=wwan0`
+    //    这一条；若把它也算「被占用」，`pick_device` 第二轮起就会跳过 wwan0 落到
+    //    全局兜底（`detect_data_dev`）—— 那会随手抓一张 `eth2` 或**另一台模组的**
+    //    `wwan1`，diff 于是下发 `set modem0.device=…`，接口漂到别的网卡上直接断网。
+    //    「占用」的语义是「别人在用」，自己占的不算。
+    let occupied: Vec<String> = occupied_by_others(existing, modem.id);
     let device = pick_device(modem, &occupied);
-    if device.is_empty() {
-        // 两种完全不同的原因，不能都说成「sysfs 里没有 net/」——
-        // 实机上最常见的是**第二种**（用户已经手工配了 modem0 proto=static device=eth2），
-        // 而提示写成第一种会把人引去查驱动，白折腾。
+    // 数据网卡还没枚举出来（模组刚插上 / 驱动还没建 netdev）时**不建接口**：
+    // 详见 [`super::skip_without_device`]。
+    let iface_exists = existing.iter().any(|e| e.name == iface_name(modem.id));
+    if let Some(why) = skip_without_device(&device, iface_exists) {
         let owned = usb_netifs_for_port(&modem.port());
-        let reason = if owned.is_empty() {
-            "没能确定这个模组的数据网卡（sysfs 里没有 net/ 子目录）"
+        let detail = if owned.is_empty() {
+            "sysfs 里还没有 net/ 子目录".to_string()
         } else {
-            // 有网卡，但都已在 existing 里 → 说明用户自己配过了，本程序不该再插一手
-            rep.skipped.push(format!(
-                "数据网卡 {} 已被现有接口占用（{}, 符合预期，不重复建）",
+            format!(
+                "{} 已存在但都被别的接口占用（{}）",
                 owned.join("/"),
                 occupied.join("/")
-            ));
-            ""
+            )
         };
-        if !reason.is_empty() {
-            rep.skipped.push(reason.to_string());
-        }
+        rep.skipped
+            .push(format!("{why}（模组 {}：{detail}）", modem.id));
+        return rep;
     }
+    // 记下本轮选中的网卡：拨号器托管（`runtime/dialer`）必须拨同一张，
+    // 否则「UCI 绑 A 口、拨号器拨 B 口」= 永远拿不到地址（见 [`device_for`]）。
+    remember_device(modem.id, &device);
 
     // 350 系列（FM350 / RW350）的 USB 网卡不发 DHCP ⇒ 用模组上报的地址直接配 static
     // （参考实现同口径：RNDIS 点对点，地址可直接落在主机网卡上）。
@@ -223,11 +230,12 @@ pub fn provision_modem_with(
         state.cfg.net.host_dial,
         &static_ipv4,
     );
-    // 强制下发 DNS（`[net] wan_dns`，默认 223.5.5.5 119.29.29.29）：只注入主接口，
-    // v6 兄弟接口不配 v4 DNS。蜂窝链路 DHCP 常拿不到 DNS（FM350 尤其如此），
+    // 强制下发 DNS（`[net] wan_dns`，默认 `119.29.29.29 223.5.5.5 2402:4e00:: 2400:3200::1`）：
+    // 只注入主接口，v6 兄弟接口不配 v4 DNS。蜂窝链路 DHCP 常拿不到 DNS（FM350 尤其如此），
     // 写进 network.modem<id>.dns 后 netifd 拉起接口即下发到 resolv.conf.auto。
+    // 关掉 IPv6 时不下发 v6 那两条（见 [`super::effective_wan_dns`]）。
     if let Some(main) = plan.ifaces.first_mut() {
-        main.dns = state.cfg.net.wan_dns.trim().to_string();
+        main.dns = effective_wan_dns(&state.cfg.net.wan_dns, state.wan_ipv6());
     }
     rep.ifaces = plan.ifaces.iter().map(|i| i.name.clone()).collect();
 
@@ -306,6 +314,50 @@ pub fn provision_modem_with(
         }
     }
     rep
+}
+
+/// 各模组最近一次计划里选中的**数据网卡**（模组 id → 网卡名）。
+///
+/// 只服务于一件事：让拨号器托管（`runtime/dialer`）与组网（`UCI`）拨/绑同一张网卡。
+/// 两边各自 `pick_device` 时，入参不同（组网要排除被占用的口、拨号器什么都不排除），
+/// 同一台模组完全可能算出两个结果 —— 结果是「接口绑在 wwan0_1、拨号器把呼叫建到
+/// wwan0」，QMAP 下地址永远出不来。`pick_device` 的文档里写着「两边必须是同一个
+/// 网卡」，这里就是把它落实的机制：组网先选、拨号器跟随。
+static PLANNED_DEVICE: OnceLock<Mutex<HashMap<u32, String>>> = OnceLock::new();
+
+/// 记下这台模组本轮选中的网卡（空 = 撤回记录，走拨号器自己的兜底）。
+fn remember_device(modem_id: u32, device: &str) {
+    let m = PLANNED_DEVICE.get_or_init(Default::default);
+    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+    if device.trim().is_empty() {
+        g.remove(&modem_id);
+    } else {
+        g.insert(modem_id, device.trim().to_string());
+    }
+}
+
+/// 拨号器托管要用的数据网卡：优先跟随组网这一轮的结果，没有才自己选。
+pub(crate) fn device_for(modem: &Modem) -> String {
+    if let Some(m) = PLANNED_DEVICE.get() {
+        let g = m.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(d) = g.get(&modem.id) {
+            if !d.is_empty() {
+                return d.clone();
+            }
+        }
+    }
+    // 组网没跑过（`auto_wan` 关着 / 非 OpenWrt / 本轮还没轮到它）：
+    // 退回拨号器自己的口径（不排除被占用口 —— 那时没有「接口」可对齐）
+    pick_device(modem, &[])
+}
+
+/// 模组没了 / 会话回收时清掉记录（id 会被新模组复用，旧网卡名不能留给下一位）。
+pub(crate) fn forget_device(modem_id: u32) {
+    if let Some(m) = PLANNED_DEVICE.get() {
+        m.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&modem_id);
+    }
 }
 
 /// 挑这个模组该绑的数据网卡（sysfs 按 USB 设备组织，多模组也不会串）。
@@ -480,5 +532,33 @@ mod tests {
         // 三条 sysfs 路径都不存在（测试机 / 非 Linux）时必须是 0，不能 panic：
         // 0 的语义是「不是 QMAP」，拨号器据此跳过 WDA/BindMux，行为确定。
         assert_eq!(qmap_mode("definitely-not-an-iface"), 0);
+    }
+
+    #[test]
+    fn dialer_follows_the_device_chosen_by_provision() {
+        // 拨号器与组网必须拨/绑同一张网卡（QMAP 下绑错就永远 NO-CARRIER）。
+        // 只钉「跟随 + 回收」两件事：没跑过组网时的兜底依赖本机网卡，不测。
+        let m = crate::modem::model::Modem::new(
+            0xF1F1_0001,
+            "/definitely/not/a/tty".into(),
+            115200,
+            std::time::Duration::from_millis(50),
+            crate::modem::vendor::Vendor::Unknown,
+        );
+        let id = m.id;
+        forget_device(id);
+        remember_device(id, "  wwan0_1  ");
+        assert_eq!(
+            device_for(&m),
+            "wwan0_1",
+            "拨号器跟随组网选中的网卡（去空白）"
+        );
+        remember_device(id, "wwan0");
+        assert_eq!(device_for(&m), "wwan0", "换网卡后跟随新值");
+        forget_device(id);
+        assert!(
+            device_for(&m) != "wwan0_1",
+            "模组回收后不能把旧网卡留给复用这个 id 的下一位"
+        );
     }
 }

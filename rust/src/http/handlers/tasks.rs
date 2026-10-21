@@ -289,7 +289,7 @@ fn handle_post(
                 // QMI/MBIM 只是「交办」：会话由拨号协调器建。立刻踢一轮，
                 // 别让用户等下一次 15 秒节拍（AT 路径此时已连上，踢一轮是空操作）。
                 if out.is_ok() {
-                    crate::runtime::dialer::supervisor().kick(st.clone());
+                    crate::runtime::dialer::supervisor().kick();
                 }
                 // 无论成败都把「卡在哪一步」的状态归档 + 广播，页面据此刷新
                 let st_now = m.dial_status();

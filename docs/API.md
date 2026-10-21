@@ -210,6 +210,10 @@
 空串表示没连过或链路不是本程序拨的。**新增字段、旧前端可忽略**；其余字段与语义未变。
 生命周期（谁决定连、何时重连、退避）见 `docs/DIAL_STATE_MACHINE.md`。
 
+`GET /api/dial` 另有新增字段 `wan_dns`（字符串，空串 = 不强制下发）：本次组网实际会
+写进 `network.modem<id>.dns` 的那串地址 —— `[net] wan_dns` 经「IPv6 开关」裁剪后的结果
+（`wan_ipv6=false` 时只留 IPv4 两条）。页面拿它显示「接口下发 DNS」，排障不必翻配置文件。
+
 ### `/api/usbnet`
 
 | 方法 | 路径 | handler | 说明 |

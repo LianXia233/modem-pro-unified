@@ -5,7 +5,8 @@
 //!
 //! 契约见 docs/API.md，字段：
 //!   `modem_id / state / usb / class_notes / types / auto_wan / wan_ipv6 /
-//!    wan_ipv6_mode / wan_ipv6_modes / dial_enabled / wan_mode / wan_mode_label / wan_modes`。
+//!    wan_ipv6_mode / wan_ipv6_modes / dial_enabled / wan_mode / wan_mode_label /
+//!    wan_modes / wan_dns`。
 //! `auto_wan`（自动组网最近一次结果）由后台 netprov 循环每 15 秒写一次；
 //! 从未跑过就是 null，见 `netprov/provision.rs`。
 
@@ -59,6 +60,13 @@ pub fn handle(req: Request, state: &AppState, query: &HashMap<String, String>) -
         "wan_mode": mode.as_str(),
         "wan_mode_label": mode.label(),
         "wan_modes": crate::config::WanMode::list_payload(),
+        // 组网实际会写进 network.modem<id>.dns 的那串（`[net] wan_dns` 经
+        // IPv6 开关裁剪后的结果；空串 = 不强制下发，用运营商/DHCP 给的）。
+        // 页面拿它显示「接口下发 DNS」，排障时不用去翻 config.toml。
+        "wan_dns": crate::netprov::effective_wan_dns(
+            &state.cfg.net.wan_dns,
+            state.wan_ipv6(),
+        ),
         // 主机侧拨号器当前后端（external = 厂商二进制，native-qmi = Rust 原生）
         "host_dialer": crate::runtime::dialer::supervisor().describe(modem.id),
     });

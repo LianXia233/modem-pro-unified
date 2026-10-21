@@ -74,7 +74,7 @@ use crate::modem::model::dial::{DIAL_CONNECTED, DIAL_DIALING};
 #[cfg(unix)]
 use crate::modem::model::Modem;
 #[cfg(unix)]
-use crate::netprov::provision::pick_device;
+use crate::netprov::provision::device_for;
 
 #[cfg(unix)]
 pub mod native;
@@ -331,6 +331,13 @@ pub struct DialerSupervisor {
     /// 已经被顶掉。加锁后同一模组同时只有一个建会话流程。
     #[cfg(unix)]
     starting: Mutex<std::collections::HashSet<u32>>,
+    /// `AppState` 的句柄（[`Self::kick`] 用）。
+    ///
+    /// 为什么不是 kick 的入参：`/api/dial/connect` 这类**同步** handler 只拿得到
+    /// `&AppState`（路由层统一签名），而 kick 必须把 `Arc` 移进后台线程。
+    /// 进程内只有一个协调器，装配完 `AppState` 后 `arm` 一次即可 ——
+    /// 异步任务那条路（`tasks.rs`）原本自己持有 `Arc`，一并统一到这里。
+    state: OnceLock<Arc<AppState>>,
 }
 
 impl DialerSupervisor {
@@ -359,12 +366,25 @@ impl DialerSupervisor {
         self.retry.clear_all();
     }
 
+    /// 挂上 `AppState`（进程启动时调一次；之后 [`Self::kick`] 才能用）。
+    pub fn arm(&self, state: Arc<AppState>) {
+        let _ = self.state.set(state);
+    }
+
     /// 立刻跑一轮协调（不等 15 秒节拍）。
     ///
-    /// 只在**后台线程**里跑：调用方（任务线程）刚下发完拨号，不想再等一个节拍
-    /// 才看到会话建立，但也不能把请求本身拖住。并发安全由 `starting` 保证 ——
+    /// 只在**后台线程**里跑：调用方刚下发完拨号，不想再等一个节拍才看到会话
+    /// 建立，但也不能把请求本身拖住。并发安全由 `starting` 保证 ——
     /// 同一模组同时只会有一个建会话流程。
-    pub fn kick(&'static self, state: Arc<AppState>) {
+    ///
+    /// QMI/MBIM 必须走这一步：`Modem::dial()` 对这两类只做「交办」，
+    /// 真正的会话由本协调器建 —— 页面上点「拨号」后不 kick，就要干等最多
+    /// 15 秒才从 `dialing` 变 `connected`。
+    pub fn kick(&'static self) {
+        let Some(state) = self.state.get().cloned() else {
+            log::debug!("拨号协调器还没挂上 AppState，本次 kick 跳过");
+            return;
+        };
         std::thread::spawn(move || self.reconcile(&state));
     }
 
@@ -403,6 +423,7 @@ impl DialerSupervisor {
             self.stop_session(id);
             self.retry.clear(id);
             self.in_flight.lock().unwrap().remove(&id);
+            crate::netprov::provision::forget_device(id);
         }
 
         for modem in running {
@@ -491,7 +512,7 @@ impl DialerSupervisor {
         } else {
             st.apn.clone()
         };
-        let device = pick_device(modem, &[]);
+        let device = device_for(modem);
         let kind = modem.ensure_dial_kind();
         let plan = match native::plan_native(
             id,

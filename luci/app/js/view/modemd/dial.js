@@ -456,6 +456,9 @@ E('span', { 'class': 'mp-badge ' + (hostDialer ? 'mp-badge-success' : (atPlane ?
 				E('div', { 'class': 'mp-kv-grid' }, [
 					rowKv('执行时间', autoWan ? autoWan.at : '-'),
 					rowKv('生效接口', autoWan && autoWan.ifaces ? autoWan.ifaces.join(', ') : 'modem0'),
+					/* 接口强制下发的 DNS（`[net] wan_dns`；空 = 用运营商/DHCP 给的）。
+					   蜂窝链路的 DHCP 常年不给 DNS，不强制下发就是 resolv.conf.auto 为空、解析全 REFUSED。 */
+					rowKv('接口下发 DNS', dial.wan_dns || '不强制下发（用运营商 / DHCP 给的）'),
 					rowKv('组网动作', autoWan && autoWan.applied && autoWan.applied.length ? autoWan.applied.join('； ') : '无变更'),
 					rowKv('跳过项', autoWan && autoWan.skipped && autoWan.skipped.length ? autoWan.skipped.join('； ') : '无')
 				])

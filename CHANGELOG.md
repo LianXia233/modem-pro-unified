@@ -10,6 +10,58 @@
 
 ## [未发布]
 
+### 优化：接口默认下发 DNS 改为「v4 首选/备选 + v6 首选/备选」四条
+
+`[net] wan_dns` 的默认值从 `223.5.5.5 119.29.29.29`（只有两条 v4）换成：
+
+| 族 | 首选 | 备选 |
+| --- | --- | --- |
+| IPv4 | `119.29.29.29`（DNSPod） | `223.5.5.5`（阿里） |
+| IPv6 | `2402:4e00::`（DNSPod） | `2400:3200::1`（阿里） |
+
+- 顺序即优先级；两家都是 Anycast 双栈，任何一族不可用都有同族的备选顶上。
+  选国内而不选海外公共 DNS：蜂窝出口在国内，延迟与劫持风险都更低。
+- netifd 的 `interface_add_dns_server()` 对 v4 / v6 是同一个入口，IPv6 地址无需特殊写法。
+- **`wan_ipv6 = false` 时自动不下发 v6 那两条**（新增 `netprov::effective_wan_dns`）：
+  链路没有 IPv6 时写进 `resolv.conf.auto` 只会多两个永远不回应的 nameserver。
+- 默认值收敛到 `config::net::DEFAULT_WAN_DNS`；`config.toml` 里**故意写成注释模板** ——
+  它是 conffile（升级不覆盖），写死会让老机器永远拿不到新的默认值。没这一行也按默认值下发。
+- `GET /api/dial` 新增 `wan_dns` 字段（本次实际会写进 `network.modem<id>.dns` 的那串），
+  页面「自动组网报告」卡片加一行显示，排障不必翻配置文件。
+
+### 修复：第二轮拨号/接口自检（5 项，详见 `docs/DIAL_STATE_MACHINE.md` §10）
+
+从头走了一遍「模组插入 → 自动拨号 → 接口拉起 → 地址/DNS 落地」，统一状态机本身没再发现
+设计问题，问题都在它的**接入点**与**接口侧**：
+
+1. **同步接口 `/api/dial/connect` 拨 QMI/MBIM 后不 kick** —— 只有异步任务 `dial.connect`
+   调了 `kick()`，页面上点「拨号」要干等最多 15 秒才从 `dialing` 变 `connected`
+   （§3.4 写的行为没落地）。给 `DialerSupervisor` 加 `arm(Arc<AppState>)`，
+   `kick()` 不再需要入参（同步 handler 只拿得到 `&AppState`），`spawn_all` 装配后挂上。
+2. **接口 `device` 会漂到别的网卡** —— `pick_device` 的排除名单把**本模组自己的接口**
+   也算「被占用」：第一轮写完 `modem0.device=wwan0` 后，第二轮起 wwan0 被自己占着 ⇒
+   跳过 ⇒ 落到全局兜底 `detect_data_dev`，随手抓一张 `eth2` 或**另一台模组的** `wwan1`
+   ⇒ diff 下发 `set modem0.device=…`，接口漂走直接断网。新增 `occupied_by_others()`。
+3. **网卡还没枚举出来就建了一张没有 `device` 的接口** —— netifd 判 `NO_DEVICE`，
+   `modem_pro.sh` 随即 `proto_block_restart`：一张起不来、还会挡后续 ifup 的坏接口。
+   新增 `skip_without_device()`（接口已存在时仍沿用现状，不把已有配置晾着）。
+4. **从未拨号的 QMI 模组点「断开」失败** —— `hangup` 用 `cached_dial_kind()`，
+   没拨过号时 kind 是空串 ⇒ 走 AT 分支发 `AT+CGACT=0` ⇒ 模组侧没我们激活的上下文、
+   指令被拒 ⇒ 状态不置 `idle`、也不置 `manual_stop`，协调器下一轮又把会话建回来。
+   改用 `ensure_dial_kind()`。
+5. **断开后页面又跳回「已连接」** —— `dial_status` 只看「网卡有没有地址」，
+   而断开后旧地址要等 netifd 收尾才掉，期间 `idle` 被改判成 `connected`。
+   改判（③）与补地址（②）都加 `!manual_stop` 门禁。
+
+顺带把「拨号器与组网必须拨/绑同一张网卡」从注释落成机制：组网每轮
+`remember_device()`、拨号器改走 `device_for()`（模组回收时 `forget_device`，
+避免旧网卡名留给复用 id 的下一位）。两边入参不同，QMAP 下算错就是父口永远 NO-CARRIER。
+
+测试 759 → 764（新增 5 项：占用名单不含自己、空 device 保护、DNS 的 v6 裁剪与默认值一致、
+拨号器跟随组网选中的网卡）；clippy 0 warning、`cargo fmt` 干净、release 构建通过。
+实机待验（本沙箱无模组）：多网卡机器上接口 device 的稳定性、点拨号 ≤3 秒 connected、
+从未拨号的 QMI 模组的断开行为。
+
 ### 新增：MT5700M-CN 私有命令链（信号 / 流量 / URC）与 FM350 双卡预设
 
 参考 [LianXia233/luci-app-mt5700](https://github.com/LianXia233/luci-app-mt5700)（GPL-3.0，仅参考未拷贝）与两份厂商 AT 手册
@@ -481,7 +533,7 @@ netifd 接口在线时长才是权威值，且跨重启保持正确；前两者�
 
 实机翻车：RNDIS 数据口是 eth2（挂在模组 USB 接口上），而
 `pick_dial_iface(猜名快照)` 把 **SoC 有线口 eth1**（主路由 LAN，
-192.168.88.x）认了进去 —— 页面「主机网卡接口 / 已分配 IPv4」显示的
+192.168.1.x）认了进去 —— 页面「主机网卡接口 / 已分配 IPv4」显示的
 与模组毫无关系。三处猜名点全部改为 `usb_netifs_for_port()` 按 sysfs
 归属枚举（优先 QMAP mux 口）：`dial_inner` ④、`dial_status` 的
 dial_update 钩子（改为**归属校验**：记录的网卡不属于这个模组就换掉）。
