@@ -134,6 +134,10 @@ impl<'a> V6Plan<'a> {
     }
 
     /// 让 350 系列把 IPv6 完全交给独立兄弟接口（主接口不再跑 odhcp6c）。
+    ///
+    /// `dedicated` 只决定「要不要建兄弟接口」；主接口让位（写 `mp_no_v6`）还
+    /// 多一个前提 —— `mode.wants_sibling()`，即 `wan_ipv6=off` 时既没有兄弟
+    /// 接口接手，主接口也不该留下一个没人接手的 `mp_no_v6=1`。
     pub fn dedicated(mut self, yes: bool) -> Self {
         self.dedicated = yes;
         self

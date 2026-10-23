@@ -60,12 +60,14 @@
 
 - **无条件建**（`netprov::V6Plan::dedicated`）：350 系列只要 `wan_ipv6 != off`
   就建 `modem<id>_6`，不再等 IPv4 地址、不再看 `wan_mode` 的兄弟接口开关。
-- **不重复跑客户端**（新 UCI 选项 `mp_no_v6`）：主接口还是 `modem_pro` 时写
-  `mp_no_v6=1`，`modem_pro.sh` 据此导出 `MP_NO_V6`，`mp-client.sh` 跳过
-  v6 上报脚本生成 / odhcp6c 启动与巡检，`accept_ra` 也不再被打开 —— 否则同一张
-  网卡上两个 DHCPv6 客户端抢 RA，v6 接口反而一直空着。计划退回普通形态时
-  diff 会下 `uci delete network.modem<id>.mp_no_v6` 清掉这个键（换非 350 模组
-  不会永久少跑 odhcp6c）。
+- **不重复跑客户端**（新 UCI 选项 `mp_no_v6`）：主接口还是 `modem_pro` 且确有
+  兄弟接口接手 IPv6 时写 `mp_no_v6=1`，`modem_pro.sh` 据此导出 `MP_NO_V6`，
+  `mp-client.sh` 跳过 v6 上报脚本生成 / odhcp6c 启动与巡检，`accept_ra` 也不再
+  被打开 —— 否则同一张网卡上两个 DHCPv6 客户端抢 RA，v6 接口反而一直空着。
+  `wan_ipv6=off`（不建兄弟接口）时**不写**这个键：让位给一个不存在的接手方，
+  等于这台机器彻底没有 IPv6。计划退回普通形态时 diff 会下
+  `uci delete network.modem<id>.mp_no_v6` 清掉它（换非 350 模组不会永久少跑
+  odhcp6c）。
 - **运行期再识别 + 重拉**（`netprov::v6::iface_live` / `maybe_rekick`）：已符合
   计划的轮次里读一次 `ifstatus modem<id>_6`（`up` / `uptime` / data 里的
   `ipv6-address`、`ipv6-prefix-assignment`、`ipv6-prefix`），接口 up 满 20 秒仍没有

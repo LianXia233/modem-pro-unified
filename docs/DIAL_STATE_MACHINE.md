@@ -425,11 +425,14 @@ ICCID 兜底、优先级表逐条 —— 用户优先 / 同家沿用 / 异家校
 | 重拉 | 没人再碰 | `v6::iface_live()`（`ifstatus` 的 `up` / `uptime` / `ipv6-address` / `ipv6-prefix-assignment`）+ `maybe_rekick()`：up 满 20s 仍无全局 v6 ⇒ `ifdown`+`ifup`，退避 30/60/120/240/300s，拿到地址即清零 |
 
 **同一张网卡上只能有一个 DHCPv6 客户端**：主接口还是 `modem_pro` 时，`mp-client.sh`
-自己会起一个 odhcp6c，与兄弟接口抢 RA。因此主接口写 `mp_no_v6=1`（proto 配置项 →
-导出 `MP_NO_V6` → 跳过 v6 脚本生成 / odhcp6c 启动与巡检，并**不**打开 `accept_ra`
-—— 内核在主网卡上自行 SLAAC 会让兄弟接口永远看不到地址）。
-`diff_plan` 两侧都管：计划需要时写，计划不再需要（换非 350 模组 / 主接口转 static）
-时 `uci delete network.modem<id>.mp_no_v6` 清掉，避免留下一个永久少跑 odhcp6c 的接口。
+自己会起一个 odhcp6c，与兄弟接口抢 RA。因此**确有兄弟接口接手时**主接口才写
+`mp_no_v6=1`（proto 配置项 → 导出 `MP_NO_V6` → 跳过 v6 脚本生成 / odhcp6c 启动与
+巡检，并**不**打开 `accept_ra` —— 内核在主网卡上自行 SLAAC 会让兄弟接口永远看不到
+地址）。`wan_ipv6=off` 时根本不建兄弟接口，主接口也就不能带着 `mp_no_v6=1` 交出去
+（那等于这台机器彻底没有 IPv6）。
+`diff_plan` 两侧都管：计划需要时写，计划不再需要（换非 350 模组 / 主接口转 static /
+关掉 `wan_ipv6`）时 `uci delete network.modem<id>.mp_no_v6` 清掉，避免留下一个永久
+少跑 odhcp6c 的接口。
 
 限速与限界：`maybe_rekick` 只在 `dhcpv6` / `ra` 两种模式下动作，`static` 的地址由
 UCI 直接配、`off` 不建接口；重拉只动 `modem<id>_6`，不碰主接口与其 IPv4；
