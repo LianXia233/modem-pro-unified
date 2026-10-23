@@ -147,18 +147,31 @@ fn resolicit_gate() {
 }
 
 #[test]
-fn kick_backoff_grows_and_caps() {
-    let gaps: Vec<u64> = (0..7).map(|n| kick_gap(n).as_secs()).collect();
-    assert_eq!(gaps, vec![30, 60, 120, 240, 300, 300, 300]);
+fn recovery_gap_tiers() {
+    // 15 秒 ×10
+    for n in 0..KICK_FAST_TIMES {
+        assert_eq!(recovery_gap(n), KICK_FAST_INTERVAL, "attempt {n}");
+    }
+    // 61 秒 ×10
+    for n in KICK_FAST_TIMES..KICK_FAST_TIMES + KICK_SLOW_TIMES {
+        assert_eq!(recovery_gap(n), KICK_SLOW_INTERVAL, "attempt {n}");
+    }
+    // 之后 3 分钟兜底，**不封顶**（纯 IPv4 环境也不能停止巡检）
+    for n in [20u32, 21, 50, 500, 100_000] {
+        assert_eq!(recovery_gap(n), KICK_FALLBACK_INTERVAL, "attempt {n}");
+    }
+    assert_eq!(KICK_FAST_INTERVAL, Duration::from_secs(15));
+    assert_eq!(KICK_SLOW_INTERVAL, Duration::from_secs(61));
+    assert_eq!(KICK_FALLBACK_INTERVAL, Duration::from_secs(180));
 }
 
 #[test]
 fn kick_gate_only_when_v6_missing_and_interface_ready() {
     // 拿到 v6 ⇒ 永不重拉
-    assert!(!should_kick(V6Mode::Dhcpv6, true, 120, true, 0, None, false));
+    assert!(!should_kick(V6Mode::Dhcpv6, true, 120, true, 0, None));
     // 接口没 up：只有第一次（since_last 为空）立刻拉起
-    assert!(should_kick(V6Mode::Dhcpv6, false, 0, false, 0, None, false));
-    // 已经拉过就要退避 —— 否则 15 秒一轮的组网循环会把 odhcp6c 反复杀掉，
+    assert!(should_kick(V6Mode::Dhcpv6, false, 0, false, 0, None));
+    // 已经拉过就要退避 —— 否则组网循环会把 odhcp6c 反复杀掉，
     // 接口永远停在 pending（实机日志：「已运行 0s …（第 N 次重拉）」每轮 +1）
     assert!(!should_kick(
         V6Mode::Dhcpv6,
@@ -166,88 +179,66 @@ fn kick_gate_only_when_v6_missing_and_interface_ready() {
         0,
         false,
         3,
-        Some(Duration::from_secs(1)),
-        false
+        Some(Duration::from_secs(1))
     ));
+    // 快挡：第 1 次后 15 秒才允许再拉
     assert!(!should_kick(
         V6Mode::Dhcpv6,
         false,
         0,
         false,
         1,
-        Some(Duration::from_secs(59)),
-        false
+        Some(Duration::from_secs(14))
     ));
-    // 等到恢复间隔（第 1 次后 60 秒）才允许再拉
     assert!(should_kick(
         V6Mode::Dhcpv6,
         false,
         0,
         false,
         1,
-        Some(Duration::from_secs(60)),
-        false
+        Some(Duration::from_secs(15))
+    ));
+    // 慢挡：第 12 次后要等 61 秒
+    assert!(!should_kick(
+        V6Mode::Dhcpv6,
+        false,
+        0,
+        false,
+        12,
+        Some(Duration::from_secs(60))
+    ));
+    assert!(should_kick(
+        V6Mode::Dhcpv6,
+        false,
+        0,
+        false,
+        12,
+        Some(Duration::from_secs(61))
+    ));
+    // 兜底：第 30 次后要等 180 秒
+    assert!(!should_kick(
+        V6Mode::Dhcpv6,
+        false,
+        0,
+        false,
+        30,
+        Some(Duration::from_secs(179))
+    ));
+    assert!(should_kick(
+        V6Mode::Dhcpv6,
+        false,
+        0,
+        false,
+        30,
+        Some(Duration::from_secs(180))
     ));
     // 刚起来 20 秒内不抢（RA/DHCPv6 还在协商）
-    assert!(!should_kick(V6Mode::Dhcpv6, true, 19, false, 0, None, false));
+    assert!(!should_kick(V6Mode::Dhcpv6, true, 19, false, 0, None));
     // up 够久且从未重拉过 ⇒ 立即
-    assert!(should_kick(V6Mode::Dhcpv6, true, 20, false, 0, None, false));
-    // 按退避：第 1 次后 60 秒内不再拉
-    assert!(!should_kick(
-        V6Mode::Dhcpv6,
-        true,
-        120,
-        false,
-        1,
-        Some(Duration::from_secs(59)),
-        false
-    ));
-    assert!(should_kick(
-        V6Mode::Dhcpv6,
-        true,
-        120,
-        false,
-        1,
-        Some(Duration::from_secs(60)),
-        false
-    ));
+    assert!(should_kick(V6Mode::Dhcpv6, true, 20, false, 0, None));
     // static 不归这条路（地址由 UCI 配）
-    assert!(!should_kick(V6Mode::Static, true, 600, false, 0, None, false));
-    assert!(!should_kick(V6Mode::Off, true, 600, false, 0, None, false));
-}
-
-#[test]
-fn silent_recovery_when_v6_never_seen() {
-    // 对齐 luci-app-fm350 的 V6_SILENT_RECOVERY_INTERVAL：
-    // 前面几轮按 kick_gap 快速重试（覆盖 PDP 刚激活 / RA 还没到的窗口）…
-    assert_eq!(recovery_gap(0, false), Duration::from_secs(30));
-    assert_eq!(recovery_gap(1, false), Duration::from_secs(60));
-    assert_eq!(recovery_gap(2, false), Duration::from_secs(120));
-    assert_eq!(recovery_gap(3, false), Duration::from_secs(240));
-    // …连续多轮都没见过 v6 ⇒ 判定「本卡/本网没有 v6」，30 分钟兜底一次，
-    // 免得纯 IPv4 环境每分钟把接口拆一次
-    assert_eq!(recovery_gap(4, false), SILENT_RECOVERY_INTERVAL);
-    assert_eq!(recovery_gap(9, false), SILENT_RECOVERY_INTERVAL);
-    // 见过 v6 的接口不走静默期：掉线后仍按 kick_gap 快速恢复
-    assert_eq!(recovery_gap(4, true), Duration::from_secs(300));
-    assert!(!should_kick(
-        V6Mode::Dhcpv6,
-        false,
-        0,
-        false,
-        5,
-        Some(Duration::from_secs(600)),
-        false
-    ));
-    assert!(should_kick(
-        V6Mode::Dhcpv6,
-        false,
-        0,
-        false,
-        5,
-        Some(Duration::from_secs(1800)),
-        false
-    ));
+    assert!(!should_kick(V6Mode::Static, true, 600, false, 0, None));
+    assert!(!should_kick(V6Mode::Off, true, 600, false, 0, None));
 }
 
 #[test]
