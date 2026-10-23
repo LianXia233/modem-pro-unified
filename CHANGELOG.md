@@ -10,6 +10,8 @@
 
 ## [未发布]
 
+## [1.0.6] - 2026-10-23
+
 ### 修复：350 系列 static IPv4 下 IPv6 接口不创建
 
 `wan_mode=modem_pro`（默认）时，FM350 / RW350 的 v4 因模组内 DHCP 无响应会被转成
@@ -99,11 +101,14 @@
 - **LuCI 存储区显示如实化**：`AT+CPMS?` 只回六个数字（无区名）时，
   徽章显示「未报区名」而不是硬猜 `SM`，下拉框加一条禁用占位并挡住空值提交。
 
-测试 789 → 794（dedicated 兄弟接口与 `mp_no_v6` 的建/清、`diff_plan` 零写入、
+测试 786 → 794（dedicated 兄弟接口与 `mp_no_v6` 的建/清、`diff_plan` 零写入、
 `ifstatus` 的 v6 判定、重拉退避与门禁、号码归一化、松散号码出同一份 PDU、
-状态报告被丢弃）；`cargo build --release` 0 warning，`sh -n` / `node --check` 通过。
-未实机验证：350 系列 `mp_no_v6` 下主接口 IPv4 与兄弟接口 IPv6 并行、
-`maybe_rekick` 在真实 RA 延迟下的重拉次数（本沙箱无模组与 netifd）。
+状态报告被丢弃）；`cargo build --release` 0 warning，`sh -n` / `node --check` 通过，
+`scripts/check-desensitize.sh` exit 0（286 文件；新增测试样例里的运营商前缀
+已换成 RFC 3849 文档段）。未实机验证：350 系列 `mp_no_v6` 下主接口 IPv4 与
+兄弟接口 IPv6 并行、`maybe_rekick` 在真实 RA 延迟下的重拉次数（本沙箱无模组与
+netifd）。`cargo fmt --check` / `cargo clippy` 因发版环境缺组件**未执行**，
+详见 [1.0.6] 发版说明的已知边界。
 
 ## [1.0.5] - 2026-10-21
 
