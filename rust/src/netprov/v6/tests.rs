@@ -232,10 +232,11 @@ fn kick_gate_only_when_v6_missing_and_interface_ready() {
         30,
         Some(Duration::from_secs(180))
     ));
-    // 刚起来 20 秒内不抢（RA/DHCPv6 还在协商）
-    assert!(!should_kick(V6Mode::Dhcpv6, true, 19, false, 0, None));
-    // up 够久且从未重拉过 ⇒ 立即
-    assert!(should_kick(V6Mode::Dhcpv6, true, 20, false, 0, None));
+    // 刚起来不到 10 秒不抢（RA/DHCPv6 还在协商）；下限必须小于快挡 15 秒，
+    // 否则快挡会被这条挡掉、实际节奏退化成 30 秒（实机踩过）
+    assert!(!should_kick(V6Mode::Dhcpv6, true, 9, false, 0, None));
+    assert!(should_kick(V6Mode::Dhcpv6, true, 10, false, 0, None));
+    assert!(KICK_MIN_UPTIME < KICK_FAST_INTERVAL.as_secs());
     // static 不归这条路（地址由 UCI 配）
     assert!(!should_kick(V6Mode::Static, true, 600, false, 0, None));
     assert!(!should_kick(V6Mode::Off, true, 600, false, 0, None));
