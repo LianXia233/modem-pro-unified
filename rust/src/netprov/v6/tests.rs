@@ -58,7 +58,7 @@ fn placeholder_and_non_global_v6_is_rejected() {
     assert!(!is_usable_global_v6("fe80::200:11ff:fe12:1314"));
     assert!(!is_usable_global_v6("ff02::1"));
     assert!(!is_usable_global_v6(""));
-    // 真实的全局地址（电信 240e / 联通 2408）
+    // 可路由的全局地址（此处用 RFC 3849 文档段，形态同实机 24xx 前缀）
     assert!(is_usable_global_v6("2001:db8::1"));
     assert!(is_usable_global_v6("2001:db8:1:2::8"));
     assert!(is_usable_global_v6("2001:DB8:1:2::8"));
@@ -198,7 +198,7 @@ fn ifstatus_v6_detection_accepts_addr_or_prefix_only() {
         "data": {
             "ipv6-address": [
                 {"address": "fe80::1", "mask": 64},
-                {"address": "2408:8000::1", "mask": 64}
+                {"address": "2001:db8::1", "mask": 64}
             ]
         }
     });
@@ -207,7 +207,7 @@ fn ifstatus_v6_detection_accepts_addr_or_prefix_only() {
         "up": true,
         "data": {
             "ipv6-prefix-assignment": [
-                {"address": "2408:8000:1:2::", "mask": 64}
+                {"address": "2001:db8:1:2::", "mask": 64}
             ]
         }
     });
