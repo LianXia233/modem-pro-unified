@@ -235,6 +235,7 @@ pub fn parse_existing(
             "gateway" => out[i].gateway = value,
             "extendprefix" => out[i].extendprefix = value,
             "ip6addr" => out[i].ip6addr = value,
+            "mp_no_v6" => out[i].mp_no_v6 = value,
             "dns" => out[i].dns = value,
             _ => {}
         }

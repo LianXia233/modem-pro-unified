@@ -35,6 +35,11 @@ IFACE="${MP_IFACE:-${1:-}}"
 V4_SCRIPT="/tmp/mp-dhcp-${INTERFACE}.script"
 V6_SCRIPT="/tmp/mp-dhcpv6-${INTERFACE}.script"
 
+# 350 系列：IPv6 由独立的 `modem<id>_6` 兄弟接口负责，本接口只跑 udhcpc。
+# 不跳过的话同一张网卡上会同时有两个 odhcp6c（主接口 + v6 接口），
+# RA 被谁先收走不确定，v6 接口可能永远拿不到地址。
+NO_V6="${MP_NO_V6:-0}"
+
 MAX_FAILS=5	# 单个客户端连续退出这么多次才整体重启协议
 POLL=3		# 巡检间隔（秒）
 
@@ -119,11 +124,18 @@ logger -t modem-pro "mp-client: 启动 $INTERFACE（设备 $IFACE）"
 cleanup_stale
 
 gen_script /lib/netifd/dhcp.script   "$V4_SCRIPT" || { logger -t modem-pro "mp-client: 生成 v4 上报脚本失败"; exit 1; }
-gen_script /lib/netifd/dhcpv6.script "$V6_SCRIPT" || { logger -t modem-pro "mp-client: 生成 v6 上报脚本失败"; exit 1; }
+if [ "$NO_V6" = "1" ]; then
+	rm -f "$V6_SCRIPT"
+	logger -t modem-pro "mp-client: $INTERFACE 只跑 udhcpc（mp_no_v6=1，IPv6 由独立接口负责）"
+else
+	gen_script /lib/netifd/dhcpv6.script "$V6_SCRIPT" || { logger -t modem-pro "mp-client: 生成 v6 上报脚本失败"; exit 1; }
+fi
 
 start_udhcpc
-sleep 1
-start_odhcp6c
+if [ "$NO_V6" != "1" ]; then
+	sleep 1
+	start_odhcp6c
+fi
 
 UFAIL=0
 OFAIL=0
@@ -144,16 +156,18 @@ while [ "$STOPPING" = "0" ]; do
 		start_udhcpc
 	fi
 
-	if kill -0 "$ODHCP6C_PID" 2>/dev/null; then
-		OFAIL=0
-	else
-		OFAIL=$((OFAIL + 1))
-		if [ "$OFAIL" -ge "$MAX_FAILS" ]; then
-			logger -t modem-pro "mp-client: odhcp6c 连续退出 $OFAIL 次 → 整体重启协议（交给 netifd）"
-			exit 1
+	if [ "$NO_V6" != "1" ]; then
+		if kill -0 "$ODHCP6C_PID" 2>/dev/null; then
+			OFAIL=0
+		else
+			OFAIL=$((OFAIL + 1))
+			if [ "$OFAIL" -ge "$MAX_FAILS" ]; then
+				logger -t modem-pro "mp-client: odhcp6c 连续退出 $OFAIL 次 → 整体重启协议（交给 netifd）"
+				exit 1
+			fi
+			logger -t modem-pro "mp-client: odhcp6c 退出，重新拉起（第 $OFAIL 次）"
+			start_odhcp6c
 		fi
-		logger -t modem-pro "mp-client: odhcp6c 退出，重新拉起（第 $OFAIL 次）"
-		start_odhcp6c
 	fi
 done
 

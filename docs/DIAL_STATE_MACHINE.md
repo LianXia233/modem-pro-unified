@@ -407,3 +407,38 @@ ICCID 兜底、优先级表逐条 —— 用户优先 / 同家沿用 / 异家校
 自定义不覆盖 / 切换更新与保守回落 / 无上下文回落链 / IMS 不算可用上下文）。
 未实机验证：识别在真机 `COPS`/`QNWINFO` 各固件变体上的表现、`AT+CGDCONT` 写入后
 部分固件的生效延迟、广电卡实卡（46015 / 898615 表项按公开资料整理，未实卡验证）。
+
+---
+
+## 12. 350 系列的 IPv6 接口生命周期（建 / 认 / 重拉）
+
+350 系列（FM350 / RW350，广和通 MTK）的 IPv6 与 IPv4 是**两套时间线**：v4 由组网
+按 `AT+CGPADDR` 落 static，v6 必须由独立的 `modem<id>_6` 客户端（odhcp6c / 内核 RA）
+去要，而它能不能拿到取决于运营商侧 RA 什么时候到。实机反馈的现象是
+「模组明明有 V6，插件不建 v6 接口；建了之后一直没地址，也不会再试」。
+三段各自的原因与口径：
+
+| 阶段 | 原来 | 现在 |
+| --- | --- | --- |
+| 建接口 | 取决于 `wan_mode` 的兄弟接口开关，或主接口已被转成 `static`（= 已拿到 v4） | `V6Plan::dedicated(is_350)`：350 系列只要 `wan_ipv6 != off` 就无条件建 `modem<id>_6`，不等 IPv4 |
+| 认地址 | `dial_state_ipv6()` 非空即信，`is_empty()` 才补 `AT+CGPADDR` | 判据换成 `usable_static_v6()`：**不是可用全局地址就重查**；`query_own_ipv6()` 同时回写 `DialState.ipv6`（原来只写旁路缓存，永远被旧状态盖住） |
+| 重拉 | 没人再碰 | `v6::iface_live()`（`ifstatus` 的 `up` / `uptime` / `ipv6-address` / `ipv6-prefix-assignment`）+ `maybe_rekick()`：up 满 20s 仍无全局 v6 ⇒ `ifdown`+`ifup`，退避 30/60/120/240/300s，拿到地址即清零 |
+
+**同一张网卡上只能有一个 DHCPv6 客户端**：主接口还是 `modem_pro` 时，`mp-client.sh`
+自己会起一个 odhcp6c，与兄弟接口抢 RA。因此主接口写 `mp_no_v6=1`（proto 配置项 →
+导出 `MP_NO_V6` → 跳过 v6 脚本生成 / odhcp6c 启动与巡检，并**不**打开 `accept_ra`
+—— 内核在主网卡上自行 SLAAC 会让兄弟接口永远看不到地址）。
+`diff_plan` 两侧都管：计划需要时写，计划不再需要（换非 350 模组 / 主接口转 static）
+时 `uci delete network.modem<id>.mp_no_v6` 清掉，避免留下一个永久少跑 odhcp6c 的接口。
+
+限速与限界：`maybe_rekick` 只在 `dhcpv6` / `ra` 两种模式下动作，`static` 的地址由
+UCI 直接配、`off` 不建接口；重拉只动 `modem<id>_6`，不碰主接口与其 IPv4；
+每轮组网最多读一次 `ifstatus`（一个 fork），且仅 350 系列。
+
+### 12.1 与短信的 `+CMTI` arm 是同一类问题
+
+两者都是「**判定/武装的时刻早于事实发生的时刻，之后没人再判一次**」：
+IPv6 是接口建早于地址分配，`+CMTI` 是 MT5700 掉电后 CNMI 回到全 0 而 arm 只发生在
+`read_sms()` 里，而 `read_sms()` 又只在收到 `+CMTI` 时被触发。修法同构 ——
+把 arm 移到常驻循环（URC 循环每轮调 `ensure_sms_urc()`），并用「确认成功才置位 +
+失败按 30s 限速」兜住串口占用。

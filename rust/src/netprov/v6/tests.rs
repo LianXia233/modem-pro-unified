@@ -145,3 +145,81 @@ fn resolicit_gate() {
         false
     ));
 }
+
+#[test]
+fn kick_backoff_grows_and_caps() {
+    let gaps: Vec<u64> = (0..7).map(|n| kick_gap(n).as_secs()).collect();
+    assert_eq!(gaps, vec![30, 60, 120, 240, 300, 300, 300]);
+}
+
+#[test]
+fn kick_gate_only_when_v6_missing_and_interface_ready() {
+    // 拿到 v6 ⇒ 永不重拉
+    assert!(!should_kick(
+        V6Mode::Dhcpv6,
+        true,
+        120,
+        true,
+        0,
+        None
+    ));
+    // 接口没 up ⇒ 先拉起（哪怕刚重启过）
+    assert!(should_kick(V6Mode::Dhcpv6, false, 0, false, 3, Some(Duration::from_secs(1))));
+    // 刚起来 20 秒内不抢（RA/DHCPv6 还在协商）
+    assert!(!should_kick(V6Mode::Dhcpv6, true, 19, false, 0, None));
+    // up 够久且从未重拉过 ⇒ 立即
+    assert!(should_kick(V6Mode::Dhcpv6, true, 20, false, 0, None));
+    // 按退避：第 1 次后 60 秒内不再拉
+    assert!(!should_kick(
+        V6Mode::Dhcpv6,
+        true,
+        120,
+        false,
+        1,
+        Some(Duration::from_secs(59))
+    ));
+    assert!(should_kick(
+        V6Mode::Dhcpv6,
+        true,
+        120,
+        false,
+        1,
+        Some(Duration::from_secs(60))
+    ));
+    // static 不归这条路（地址由 UCI 配）
+    assert!(!should_kick(V6Mode::Static, true, 600, false, 0, None));
+    assert!(!should_kick(V6Mode::Off, true, 600, false, 0, None));
+}
+
+#[test]
+fn ifstatus_v6_detection_accepts_addr_or_prefix_only() {
+    let with_addr = serde_json::json!({
+        "up": true,
+        "data": {
+            "ipv6-address": [
+                {"address": "fe80::1", "mask": 64},
+                {"address": "2408:8000::1", "mask": 64}
+            ]
+        }
+    });
+    assert!(status_has_v6(&with_addr));
+    let prefix_only = serde_json::json!({
+        "up": true,
+        "data": {
+            "ipv6-prefix-assignment": [
+                {"address": "2408:8000:1:2::", "mask": 64}
+            ]
+        }
+    });
+    assert!(status_has_v6(&prefix_only), "只拿到 PD 前缀也算 v6 已就绪");
+    let v4_only = serde_json::json!({
+        "up": true,
+        "data": {"ipv4-address": [{"address": "10.0.0.2", "mask": 24}]}
+    });
+    assert!(!status_has_v6(&v4_only));
+    let placeholder = serde_json::json!({
+        "up": true,
+        "data": {"ipv6-address": [{"address": "::18df:9a01:f982:815a", "mask": 128}]}
+    });
+    assert!(!status_has_v6(&placeholder), "无前缀残值不能算拿到了 v6");
+}

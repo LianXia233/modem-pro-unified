@@ -25,8 +25,8 @@ use crate::modem::model::{usb_netifs_for_port, Modem};
 use super::uci;
 use super::v6::{self, V6Mode};
 use super::{
-    diff_plan, effective_wan_dns, iface_name, occupied_by_others, plan_wan, skip_without_device,
-    ExistingIface, UciOp, V6Plan, FIREWALL_ZONE,
+    diff_plan, effective_wan_dns, iface_name, iface_name_v6, occupied_by_others, plan_wan,
+    skip_without_device, ExistingIface, UciOp, V6Plan, FIREWALL_ZONE,
 };
 
 /// 一次组网的结果（`/api/dial` 的 `auto_wan` 字段 + 日志）。
@@ -162,10 +162,11 @@ pub fn provision_modem_with(
     // modem_pro 的 v4 也是跑 udhcpc（mp-client wrapper），而 FM350 的模组内
     // DHCP 服务器实测长期无响应（broadcast discover 无 offer）——
     // 不转换的话 modem_pro 模式在 350 系列上永远拿不到 v4 地址。
+    let is_350 = crate::runtime::hostnic::quirk(&modem.model().unwrap_or_default()).0;
     let static_ipv4 = if matches!(
         mode,
         crate::config::WanMode::Dhcp | crate::config::WanMode::ModemPro
-    ) && crate::runtime::hostnic::quirk(&modem.model().unwrap_or_default()).0
+    ) && is_350
     {
         // **实时查询优先**：拨号状态/缓存里的地址可能是上一条会话的
         // （重拨后地址会变，实测踩过），拿到新会话地址才算数；查不到
@@ -199,13 +200,16 @@ pub fn provision_modem_with(
     };
     let mut static_v6 = String::new();
     if v6_mode == V6Mode::Static {
-        let raw = {
-            let cached = modem.dial_state_ipv6();
-            if cached.is_empty() {
-                modem.query_own_ipv6().unwrap_or_default()
-            } else {
-                cached
-            }
+        // **缓存里的值不可用就立刻重查**，不能因为「非空」就信它：
+        // ① 拨号状态里的 v6 可能是上一条 PDP 的旧地址；
+        // ② `AT+CGPADDR` 在只拿到 v4 时会回一个无前缀残值（实机 `::18df:...`）。
+        // 只判 `is_empty()` 会让这两种值永久挡住后续识别 —— 模组后来真拿到
+        // v6 了，这边还在用旧残值，表现就是「一直认为没有 IPv6」。
+        let cached = modem.dial_state_ipv6();
+        let raw = if v6::usable_static_v6(&cached).is_some() {
+            cached
+        } else {
+            modem.query_own_ipv6().unwrap_or(cached)
         };
         match v6::usable_static_v6(&raw) {
             Some(addr) => static_v6 = addr,
@@ -219,7 +223,11 @@ pub fn provision_modem_with(
             }
         }
     }
-    let v6_plan = V6Plan::of(v6_mode, &static_v6, state.cfg.net.lan_ipv6);
+    // 350 系列：**永远建独立 v6 接口**，与「此刻有没有 v6 地址」解耦。
+    // 地址是模组侧 PDP 激活后才有的，组网循环不可能刚好在那个瞬间跑；
+    // 先建好 `modem<id>_6`（dhcpv6/ra 由客户端自己反复要地址），再靠下面的
+    // `maybe_rekick` 在运行期重识别，才不会被「判断得太早」卡死。
+    let v6_plan = V6Plan::of(v6_mode, &static_v6, state.cfg.net.lan_ipv6).dedicated(is_350);
     let mut plan = plan_wan(
         modem.id,
         &usb.kind,
@@ -267,6 +275,19 @@ pub fn provision_modem_with(
             );
             if let Err(e) = uci::reload_network() {
                 log::warn!("自动组网 模组 {}：补 reload 失败: {e}", modem.id);
+            }
+        }
+        // 350 系列运行期再识别 IPv6：接口形态已经配好，但模组拿到 v6 的时刻
+        // 晚于接口建立（PDP 激活 / RA 到达都可能滞后）。这里每轮看一次
+        // `ifstatus`：up 着却一直没有全局地址/委派前缀 ⇒ 按退避重新 ifdown/ifup，
+        // 让 odhcp6c 重新发 RS/DHCPv6；一旦拿到地址就自动停手。
+        // 只对 350 做 —— 其它模组的 v6 由各自模式自己管，不能无端拆接口。
+        if is_350 && v6_mode.wants_sibling() {
+            let v6_iface = iface_name_v6(modem.id);
+            if let Some(live) = v6::iface_live(&v6_iface) {
+                if v6::maybe_rekick(&v6_iface, v6_mode, live) {
+                    rep.skipped.push(format!("{v6_iface} 无全局 IPv6，已重新拉起"));
+                }
             }
         }
         // 形态对但 v6 还没就绪时，按模式补动作（都是幂等的）：

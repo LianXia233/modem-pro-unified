@@ -1890,12 +1890,18 @@ impl Modem {
     }
 
     /// 补一条 `AT+CGPADDR` 读本机 IPv6（**会占串口**，只在状态里没有值时才该调用）。
+    ///
+    /// 新鲜结果同时写回拨号状态：`dial_state_ipv6` 先读状态、后读缓存，
+    /// 只更新缓存的话状态里的旧值/残值会永远盖住这次查询 —— 组网就再也
+    /// 看不到模组后来才拿到的 IPv6（实机 FM350 晚分配 v6 的根因之一）。
     pub fn query_own_ipv6(&self) -> Result<String> {
         let cid = self.dial_state.lock().unwrap().cid;
         let cid = if cid > 0 { cid } else { DEFAULT_DATA_CID };
         let (_, ipv6) = self.query_pdp_addrs(cid)?;
-        if !ipv6.trim().is_empty() {
-            *self.own_ipv6_cache.lock().unwrap() = Some(ipv6.trim().to_string());
+        let ipv6 = ipv6.trim().to_string();
+        if !ipv6.is_empty() {
+            *self.own_ipv6_cache.lock().unwrap() = Some(ipv6.clone());
+            self.dial_update(|s| s.ipv6 = ipv6.clone());
         }
         Ok(ipv6)
     }

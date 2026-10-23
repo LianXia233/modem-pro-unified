@@ -87,9 +87,10 @@ const SMS_REFRESH_MIN_GAP: Duration = Duration::from_secs(10);
 /// 边界（与其它循环一脉相承）：
 /// - **不自己开串口**：只处理 `is_running()`（AT 口已打开）的模组，没人查询过的
 ///   模组不会被这个循环唤醒；
-/// - **不发 AT**：只 `take_urc_lines()` 取走已暂存的行 —— 与查询共用同一把 AT 锁，
-///   不会和命令收发抢串口，拿到锁后也只是 `mem::take` 一个 Vec。唯一的例外是
-///   `+CMTI` 触发的一次短信重读（见 [`refresh_sms_on_urc`]）：新短信的内容没有
+/// - **基本不发 AT**：只 `take_urc_lines()` 取走已暂存的行 —— 与查询共用同一把 AT 锁，
+///   不会和命令收发抢串口，拿到锁后也只是 `mem::take` 一个 Vec。两个例外：
+///   ① [`Modem::ensure_sms_urc`] 每会话补一次 `AT+CNMI`（拿到 OK 后就不再发）；
+///   ② `+CMTI` 触发的一次短信重读（见 [`refresh_sms_on_urc`]）：新短信的内容没有
 ///   别的路径能拿到，且受节流约束；
 /// - **只置脏、不改状态**：单字段注册态 URC 与 `n=0` 时的查询应答同形，不足以
 ///   推定状态，权威读数仍走既有查询路径（见 `model/urc.rs` 的取证表）。
@@ -111,6 +112,12 @@ fn spawn_urc(state: &Arc<AppState>, interval: u64) {
                 if !modem.is_running() {
                     continue;
                 }
+                // 主动把 `+CMTI` 上报打开：MT5700 掉电后 CNMI 回到默认（0,0,0,0,0），
+                // 不 arm 就永远没有 +CMTI，而「读短信」又只在收到 +CMTI 或用户点页面时
+                // 发生 —— 死循环，重启后新短信既不进页面也不推微信。
+                // 这个调用自带两道闸（只碰 MT5700/FM350、每会话一次），
+                // 后续每一拍都是原子的 bool 读，不再占串口。
+                modem.ensure_sms_urc();
                 let lines = modem.take_urc_lines();
                 if !lines.is_empty() {
                     let act = crate::modem::model::urc_actions(&lines);

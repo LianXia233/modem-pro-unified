@@ -95,6 +95,15 @@ pub struct V6Plan<'a> {
     pub static_addr: &'a str,
     /// `dhcpv6` 模式下把拿到的 `/64` 继续委派给 LAN（`extendprefix=1`）。
     pub extend_prefix: bool,
+    /// IPv6 必须由独立的兄弟接口负责（350 系列）。
+    ///
+    /// 为真时：
+    /// - 即使主接口是 `modem_pro` 也要建 `modem<id>_6`（不再等 IPv4 地址 / 不再
+    ///   依赖 `wan_mode`）；
+    /// - 主接口写 `mp_no_v6=1`，让 `mp-client.sh` **不要**再起一个 odhcp6c ——
+    ///   否则同一个网卡上会跑两个 DHCPv6 客户端，谁先抢到 RA 谁算，v6 接口
+    ///   反而可能因为「地址已经加在主接口上」而一直空着。
+    pub dedicated: bool,
 }
 
 impl Default for V6Plan<'_> {
@@ -103,6 +112,7 @@ impl Default for V6Plan<'_> {
             mode: V6Mode::Off,
             static_addr: "",
             extend_prefix: false,
+            dedicated: false,
         }
     }
 }
@@ -119,7 +129,14 @@ impl<'a> V6Plan<'a> {
             mode,
             static_addr,
             extend_prefix,
+            dedicated: false,
         }
+    }
+
+    /// 让 350 系列把 IPv6 完全交给独立兄弟接口（主接口不再跑 odhcp6c）。
+    pub fn dedicated(mut self, yes: bool) -> Self {
+        self.dedicated = yes;
+        self
     }
 }
 
@@ -189,6 +206,11 @@ pub struct PlannedIface {
     pub extendprefix: bool,
     /// `static` 模式的 IPv6 地址（带 `/128`；空 = 不设这一项）。
     pub ip6addr: String,
+    /// 主接口是否禁用 `mp-client.sh` 里的 odhcp6c（`mp_no_v6=1`）。
+    ///
+    /// 只有 350 系列在「IPv6 交给 modem<id>_6」时会写：主接口继续用 modem_pro
+    /// 取 v4，但 v6 必须由兄弟接口单独跑，避免两个 DHCPv6 客户端抢同一条链路。
+    pub mp_no_v6: bool,
     /// 强制下发的 DNS（空格分隔；空 = 不写 `dns` 项）。
     ///
     /// 只对主接口有意义 —— DNS 跟着默认路由走，v6 兄弟接口不配 v4 DNS。
@@ -328,9 +350,17 @@ pub fn plan_wan(
         gateway,
         extendprefix: false,
         ip6addr: String::new(),
+        // 让出 odhcp6c 的前提是**真的有兄弟接口接手**：`wan_ipv6=off` 时不建兄弟接口，
+        // 主接口也不该留下一个没人接手的 mp_no_v6=1。
+        mp_no_v6: v6.dedicated && v6.mode.wants_sibling() && proto == PROTO_MODEM_PRO,
         dns: String::new(),
     }];
-    if v6.mode.wants_sibling() && (mode.wants_dhcpv6_sibling() || proto == PROTO_STATIC) {
+    // 350 系列（`v6.dedicated`）必须建独立 v6 接口 —— **不再等 IPv4 地址**：
+    // 主接口还是 modem_pro（模组还没上报 v4）时也建，v6 才不会因为「判断得太早」
+    // 而永远缺席。此时主接口写 `mp_no_v6=1`，把 odhcp6c 让给兄弟接口。
+    if v6.mode.wants_sibling()
+        && (v6.dedicated || mode.wants_dhcpv6_sibling() || proto == PROTO_STATIC)
+    {
         let mut v6_mode = v6.mode;
         let mut ip6addr = String::new();
         // `static` 模式没有可用地址时退回 dhcpv6：写个没有地址的 static 接口
@@ -357,6 +387,7 @@ pub fn plan_wan(
             gateway: String::new(),
             extendprefix: v6_mode == V6Mode::Dhcpv6 && v6.extend_prefix,
             ip6addr,
+            mp_no_v6: false,
             dns: String::new(),
         });
     }
@@ -463,6 +494,8 @@ pub struct ExistingIface {
     /// `extendprefix` 原样存字符串（`"1"` / 空），`ip6addr` 带 `/128`。
     pub extendprefix: String,
     pub ip6addr: String,
+    /// 主接口的 `mp_no_v6`（`"1"` / 空）：350 系列把 v6 交给兄弟接口时写。
+    pub mp_no_v6: String,
     /// 已下发的 DNS（空格分隔；用于 diff 对齐，避免每轮重复写）。
     pub dns: String,
     /// 已经在哪些防火墙 zone 里（zone 名，如 `wan`）。
@@ -543,6 +576,9 @@ pub fn diff_plan(
                     push_if_set(&mut ops, &p.name, "metric", &p.metric.to_string());
                 }
                 push_if_set(&mut ops, &p.name, "auto", if p.auto { "1" } else { "0" });
+                if p.mp_no_v6 {
+                    push_if_set(&mut ops, &p.name, "mp_no_v6", "1");
+                }
                 push_if_set(&mut ops, &p.name, "ipaddr", &p.ipaddr);
                 push_if_set(&mut ops, &p.name, "netmask", &p.netmask);
                 push_if_set(&mut ops, &p.name, "gateway", &p.gateway);
@@ -573,6 +609,18 @@ pub fn diff_plan(
                 let want_auto = if p.auto { "1" } else { "0" };
                 if e.auto != want_auto {
                     push_if_set(&mut ops, &p.name, "auto", want_auto);
+                }
+                // `mp_no_v6`：350 系列把 v6 交给兄弟接口时必须写；不再需要时清掉，
+                // 否则主接口会一直少跑一个 odhcp6c（换了非 350 模组就会丢 v6）。
+                if p.mp_no_v6 {
+                    if e.mp_no_v6 != "1" {
+                        push_if_set(&mut ops, &p.name, "mp_no_v6", "1");
+                    }
+                } else if !e.mp_no_v6.is_empty() {
+                    ops.push(UciOp::Unset {
+                        section: p.name.clone(),
+                        key: "mp_no_v6".into(),
+                    });
                 }
                 // 静态项：计划里有就补齐；计划里没有（dhcp / modem_pro）而现状有 ⇒ 清掉，
                 // 否则从 static 切回 dhcp 时旧地址会跟着接口重新 ifup 进内核。
@@ -1301,6 +1349,128 @@ mod tests {
         assert_eq!(p.ifaces.len(), 2);
         assert_eq!(p.ifaces[1].proto, PROTO_NONE);
         assert_eq!(p.ifaces[1].device, "@modem0");
+    }
+
+    #[test]
+    fn fm350_dedicated_sibling_exists_before_ipv4_arrives() {
+        // 350 系列：还没拿到 IPv4（主接口仍是 modem_pro）也必须先把 v6 接口建好。
+        // 模组分配 IPv6 晚于接口建立是常态，等「确认有 v6」再建永远等不到。
+        let p = plan_wan(
+            0,
+            "ncm",
+            WanMode::ModemPro,
+            "eth2",
+            V6Plan::of(V6Mode::Dhcpv6, "", true).dedicated(true),
+            20,
+            false,
+            "",
+        );
+        assert_eq!(p.ifaces[0].proto, PROTO_MODEM_PRO);
+        assert!(p.ifaces[0].mp_no_v6, "主接口必须把 odhcp6c 让给 v6 接口");
+        assert_eq!(p.ifaces.len(), 2);
+        assert_eq!(p.ifaces[1].name, "modem0_6");
+        assert_eq!(p.ifaces[1].proto, PROTO_DHCPV6);
+        assert_eq!(p.ifaces[1].device, "@modem0");
+        assert!(p.ifaces[1].extendprefix);
+
+        // 拿到 v4 转 static 后：主接口不再跑 mp-client，mp_no_v6 应清掉
+        let p = plan_wan(
+            0,
+            "ncm",
+            WanMode::ModemPro,
+            "eth2",
+            V6Plan::of(V6Mode::Dhcpv6, "", true).dedicated(true),
+            20,
+            false,
+            "10.42.0.16",
+        );
+        assert_eq!(p.ifaces[0].proto, PROTO_STATIC);
+        assert!(!p.ifaces[0].mp_no_v6);
+        assert_eq!(p.ifaces.len(), 2, "v6 接口不能随 v4 换 proto 而消失");
+
+        // `wan_ipv6=off`：不建兄弟接口，主接口也不能留下一个没人接手的 mp_no_v6
+        let p = plan_wan(
+            0,
+            "ncm",
+            WanMode::ModemPro,
+            "eth2",
+            V6Plan::of(V6Mode::Off, "", false).dedicated(true),
+            20,
+            false,
+            "",
+        );
+        assert_eq!(p.ifaces.len(), 1, "关掉 IPv6 就不该建 v6 接口");
+        assert!(!p.ifaces[0].mp_no_v6, "没有接手方时主接口不能让出 odhcp6c");
+    }
+
+    #[test]
+    fn diff_sets_then_clears_mp_no_v6() {
+        let dedicated = plan_wan(
+            0,
+            "ncm",
+            WanMode::ModemPro,
+            "eth2",
+            V6Plan::of(V6Mode::Dhcpv6, "", true).dedicated(true),
+            20,
+            false,
+            "",
+        );
+        // 新建：主接口必须带 mp_no_v6=1
+        let ops = diff_plan(&[], &dedicated, FIREWALL_ZONE, "firewall.wan");
+        assert_set(&ops, "modem0", "mp_no_v6", "1");
+
+        // 已配好：不再重复写
+        let cur = vec![
+            ExistingIface {
+                name: "modem0".into(),
+                proto: PROTO_MODEM_PRO.into(),
+                device: "eth2".into(),
+                metric: "20".into(),
+                auto: "1".into(),
+                mp_no_v6: "1".into(),
+                zones: vec!["wan".into()],
+                ..Default::default()
+            },
+            ExistingIface {
+                name: "modem0_6".into(),
+                proto: PROTO_DHCPV6.into(),
+                device: "@modem0".into(),
+                metric: "20".into(),
+                auto: "1".into(),
+                extendprefix: "1".into(),
+                zones: vec!["wan".into()],
+                ..Default::default()
+            },
+        ];
+        let ops = diff_plan(&cur, &dedicated, FIREWALL_ZONE, "firewall.wan");
+        assert!(
+            ops.is_empty(),
+            "形态已符合计划必须是零写入，实际: {ops:?}"
+        );
+
+        // 换回普通 modem_pro（不再 dedicated）：残留的 mp_no_v6 必须清掉，
+        // 否则这个接口会永远少跑一个 odhcp6c，IPv6 直接消失。
+        let plain = plan_wan(
+            0,
+            "ncm",
+            WanMode::ModemPro,
+            "eth2",
+            V6Plan::of(V6Mode::Dhcpv6, "", true),
+            20,
+            false,
+            "",
+        );
+        let ops = diff_plan(&cur, &plain, FIREWALL_ZONE, "firewall.wan");
+        assert!(
+            ops.contains(&UciOp::Unset {
+                section: "modem0".into(),
+                key: "mp_no_v6".into()
+            }),
+            "应清掉 mp_no_v6，实际: {ops:?}"
+        );
+        assert!(ops.contains(&UciOp::Remove {
+            section: "modem0_6".into()
+        }));
     }
 
     #[test]

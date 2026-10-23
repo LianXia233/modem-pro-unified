@@ -44,6 +44,9 @@ proto_modem_pro_init_config() {
 	proto_config_add_int "metric"
 	proto_config_add_int "mtu"
 	proto_config_add_string "zone"
+	# 350 系列：IPv6 交给独立的 `modem<id>_6` 兄弟接口，本接口只跑 udhcpc。
+	# 不设它的话同一个网卡上会有两个 odhcp6c（主接口 + 兄弟接口）。
+	proto_config_add_boolean "mp_no_v6"
 }
 
 # accept_ra 必须 >= 2。
@@ -79,11 +82,11 @@ proto_modem_pro_setup() {
 
 	local hostname clientid vendorid broadcast reqopts
 	local reqaddress reqprefix ip6prefix ip6prefixes ip6ifaceid soltimeout accept_ra extendprefix
-	local metric mtu zone opt
+	local metric mtu zone opt mp_no_v6
 
 	json_get_vars hostname clientid vendorid broadcast reqopts
 	json_get_vars reqaddress reqprefix ip6prefix ip6ifaceid soltimeout accept_ra extendprefix
-	json_get_vars metric mtu zone
+	json_get_vars metric mtu zone mp_no_v6
 
 	[ -n "$iface" ] || {
 		proto_notify_error "$interface" NO_DEVICE
@@ -96,7 +99,15 @@ proto_modem_pro_setup() {
 	json_for_each_item proto_modem_pro_add_prefix ip6prefix ip6prefixes
 	[ -z "$ip6prefixes" ] && [ -n "$ip6prefix" ] && ip6prefixes="$ip6prefix"
 
-	[ "$accept_ra" = "0" ] || proto_modem_pro_fix_accept_ra "$iface"
+	# mp_no_v6=1：本接口不再承担 IPv6（350 系列由 modem<id>_6 全权负责）。
+	# 此时**不能**把 accept_ra 打开 —— 否则内核会在主网卡上自行 SLAAC 一份地址，
+	# 和兄弟接口的 odhcp6c 抢同一条链路，v6 接口反而可能一直空着。
+	NO_V6="${mp_no_v6:-0}"
+	if [ "$NO_V6" = "1" ]; then
+		logger -t modem-pro "接口 $interface 只跑 IPv4（mp_no_v6=1，IPv6 走独立 v6 接口）"
+	else
+		[ "$accept_ra" = "0" ] || proto_modem_pro_fix_accept_ra "$iface"
+	fi
 
 	local oopts=""
 	[ -n "$reqaddress" ] && [ "$reqaddress" != "auto" ] && append oopts "-N$reqaddress"
@@ -131,6 +142,7 @@ proto_modem_pro_setup() {
 	proto_export "MP_IFACE=$iface"
 	proto_export "MP_UOPTS=$uopts"
 	proto_export "MP_OOPTS=$oopts"
+	proto_export "MP_NO_V6=$NO_V6"
 	[ -n "$ip6prefixes" ] && proto_export "USERPREFIX=$ip6prefixes"
 	[ -n "$zone" ] && proto_export "ZONE=$zone"
 
@@ -143,6 +155,7 @@ proto_modem_pro_setup() {
 
 	local ep="关"
 	[ "$extendprefix" = "0" ] || ep="开（RFC 7278，RA 里的 /64 自动交给内网）"
+	[ "$NO_V6" = "1" ] && ep="由独立 v6 接口负责"
 	logger -t modem-pro "启动接口 $interface（设备 $iface）: v4=[$uopts] v6=[$oopts] 手工前缀=[$ip6prefixes] 自动跟随=$ep"
 
 	proto_run_command "$interface" /usr/lib/modem-pro/mp-client.sh

@@ -16,12 +16,14 @@
  *     模板变量定制、发送测试消息、登出）
  */
 
-/* 存储区代号 → 中文名（后端 SmsStorage 返回的是 SM / ME / MT 原文） */
+/* 存储区代号 → 中文名（后端 SmsStorage 返回的是 SM / ME / MT 原文）
+   空值：FM350 一类固件的 AT+CPMS? 只回六个数字、不带区名，此时如实说「未报区名」，
+   不能猜成 SM —— 猜错会让用户以为短信存在另一个区里。 */
 function memLabel(m) {
 	if (m === 'SM') return 'SIM 卡 (SM)';
 	if (m === 'ME') return '模组内置 (ME)';
 	if (m === 'MT') return '混合存储 (MT)';
-	return m || 'SM';
+	return m || '未报区名';
 }
 
 return view.extend({
@@ -176,7 +178,7 @@ return view.extend({
 							E('span', { 'style': 'font-weight:600' }, '短信存储区:'),
 							/* 后端 SmsStorage 的字段是 current（= mem1）与 mem1_used / mem1_total，
 							   没有 cur / counts —— 之前读错导致徽章永远显示默认 SM、容量不显示 */
-							E('span', { 'class': 'mp-badge mp-badge-primary' }, memLabel(storage.current || storage.mem1 || 'SM')),
+							E('span', { 'class': 'mp-badge mp-badge-primary' }, memLabel(storage.current || storage.mem1)),
 							(storage.mem1_total > 0)
 								? E('span', { 'style': 'color:var(--mp-neutral-500)' }, '容量: ' + storage.mem1_used + ' / ' + storage.mem1_total)
 								: ''
@@ -184,14 +186,30 @@ return view.extend({
 						E('div', { 'style': 'display:flex;align-items:center;gap:8px' }, [
 							E('label', { 'style': 'font-size:12px;color:var(--mp-neutral-500)' }, '切换存储区:'),
 							E('select', { 'id': 'sel-sms-mem', 'class': 'mp-select', 'style': 'min-width:120px' },
-								(storage.supported && storage.supported.length ? storage.supported : ['SM', 'ME', 'MT']).map(function (m) {
-									return E('option', { 'value': m, 'selected': ((storage.current || storage.mem1) === m) ? 'selected' : null }, memLabel(m));
-								})
+								(function () {
+									var mems = (storage.supported && storage.supported.length)
+										? storage.supported : ['SM', 'ME', 'MT'];
+									var cur = storage.current || storage.mem1 || '';
+									var opts = mems.map(function (m) {
+										return E('option', { 'value': m, 'selected': (cur === m) ? 'selected' : null }, memLabel(m));
+									});
+									/* AT+CPMS? 只回六个数字（没有区名）时下拉框无从选中：
+									   加一条禁用占位，既如实反映「不知道当前区」，也挡住把空值发进 AT+CPMS */
+									if (!cur) {
+										opts.unshift(E('option', { 'value': '', 'selected': 'selected', 'disabled': 'disabled' },
+											'模组未上报区名'));
+									}
+									return opts;
+								})()
 							),
 							E('button', {
 								'class': 'mp-btn mp-btn-ghost mp-btn-sm',
 								'click': ui.createHandlerFn(self, function (btn) {
 									var mem = document.getElementById('sel-sms-mem').value;
+									if (!mem) {
+										ui.addNotification(null, E('p', {}, '模组没上报当前存储区名，无法切换；请先读一次短信或改用 AT+CPMS 手动指定'), 'warning');
+										return;
+									}
 									btn.disabled = true;
 									/* 切存储区要下发 AT+CPMS 再回读确认，同步 POST 会撞上代理 20s 超时 */
 									task.run(api, 'sms.storage.set', { modem_id: id, mem: mem }).then(function () {

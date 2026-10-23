@@ -23,7 +23,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -616,15 +617,20 @@ fn finish_sms(mut s: Sms) -> Sms {
 ///
 /// 返回短信列表与「存储位置 → 拼接信息」。夹杂在应答里的 URC 行不是十六进制，
 /// 会被跳过；只有消费掉一条 PDU 之后才认下一段，因此不会错配。
+///
+/// **解不出来的条目直接丢弃**，不再留一条空的 `Sms`：
+/// 已发送区里常见 SMS-STATUS-REPORT（MTI=2，本解码器不认），留着空条目会在
+/// 页面上显示成一条「没有号码、没有正文」的鬼短信，还会把下面的长短信分组带偏。
+/// 头部行先缓存，正文解成功才落地。
 pub fn parse_pdu_list(resp: &str) -> (Vec<Sms>, HashMap<String, ConcatInfo>) {
     let mut list: Vec<Sms> = Vec::new();
     let mut concat = HashMap::new();
-    let mut cur: Option<usize> = None;
+    let mut head: Option<Sms> = None;
     for line in resp.lines() {
         let up = line.to_uppercase();
         if let Some(idx) = up.find("+CMGL:") {
             let f = split_cmgl_fields(&line[idx + "+CMGL:".len()..]);
-            cur = None;
+            head = None;
             if f.is_empty() || f[0].is_empty() {
                 continue;
             }
@@ -635,26 +641,47 @@ pub fn parse_pdu_list(resp: &str) -> (Vec<Sms>, HashMap<String, ConcatInfo>) {
             if let Some(st) = f.get(1) {
                 s.status = st.clone();
             }
-            list.push(s);
-            cur = Some(list.len() - 1);
+            head = Some(s);
             continue;
         }
-        let Some(i) = cur else { continue };
+        let Some(h) = head.as_ref() else { continue };
         let t = line.trim();
         if t.is_empty() || !is_hex_only(t) || t.len() % 2 != 0 {
+            // URC / 空行：不打断「头 + 正文」的配对，等下一条真正的 PDU
             continue;
         }
+        let (idx, status) = (h.index.clone(), h.status.clone());
+        head = None;
         if let Ok((mut s, ci)) = decode_pdu(t) {
-            s.index = list[i].index.clone();
-            s.status = list[i].status.clone();
-            list[i] = s;
+            s.index = idx.clone();
+            s.status = status;
             if ci.total >= 2 && ci.seq >= 1 && ci.seq <= ci.total {
-                concat.insert(list[i].index.clone(), ci);
+                concat.insert(idx, ci);
             }
+            list.push(s);
         }
-        cur = None;
     }
     (list, concat)
+}
+
+/// 一条 PDU 是不是 SMS-DELIVER / SMS-SUBMIT（MTI 0/1）。
+///
+/// 用于把 SMS-STATUS-REPORT（MTI=2）与 SMS-PP 数据（MTI=3）挡在拼接解析之外：
+/// 它们的字段布局不同（状态报告没有 SCTS 之后那套 UDH 偏移），
+/// 硬按 DELIVER 去读 UDH 会凑出一个假的「第 1/2 段」。
+fn is_deliver_or_submit(pdu: &str) -> bool {
+    let Some(b) = hex_to_bytes(pdu.trim()) else {
+        return false;
+    };
+    // [SMSC 长度][FO]：至少两个字节才谈得上 FO
+    let sc_len = match b.first() {
+        Some(v) => 1 + *v as usize,
+        None => return false,
+    };
+    match b.get(sc_len) {
+        Some(fo) => fo & 0x03 <= 1,
+        None => false,
+    }
 }
 
 /// 解析 PDU 模式读全部短信的应答，只返回「存储位置 → 拼接信息」。
@@ -683,9 +710,12 @@ pub fn parse_pdu_concat_list(resp: &str) -> HashMap<String, ConcatInfo> {
         {
             continue;
         }
-        if let Some(b) = hex_to_bytes(t) {
-            if let Some(ci) = parse_concat_udh(&b) {
-                out.insert(index.clone(), ci);
+        // 状态报告不是 DELIVER：布局不同，按 DELIVER 读 UDH 会读出假的分段信息
+        if is_deliver_or_submit(t) {
+            if let Some(b) = hex_to_bytes(t) {
+                if let Some(ci) = parse_concat_udh(&b) {
+                    out.insert(index.clone(), ci);
+                }
             }
         }
         index.clear(); // 一行 PDU 对应一条记录
@@ -854,6 +884,38 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// `AT+CMGS=<len>` 之后等 `>` 提示符的预算（标准两段式）。
 const SMS_PROMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// `AT+CNMI` 没设成时的重试间隔。
+///
+/// URC 循环 1 秒一拍地调 [`Modem::ensure_sms_urc`]：模组刚开机 / SIM 还没就绪时
+/// `AT+CNMI` 就是会失败，不限速等于每秒一次串口往返，把正常查询全堵住。
+const SMS_URC_RETRY_GAP: Duration = Duration::from_secs(30);
+
+static SMS_URC_LAST_TRY: OnceLock<Mutex<HashMap<u32, Instant>>> = OnceLock::new();
+
+/// 这台模组现在该不该再试一次 `AT+CNMI`（顺手记下本次尝试时刻）。
+fn sms_urc_try_due(modem_id: u32) -> bool {
+    let m = SMS_URC_LAST_TRY.get_or_init(Default::default);
+    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    if let Some(t) = g.get(&modem_id) {
+        if now.saturating_duration_since(*t) < SMS_URC_RETRY_GAP {
+            return false;
+        }
+    }
+    g.insert(modem_id, now);
+    true
+}
+
+/// 撤回限速记录：会话已经确定要重来（换命令口 / `AT+CFUN=1,1` 复位），
+/// 下一拍就该立刻再试一次，而不是等满 30 秒。
+pub(crate) fn sms_urc_forget(modem_id: u32) {
+    if let Some(m) = SMS_URC_LAST_TRY.get() {
+        m.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&modem_id);
+    }
+}
+
 /// PDU 提交的两种形态（见模块头）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PduSubmitForm {
@@ -879,7 +941,9 @@ pub struct SmsSendResult {
 impl super::Modem {
     /// 发一条短信（超长自动分段）。
     pub fn send_sms(&self, phone: &str, content: &str) -> error::Result<SmsSendResult> {
-        let phone = phone.trim();
+        // 号码先剥掉分隔符：`+86 138-0013-8000` 这种抄写在文本模式里会被当成
+        // 地址字符直接发出去（引号里的空格模组不答应），PDU 模式也一样要纯数字。
+        let phone = strip_phone_separators(phone.trim());
         let content = content.trim();
         if phone.is_empty() {
             return Err(msg("收件号码不能为空"));
@@ -892,12 +956,12 @@ impl super::Modem {
         // MT5700 / MT5710：只认「长度 + 字面 \r + PDU」的一次性形态，
         // 标准两段式在它上面会静默（见模块头）。
         if self.is_mt5700() {
-            return self.send_sms_pdu(phone, content, PduSubmitForm::OneShot);
+            return self.send_sms_pdu(&phone, content, PduSubmitForm::OneShot);
         }
         // 广和通 MTK 平台（FM350 / RW350）走标准两段式 PDU：文本模式在它上面
         // 中文与长短信都不可靠（实测）。
         if self.is_fibocom_mtk() {
-            return self.send_sms_pdu(phone, content, PduSubmitForm::TwoStep);
+            return self.send_sms_pdu(&phone, content, PduSubmitForm::TwoStep);
         }
         // 号码里的 + 在 UCS2 下也要一起编码，所以只看有没有非 ASCII 字符
         let ucs2 = !content.is_ascii() || !phone.is_ascii();
@@ -915,10 +979,13 @@ impl super::Modem {
                 p.command("AT+CSMP=17,167,0,8", t)?;
             } else {
                 p.command("AT+CSCS=\"IRA\"", t)?;
+                // TP-DCS 也是全局状态：上一次中文发送把它设成了 8（UCS2），
+                // 不复位的话这条英文短信会按 UCS2 发出去，对方收到的是乱码。
+                p.command("AT+CSMP=17,167,0,0", t)?;
             }
             for part in &parts {
                 let addr = if ucs2 {
-                    utf16_hex(phone)
+                    utf16_hex(&phone)
                 } else {
                     phone.to_string()
                 };
@@ -1026,31 +1093,55 @@ impl super::Modem {
     /// 保证 `+CMTI` 上报开着（MT5700 掉电不保存，FM350 也按同一模式）。
     ///
     /// 只对这两条支线下发；别的厂商不碰（用户可能自己配过 `AT+CNMI`）。
-    /// 每会话最多成功尝试一次：失败也不反复占串口，读短信本身不依赖它。
-    pub(super) fn ensure_sms_urc(&self) {
+    /// 确认成功就永久不再发（`sms_urc_ready`）；没确认成也按
+    /// [`SMS_URC_RETRY_GAP`] 限速，不会每拍都占串口。
+    ///
+    /// `pub(crate)`：URC 循环（`http::loops`）每轮也调它 —— 不主动 arm 的话，
+    /// 「没人开页面就没有 +CMTI，没有 +CMTI 就没人调 read_sms」是个死循环，
+    /// MT5700 重启后 CNMI 回到默认值，新短信就再也推不动页面/微信。
+    pub(crate) fn ensure_sms_urc(&self) {
         if !(self.is_mt5700() || self.is_fibocom_mtk()) {
             return;
         }
         if self.sms_urc_ready.load(Ordering::Relaxed) {
             return;
         }
-        let _ = self.with_at_prio(Prio::Bulk, |p| -> error::Result<()> {
-            let t = self.cmd_timeout;
-            let cur = p.command("AT+CNMI?", t).unwrap_or_default();
-            if !cur.to_uppercase().contains("2,1,0,2") {
-                match p.command("AT+CNMI=2,1,0,2,0", t) {
-                    Ok(r) if is_ok(&r) => {}
-                    Ok(r) => log::debug!(
-                        "模组 id={}：AT+CNMI 未被接受（{}），/api 主动读短信仍可用",
-                        self.id,
-                        r.trim()
-                    ),
-                    Err(e) => log::debug!("模组 id={}：AT+CNMI 设置失败：{e}", self.id),
+        // 限速闸：URC 循环 1 秒一拍，模组没就绪（刚开机 / SIM 未就绪）时
+        // AT+CNMI 会一直失败 —— 不设闸就是每秒一次串口往返，把查询都堵住。
+        if !sms_urc_try_due(self.id) {
+            return;
+        }
+        let armed = self
+            .with_at_prio(Prio::Bulk, |p| -> error::Result<bool> {
+                let t = self.cmd_timeout;
+                // 详细错误码（`+CME ERROR: memory busy` 而不是光 `ERROR`）：
+                // 发送/删除失败时页面能直接看懂，不用去查 CME 表。失败无所谓，
+                // 有些固件不支持 2，此时仍是简短错误码，功能不受影响。
+                let _ = p.command("AT+CMEE=2", t);
+                let cur = p.command("AT+CNMI?", t).unwrap_or_default();
+                if cur.to_uppercase().contains("2,1,0,2") {
+                    return Ok(true);
                 }
-            }
-            Ok(())
-        });
-        self.sms_urc_ready.store(true, Ordering::Relaxed);
+                match p.command("AT+CNMI=2,1,0,2,0", t) {
+                    Ok(r) if is_ok(&r) => Ok(true),
+                    Ok(r) => {
+                        log::debug!(
+                            "模组 id={}：AT+CNMI 未被接受（{}），/api 主动读短信仍可用",
+                            self.id,
+                            r.trim()
+                        );
+                        Ok(false)
+                    }
+                    Err(e) => {
+                        log::debug!("模组 id={}：AT+CNMI 设置失败：{e}", self.id);
+                        Ok(false)
+                    }
+                }
+            })
+            .unwrap_or(false);
+        if armed {
+            self.sms_urc_ready.store(true, Ordering::Relaxed);
+        }
     }
 
     /// 删一条短信（按存储位置）。
@@ -1449,23 +1540,75 @@ pub fn build_submit_parts(number: &str, text: &str) -> Result<Vec<SubmitPart>, S
     Ok(out)
 }
 
+/// 去掉号码里的分隔符（空格、`-`、`(`、`)`、`.`、`/`）。
+///
+/// 页面上常见的输入是 `+86 138-0013-8000` / `(13800138000)` 这类写法，
+/// PDU 与文本模式都要的是纯数字，先归一化再判断格式才不会误判。
+pub fn strip_phone_separators(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !matches!(c, ' ' | '\t' | '-' | '(' | ')' | '.' | '/'))
+        .collect()
+}
+
+/// 归一化收件号码，返回 `(TP-DA 类型, 数字串)`。
+///
+/// 规则（TS 23.003 / 23.040，与 `luci-app-mt5700/docs/sms-at-protocol.md` 同口径）：
+/// 1. 去分隔符；
+/// 2. `00` 开头且后面还够一个号码 ⇒ 视为手写的国际接入码，去掉并转国际格式；
+/// 3. `+` 开头 ⇒ 国际格式（`0x91`）；
+/// 4. 不带 `+` 的 `86` + 11 位手机号（国内常见抄写方式）⇒ 按国际格式；
+/// 5. 不带 `+` 的 11 位 `1` 开头手机号 ⇒ 自动补 `86` 并转国际格式
+///    （用户只写 `13800138000` 是绝大多数输入，直接按 0x81 发会被很多模组拒收）；
+/// 6. 其余保持国内格式（`0x81`），数字长度 2..=20。
+pub fn normalize_destination(raw: &str) -> Result<(u8, String), String> {
+    let s = strip_phone_separators(raw.trim());
+    if s.is_empty() {
+        return Err("收件号码不能为空".to_string());
+    }
+    let mut international = s.starts_with('+');
+    let mut digits = if international {
+        s[1..].to_string()
+    } else {
+        s.clone()
+    };
+    // 手写的国际接入码：`008613800138000`
+    if !international {
+        if let Some(rest) = digits.strip_prefix("00") {
+            if rest.len() >= 7 && rest.chars().all(|c| c.is_ascii_digit()) {
+                digits = rest.to_string();
+                international = true;
+            }
+        }
+    }
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return Err("收件号码格式无效（只允许数字与 +、-、空格、括号）".to_string());
+    }
+    // 不带 + 的 `8613800138000`：国内抄写习惯，仍按国际格式
+    if !international && digits.len() == 13 && digits.starts_with("86") {
+        international = true;
+    }
+    // 裸写的 11 位手机号 ⇒ 补中国区号
+    if !international && digits.len() == 11 && digits.starts_with('1') {
+        digits = format!("86{digits}");
+        international = true;
+    }
+    if digits.len() < 2 || digits.len() > 20 {
+        return Err(format!(
+            "收件号码长度无效（{} 位，需 2~20 位）",
+            digits.len()
+        ));
+    }
+    Ok((if international { 0x91 } else { 0x81 }, digits))
+}
+
 /// 构造单条 SMS-SUBMIT；`udh` 非空时写 TP-UDHI 并按规范前置连接头。
 fn build_single_pdu(
     number: &str,
     text: &str,
     udh: Option<&[u8]>,
 ) -> Result<(String, usize), String> {
-    // `+` 开头或 `86` 开头按国际格式（0x91），否则国内格式（0x81）
-    let (addr_type, digits) = if let Some(d) = number.strip_prefix('+') {
-        (0x91u8, d.to_string())
-    } else if number.starts_with("86") {
-        (0x91u8, number.to_string())
-    } else {
-        (0x81u8, number.to_string())
-    };
-    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
-        return Err("收件人号码格式无效".to_string());
-    }
+    // 号码统一归一化（分隔符 / 00 / 裸 11 位手机号 / 国际格式判定见上）
+    let (addr_type, digits) = normalize_destination(number)?;
 
     // 地址按数字成对交换，奇数位末字节高半字节填 0xF
     let chars: Vec<char> = digits.chars().collect();
@@ -1711,6 +1854,77 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].index, "2");
         assert_eq!(list[0].content, "你好");
+    }
+
+    #[test]
+    fn pdu_list_drops_undecodable_status_report() {
+        // 已发送区里混着 SMS-STATUS-REPORT（MTI=2，本解码器不认）。
+        // 不能留一条空 Sms —— 页面上会是「没号码没正文」的鬼条目，还会带偏长短信分组。
+        let resp = format!(
+            "+CMGL: 1,0,,25\r\n00020007916831081000F050\r\n+CMGL: 2,0,,25\r\n{DELIVER_UCS2}\r\n\r\nOK\r\n"
+        );
+        let (list, concat) = parse_pdu_list(&resp);
+        assert_eq!(list.len(), 1, "状态报告必须被丢掉，只剩能解的那条");
+        assert_eq!(list[0].index, "2");
+        assert_eq!(list[0].content, "你好");
+        assert!(concat.is_empty());
+        // 拼接表也不能被状态报告污染（它的 UDH 偏移和 DELIVER 不一样）
+        let resp2 = format!("+CMGL: 1,0,,25\r\n00020007916831081000F050\r\nOK\r\n");
+        assert!(parse_pdu_concat_list(&resp2).is_empty());
+    }
+
+    #[test]
+    fn phone_normalization_covers_real_inputs() {
+        // 国际格式
+        assert_eq!(
+            normalize_destination("+8613800138000").unwrap(),
+            (0x91, "8613800138000".into())
+        );
+        // 抄写时带的分隔符全部剥掉
+        assert_eq!(
+            normalize_destination("+86 138-0013-8000").unwrap(),
+            (0x91, "8613800138000".into())
+        );
+        assert_eq!(
+            normalize_destination("(0755) 1234-5678").unwrap(),
+            (0x81, "075512345678".into())
+        );
+        // 手写的国际接入码
+        assert_eq!(
+            normalize_destination("008613800138000").unwrap(),
+            (0x91, "8613800138000".into())
+        );
+        // 不带 + 的 86 开头（国内抄写习惯）
+        assert_eq!(
+            normalize_destination("8613800138000").unwrap(),
+            (0x91, "8613800138000".into())
+        );
+        // 裸写的 11 位手机号 ⇒ 自动补 86
+        assert_eq!(
+            normalize_destination("13800138000").unwrap(),
+            (0x91, "8613800138000".into())
+        );
+        // 10086 这类服务号保持国内格式
+        assert_eq!(normalize_destination("10086").unwrap(), (0x81, "10086".into()));
+        // 非法输入
+        assert!(normalize_destination("").is_err());
+        assert!(normalize_destination("   ").is_err());
+        assert!(normalize_destination("+8613800abc").is_err());
+        assert!(normalize_destination("12").is_ok());
+        assert!(normalize_destination(&"1".repeat(21)).is_err());
+        // 归一化是幂等的（发送前外部已清洗过一次也不会变样）
+        let once = normalize_destination("13800138000").unwrap().1;
+        assert_eq!(normalize_destination(&once).unwrap().1, once);
+    }
+
+    #[test]
+    fn build_submit_pdu_accepts_loose_phone() {
+        // 带分隔符与裸手机号必须解出同一个地址字节串
+        let (a, _) = build_submit_pdu("+86 138-0013-8000", "Hi").unwrap();
+        let (b, _) = build_submit_pdu("13800138000", "Hi").unwrap();
+        assert_eq!(a, b, "号码归一化后 PDU 必须一致");
+        // 13 位地址 + 国际类型 91
+        assert!(a.starts_with("0001000D91"), "{a}");
     }
 
     #[test]

@@ -728,6 +728,7 @@ impl Modem {
         // 换了命令口可能换到另一台设备：短信上报模式要重新确认
         self.sms_urc_ready
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        super::sms::sms_urc_forget(self.id);
         // 手动指定可能指向另一台机器：IMEI 缓存一并作废
         *self.imei_cache.lock().unwrap() = None;
         self.identify()
@@ -916,6 +917,7 @@ impl Modem {
             // 复位后 CNMI 回到默认（MT5700 是 0,0,0,0,0）：下次碰短信时重设
             self.sms_urc_ready
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+            super::sms::sms_urc_forget(self.id);
         }
         kind.to_string()
     }

@@ -31,6 +31,8 @@
 //! `modem<id>_6` 的 UCI 形态由 [`crate::netprov::plan_wan`] 算（纯策略），本模块
 //! 只放「判定 + 落地动作」（sysctl / RS / 路由），两者都不碰 AT。
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::logging::unix_now;
@@ -216,6 +218,187 @@ pub fn has_global_v6(dev: &str) -> bool {
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .any(|l| usable_v6_from_addr_line(l).is_some())
+}
+
+// ---------------------------------------------------------------- 接口健康 / 重拉
+
+/// `ifstatus <name>` 里我们关心的三个事实。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IfaceLive {
+    /// netifd 认为接口已经 up。
+    pub up: bool,
+    /// 接口本次 up 了多久（秒；取不到就是 0）。
+    pub uptime: u64,
+    /// data 里已经出现可用的全局 IPv6（地址或委派前缀）。
+    pub has_v6: bool,
+}
+
+/// 读一次 `ifstatus`（OpenWrt 的 netifd 状态，JSON）。
+///
+/// 不用 `ip addr` 查主网卡：`modem<id>_6` 的设备是 `@modem0`，地址可能落在
+/// netifd 动态建出来的设备上；`ifstatus` 报的就是这个**接口**最终拿到的
+/// 地址/前缀，和「v6 接口有没有真的起来」是同一口径。
+pub fn iface_live(name: &str) -> Option<IfaceLive> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let out = std::process::Command::new("ifstatus")
+        .arg(name)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    Some(IfaceLive {
+        up: v.get("up").and_then(|x| x.as_bool()).unwrap_or(false),
+        uptime: v.get("uptime").and_then(|x| x.as_u64()).unwrap_or(0),
+        has_v6: status_has_v6(&v),
+    })
+}
+
+/// `ifstatus` 的 data 里有没有可用的全局 IPv6。
+fn status_has_v6(v: &serde_json::Value) -> bool {
+    let addr_ok = v
+        .pointer("/data/ipv6-address")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter().any(|a| {
+                a.get("address")
+                    .and_then(|x| x.as_str())
+                    .map(is_usable_global_v6)
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    if addr_ok {
+        return true;
+    }
+    // 只拿到 PD 前缀（WAN 侧没有地址）也算「v6 链路已就绪」：LAN 已经能分到地址。
+    v.pointer("/data/ipv6-prefix-assignment")
+        .or_else(|| v.pointer("/data/ipv6-prefix"))
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter().any(|p| {
+                p.get("address")
+                    .and_then(|x| x.as_str())
+                    .map(is_usable_global_v6)
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// 重启一个 v6 兄弟接口（`ifdown` + `ifup`）。
+///
+/// 只动 `modem<id>_6`，主接口与其 IPv4 不受影响。`ifdown` 失败不算错：
+/// 接口本来就没 up 时，直接 `ifup` 就是想要的结果。
+pub fn kick_sibling(name: &str) -> bool {
+    let name = name.trim();
+    if name.is_empty() {
+        return false;
+    }
+    let _ = std::process::Command::new("ifdown").arg(name).output();
+    match std::process::Command::new("ifup").arg(name).output() {
+        Ok(o) if o.status.success() => true,
+        Ok(o) => {
+            log::warn!(
+                "重拉 v6 接口 {name} 失败：{}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            false
+        }
+        Err(e) => {
+            log::warn!("跑不了 ifup {name}: {e}");
+            false
+        }
+    }
+}
+
+/// 重拉间隔：首次 30 秒，之后 60 / 120 / 240 / 300 秒封顶。
+pub fn kick_gap(attempts: u32) -> Duration {
+    let secs = 30u64.saturating_mul(1u64 << attempts.min(4));
+    Duration::from_secs(secs.min(300))
+}
+
+/// 接口起来多久之后才开始考虑「是不是没拿到 v6」。
+///
+/// 350 系列从 PDP 激活到 RA 到达实测要十几秒；太早重拉只会把刚发出的 RS 打断。
+pub const KICK_MIN_UPTIME: u64 = 20;
+
+/// 纯策略：现在该不该重拉 v6 接口。
+///
+/// - 只有 `dhcpv6` / `ra` 需要（`static` 的地址由 UCI 直接配，不走客户端）；
+/// - 已经有全局 v6 ⇒ 永远不重拉；
+/// - 接口还没 up ⇒ 立刻拉起（`ifup`，不是重启）；
+/// - up 但不足 [`KICK_MIN_UPTIME`] ⇒ 再等等；
+/// - 其余按 [`kick_gap`] 退避，避免每 15 秒一轮把接口反复拆掉。
+pub fn should_kick(
+    mode: V6Mode,
+    up: bool,
+    uptime: u64,
+    has_v6: bool,
+    attempts: u32,
+    since_last: Option<Duration>,
+) -> bool {
+    if !matches!(mode, V6Mode::Dhcpv6 | V6Mode::Ra) || has_v6 {
+        return false;
+    }
+    if !up {
+        return true;
+    }
+    if uptime < KICK_MIN_UPTIME {
+        return false;
+    }
+    match since_last {
+        None => true,
+        Some(d) => d >= kick_gap(attempts),
+    }
+}
+
+#[derive(Debug, Default)]
+struct KickState {
+    last: Option<Instant>,
+    attempts: u32,
+}
+
+static KICK_STATE: OnceLock<Mutex<HashMap<String, KickState>>> = OnceLock::new();
+
+/// 每轮组网检查一次 v6 兄弟接口：没拿到地址就按退避重拉。
+///
+/// 这就是「模组后来才拿到 v6」的补偿路径：接口建得早、当时没有地址也没关系，
+/// 只要它 up 着还没有全局 v6，就阶段性地 `ifdown/ifup` 让它重新发 RS / DHCPv6。
+/// 拿到 v6 后计数清零，下次掉线重新从 30 秒开始。
+pub fn maybe_rekick(name: &str, mode: V6Mode, live: IfaceLive) -> bool {
+    let name = name.trim();
+    if name.is_empty() || !matches!(mode, V6Mode::Dhcpv6 | V6Mode::Ra) {
+        return false;
+    }
+    let map = KICK_STATE.get_or_init(Default::default);
+    let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
+    let st = g.entry(name.to_string()).or_default();
+    if live.has_v6 {
+        st.last = None;
+        st.attempts = 0;
+        return false;
+    }
+    let now = Instant::now();
+    let since = st.last.map(|t| now.saturating_duration_since(t));
+    if !should_kick(mode, live.up, live.uptime, live.has_v6, st.attempts, since) {
+        return false;
+    }
+    let attempt = st.attempts.saturating_add(1);
+    st.last = Some(now);
+    st.attempts = attempt;
+    drop(g);
+    log::info!(
+        "v6 接口 {name} 已运行 {}s 仍无全局 IPv6（第 {} 次重拉，模式 {}）",
+        live.uptime,
+        attempt,
+        mode.as_str()
+    );
+    kick_sibling(name)
 }
 
 // ---------------------------------------------------------------- 落地动作
