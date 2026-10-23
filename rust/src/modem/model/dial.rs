@@ -2231,7 +2231,7 @@ impl Modem {
     ///
     /// 两条候选：不带 cid 的标准写法先试；被拒（实测 FM350-GL 的 `AT+CGPADDR`
     /// 直接回 ERROR，而 `AT+CGPADDR=2` 正常）再试带 cid 的写法。
-    fn query_pdp_addrs(&self, cid: i32) -> Result<(String, String)> {
+    pub(super) fn query_pdp_addrs(&self, cid: i32) -> Result<(String, String)> {
         let mut resp = self.at_cmd_prio(Prio::Data, "AT+CGPADDR");
         if !is_ok(&resp) {
             resp = self.at_cmd_prio(Prio::Data, &format!("AT+CGPADDR={cid}"));

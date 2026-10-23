@@ -18,6 +18,7 @@ use crate::error::Result;
 use super::super::at::{csv, extract_field, is_ok, Prio};
 use super::addr;
 use super::band;
+use super::dial::DEFAULT_DATA_CID;
 use super::modem::Modem;
 use super::netselect::{self, NetSelect};
 use super::regstate::{self, RegState};
@@ -394,7 +395,37 @@ impl Modem {
         let resp = self
             .with_at_prio(Prio::Data, |p| p.command("AT+CGCONTRDP", self.cmd_timeout))
             .unwrap_or_default();
-        parse_active_context(&resp)
+        let (apn, mut v4, mut v6) = parse_active_context(&resp);
+        // 350 系列（FM350 / RW350，广和通 MTK）的地址**只认 CGPADDR**：
+        // 对齐参考实现 luci-app-fm350 的 `modem/pdp.rs` ——
+        //   * 该固件的 `<local_addr>` / `<gw_addr>` 两列常年是空串，地址只在
+        //     `AT+CGPADDR` 里，所以 CGCONTRDP 的地址在这里直接丢弃（只剩 APN 可用）；
+        //   * `AT+CGPADDR` 的 IPv6 位出现 `::1` 占位即判「无 IPv6」，不回落到
+        //     CGCONTRDP 的残留值（否则会配出一条永远不通的 v6 路由）；
+        //   * `dial_state_*` 就是 CGPADDR 读到的值（拨号器与 `query_own_ipv4/6`
+        //     都写它），所以这里不必每轮再发一条 AT；冷启动 / PDP 由外部激活时
+        //     缓存是空的，才去模组现查一次。
+        if crate::modem::model::is_fibocom_350(&self.model().unwrap_or_default()) {
+            let (c4, c6) = (self.dial_state_ipv4(), self.dial_state_ipv6());
+            let (a4, a6) = if c4.trim().is_empty() && c6.trim().is_empty() {
+                let cid = self.dial_state.lock().unwrap().cid;
+                let cid = if cid > 0 { cid } else { DEFAULT_DATA_CID };
+                self.query_pdp_addrs(cid).unwrap_or_default()
+            } else {
+                (c4, c6)
+            };
+            v4 = (!a4.trim().is_empty()).then(|| a4.trim().to_string());
+            // 占位残值（`::1` / 只有接口标识）不许显示，否则页面又会冒出个假 v6
+            v6 = crate::netprov::v6::usable_static_v6(&a6);
+        } else if v4.is_none() {
+            // 其它厂商：CGCONTRDP 的地址列是可信的（上面已按 3GPP 字段位取过）。
+            // `<local_addr>` 为空时退回拨号状态里那份，避免卡片整片空白。
+            let cached = self.dial_state_ipv4();
+            if !cached.trim().is_empty() {
+                v4 = Some(cached);
+            }
+        }
+        (apn, v4, v6)
     }
 }
 
@@ -429,34 +460,36 @@ pub fn parse_active_context(resp: &str) -> (Option<String>, Option<String>, Opti
         if ctx.apn.is_none() {
             ctx.apn = f.get(2).cloned().filter(|s| !s.is_empty());
         }
-        // 地址字段从第 3 位起扫，找到**第一个**含地址的字段就停：再往后是
-        // DNS（也是合法 IPv4/IPv6），再当地址收就会把 DNS 显示成「本机地址」。
+        // 字段下标按 3GPP TS 27.007 §10.1.24（= 广和通手册 §12.2.10）：
+        //   f[0]=cid  f[1]=bearer_id  f[2]=apn
+        //   f[3]=<local_addr and subnet_mask>   f[4]=<gw_addr>
+        //   f[5]=<DNS_prim>  f[6]=<DNS_sec>  f[7]/f[8]=<P-CSCF> …
         //
-        // 但要把「紧邻的下一个字段」也看一眼：实测两种固件会把 v4 / v6
-        // 拆开报 —— 广和通 MTK 平台是同一 cid 拆两行，移远等是同一行里
-        // 相邻两列。只认第一个字段就会漏掉另一个家族。
+        // **只读 f[3]（外加 f[4] 里另一个家族那一列），绝不往后扫**。
+        // 早先是「从第 3 位起找第一个像地址的字段」，遇到 f[3]/f[4] 为空串的
+        // 固件就会一路扫进 DNS 列：实测 FM350-GL（81600.0000.00.29.24.02）
+        // f[3]/f[4] 空、f[5]/f[6] 正是 `AT+GTDNS=1` 报的那两台 DNS ——
+        // 于是页面把运营商下发的那台 IPv6 DNS 当成「模组本机 IPv6」显示出来，
+        // 而 `AT+CGPADDR` 那边只有 `::1` 占位、链路上也没有 RA/DHCPv6，
+        // 表现就是「模组有 V6、接口没 V6」。DNS 列绝对不能当本机地址。
         //
-        // 地址字段的下标**不能写死**：3GPP 规定它在第 3 位，但实测
-        // 广和通 MTK 平台把它放到了第 5 位（f[3] / f[4] 是空串），
-        // 照 3GPP 取下标只会得到空串 —— 地址（含 IPv6）整条读不到。
-        let Some(at) = f.iter().skip(3).position(|raw| {
-            let (a, b) = split_addr(raw);
-            a.is_some() || b.is_some()
-        }) else {
-            continue;
-        };
-        let take = |ctx: &mut Ctx, raw: &str| {
-            let (a, b) = split_addr(raw);
-            if ctx.v4.is_none() {
-                ctx.v4 = a;
+        // f[4] 只在「f[3] 已经给出另一个地址家族」时才收：那是同一上下文
+        // v4/v6 拆成相邻两列时的写法；f[3] 为空时 f[4] 就是 <gw_addr>，
+        // 把它当本机地址同样会配出一条不通的路由。
+        let (mut v4, mut v6) = split_local_addr(f.get(3).map(String::as_str).unwrap_or(""));
+        if let Some(gw) = f.get(4) {
+            let (g4, g6) = split_local_addr(gw);
+            if v4.is_some() && v6.is_none() {
+                v6 = g6;
+            } else if v6.is_some() && v4.is_none() {
+                v4 = g4;
             }
-            if ctx.v6.is_none() {
-                ctx.v6 = b;
-            }
-        };
-        take(ctx, &f[at + 3]);
-        if let Some(next) = f.get(at + 4) {
-            take(ctx, next);
+        }
+        if ctx.v4.is_none() {
+            ctx.v4 = v4;
+        }
+        if ctx.v6.is_none() {
+            ctx.v6 = v6;
         }
     }
 
@@ -753,12 +786,46 @@ pub fn split_addr(addr: &str) -> (Option<String>, Option<String>) {
     (v4, v6)
 }
 
+/// 拆 `AT+CGCONTRDP` 的 `<local_addr and subnet_mask>`（手册 §12.2.10）。
+///
+/// 与 [`split_addr`] 的差别只有一个：「地址 + 掩码」连写成一列时要先切掉掩码。
+/// 出厂 `+CGPIAF: 0,0,0,0` 下这个字段是点分十进制，三种形态：
+///
+///   * IPv4：`a.b.c.d`（4 段）或 `a.b.c.d.m.m.m.m`（8 段，后 4 段是掩码）
+///   * IPv6：16 段（地址）或 32 段（前 16 段地址 + 后 16 段掩码）
+///   * 冒号写法（`+CGPIAF` 打开 IPv6 格式时）：原样交给 [`addr::normalize_ipv6`]
+///
+/// ⚠️ 这个函数**只该喂本机地址那一列**：同一条 `+CGCONTRDP` 里后面的 DNS /
+/// P-CSCF 列格式完全一样，也正是「把 DNS 当本机地址」那个 bug 的来源。
+pub fn split_local_addr(field: &str) -> (Option<String>, Option<String>) {
+    let mut v4 = None;
+    let mut v6 = None;
+    for part in field.split_whitespace() {
+        // 先把掩码切掉，再交给通用的 [`split_addr`] 做家族判定与归一化 ——
+        // 判据只有一份，两条通路（`AT+CGPADDR` / `AT+CGCONTRDP`）不会分叉。
+        let segs: Vec<&str> = part.split('.').collect();
+        let addr_only = match segs.len() {
+            8 => segs[..4].join("."),
+            32 => segs[..16].join("."),
+            _ => part.to_string(),
+        };
+        let (a, b) = split_addr(&addr_only);
+        if v4.is_none() {
+            v4 = a;
+        }
+        if v6.is_none() {
+            v6 = b;
+        }
+    }
+    (v4, v6)
+}
+
 #[cfg(test)]
 mod tests {
     use super::netselect;
     use super::{
         band_label, cops_act_tech, merge_network, operator_display, parse_active_context,
-        parse_band, parse_qnwinfo, split_addr, tech_label,
+        parse_band, parse_qnwinfo, split_addr, split_local_addr, tech_label,
     };
 
     // ---------- AT+CGCONTRDP 的 <ip addr> 拆解 ----------
@@ -834,33 +901,89 @@ mod tests {
         );
     }
 
+    // ---------- <local_addr and subnet_mask>（地址 + 掩码连写） ----------
+
+    #[test]
+    fn split_local_addr_strips_ipv4_mask() {
+        // 手册 §12.2.10：IPv4 是 a1.a2.a3.a4.m1.m2.m3.m4
+        assert_eq!(
+            split_local_addr("10.42.4.240.255.255.255.0"),
+            (Some("10.42.4.240".into()), None)
+        );
+        // 不带掩码的写法照旧
+        assert_eq!(
+            split_local_addr("10.42.4.240"),
+            (Some("10.42.4.240".into()), None)
+        );
+    }
+
+    #[test]
+    fn split_local_addr_strips_ipv6_mask() {
+        // IPv6 是 16 段地址 + 16 段掩码
+        assert_eq!(
+            split_local_addr(
+                "32.1.13.184.0.1.0.2.0.0.0.0.0.0.0.8.\
+                 255.255.255.255.255.255.255.255.0.0.0.0.0.0.0.0"
+            ),
+            (None, Some("2001:db8:1:2::8".into()))
+        );
+        // 冒号写法（+CGPIAF 打开 IPv6 格式时）同样认
+        assert_eq!(
+            split_local_addr("2001:db8:1:2::8"),
+            (None, Some("2001:db8:1:2::8".into()))
+        );
+    }
+
     // ---------- 激活上下文：APN / 地址 ----------
 
-    /// 实机（FM350-GL，中国电信）原始应答：同一个 cid 报两行，
-    /// 一行 IPv4、一行把 IPv6 展开成 16 段点分十进制，地址在第 5 个字段。
-    const FIBOCOM_MTK_CGCONTRDP: &str = concat!(
+    /// 实机（FM350-GL，固件 81600.0000.00.29.24.02）原始应答形态：
+    /// 同一个 cid 报两行（v4 一行、v6 一行），但 local_addr / gw_addr 两列
+    /// 都是空串，f[5] / f[6] 才是 DNS —— 与 AT+GTDNS=1 报的完全一致。
+    ///
+    /// 这是「模组有 V6、接口没 V6」的根因夹具：早先的实现从 f[3] 往后扫第一个
+    /// 「像地址」的字段，于是把 DNS 当成模组本机地址，页面显示出一个模组根本
+    /// 没有的 IPv6（AT+CGPADDR 那边只有 ::1 占位），接口自然永远配不上。
+    const FIBOCOM_MTK_CGCONTRDP_DNS_ONLY: &str = concat!(
         "AT+CGCONTRDP\r\n",
-        "+CGCONTRDP: 0,5,\"ctnet.MNC011.MCC460.GPRS\",\"\",\"\",\"203.0.113.53\",",
-        "\"203.0.113.54\",\"\",\"\",0,,0,,,,,,,,,,,,0\r\n",
-        "+CGCONTRDP: 0,5,\"ctnet.MNC011.MCC460.GPRS\",\"\",\"\",",
-        "\"32.1.13.184.0.0.0.0.0.0.0.0.0.0.0.1\",",
-        "\"32.1.13.184.0.0.0.0.0.0.0.0.0.0.0.2\",\"\",\"\",0,,0,,,,,,,,,,,,0\r\n",
+        "+CGCONTRDP: 1,,\"cmiot5g\",\"\",\"\",\"203.0.113.53\",",
+        "\"203.0.113.54\",\"\",\"\",0,,0\r\n",
+        "+CGCONTRDP: 1,,\"cmiot5g\",\"\",\"\",",
+        "\"32.1.13.184.0.0.0.0.0.0.0.0.0.0.0.8\",",
+        "\"32.1.13.184.0.0.0.0.0.0.0.0.0.0.4.8\",\"\",\"\",0,,0\r\n",
         "OK\r\n"
     );
 
     #[test]
+    fn active_context_never_reads_dns_columns_as_local_address() {
+        // 只有 APN 是可信的；地址列（f[3] / f[4]）是空串 ⇒ 两个家族都没地址。
+        // 尤其不能把点分 16 段的 DNS（= 2001:db8::8）当成模组本机 IPv6。
+        let (apn, v4, v6) = parse_active_context(FIBOCOM_MTK_CGCONTRDP_DNS_ONLY);
+        assert_eq!(apn.as_deref(), Some("cmiot5g"));
+        assert_eq!(v4, None);
+        assert_eq!(v6, None);
+    }
+
+    #[test]
     fn active_context_merges_v4_and_v6_rows() {
-        // 归并后两行都要取到：IPv4 一行、IPv6（点分 16 段）一行
-        let (apn, v4, v6) = parse_active_context(FIBOCOM_MTK_CGCONTRDP);
-        assert_eq!(apn.as_deref(), Some("ctnet.MNC011.MCC460.GPRS"));
-        assert_eq!(v4.as_deref(), Some("203.0.113.53"));
-        // 32.1.13.184.0.0.0.0.0.0.0.0.0.0.0.1 → 2001:db8::1
-        assert_eq!(v6.as_deref(), Some("2001:db8::1"));
+        // 同一个 cid 拆两行（一行 v4、一行把 IPv6 展开成 16 段点分十进制）：
+        // 地址都在 f[3]，归并后两个家族都要取到。
+        let resp = concat!(
+            "+CGCONTRDP: 1,,\"ctnet\",\"10.42.4.240\",\"10.42.4.1\",",
+            "\"203.0.113.53\",\"203.0.113.54\",\"\",\"\"\r\n",
+            "+CGCONTRDP: 1,,\"ctnet\",\"32.1.13.184.0.1.0.2.0.0.0.0.0.0.0.8\",",
+            "\"32.1.13.184.0.1.0.2.0.0.0.0.0.0.0.1\",\"\",\"\",\"\",\"\"\r\n",
+            "OK\r\n"
+        );
+        let (apn, v4, v6) = parse_active_context(resp);
+        assert_eq!(apn.as_deref(), Some("ctnet"));
+        assert_eq!(v4.as_deref(), Some("10.42.4.240"));
+        assert_eq!(v6.as_deref(), Some("2001:db8:1:2::8"));
     }
 
     #[test]
     fn active_context_reads_3gpp_style_address_field() {
-        // 3GPP 规定地址在第 3 位（移远/广和通其它固件常见写法）
+        // 3GPP 规定地址在 f[3]（移远/广和通其它固件常见写法）；
+        // f[4] 是 gw_addr，但这里给的是**另一个家族**，按「拆成相邻两列」收下
         let resp = "+CGCONTRDP: 1,,\"cmiot5g\",\"10.42.4.240\",\"2001:db8:1:2::8\",\"\",\"\"\r\nOK";
         let (apn, v4, v6) = parse_active_context(resp);
         assert_eq!(apn.as_deref(), Some("cmiot5g"));
@@ -869,9 +992,19 @@ mod tests {
     }
 
     #[test]
+    fn active_context_ignores_gateway_as_address() {
+        // f[3] 为空时 f[4] 就是网关，不能当成本机地址（否则会配出一条不通的路由）
+        let resp = "+CGCONTRDP: 1,,\"cmiot5g\",\"\",\"10.42.4.1\",\"203.0.113.53\",\"\"\r\nOK";
+        let (apn, v4, v6) = parse_active_context(resp);
+        assert_eq!(apn.as_deref(), Some("cmiot5g"));
+        assert_eq!(v4, None);
+        assert_eq!(v6, None);
+    }
+
+    #[test]
     fn active_context_v6_only_context_is_not_skipped() {
         // 纯 IPv6 上下文：无 APN、无 v4。原先的选中判据含 v4，会整条跳过
-        let resp = "+CGCONTRDP: 1,,\"\",\"\",\"2001:db8:1:2::8\"\r\nOK";
+        let resp = "+CGCONTRDP: 1,,\"\",\"2001:db8:1:2::8\"\r\nOK";
         let (apn, v4, v6) = parse_active_context(resp);
         assert_eq!(apn, None);
         assert_eq!(v4, None);
@@ -881,7 +1014,7 @@ mod tests {
     #[test]
     fn active_context_drops_untrustworthy_addresses() {
         // 点分的 ::1 占位：既不是合法 IPv4，也不该当成 IPv6 显示
-        let resp = "+CGCONTRDP: 1,,\"ctnet\",\"\",\"\",\"0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.1\"\r\nOK";
+        let resp = "+CGCONTRDP: 1,,\"ctnet\",\"0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.1\"\r\nOK";
         let (apn, v4, v6) = parse_active_context(resp);
         assert_eq!(apn.as_deref(), Some("ctnet"));
         assert_eq!(v4, None);
@@ -896,7 +1029,7 @@ mod tests {
         );
         assert_eq!(parse_active_context(""), (None, None, None));
         // 所有上下文都没数据时也返回三空
-        let resp = "+CGCONTRDP: 1,,\"\",\"\",\"\",\"\"\r\nOK";
+        let resp = "+CGCONTRDP: 1,,\"\",\"\",\"\"\r\nOK";
         assert_eq!(parse_active_context(resp), (None, None, None));
     }
 
@@ -905,8 +1038,8 @@ mod tests {
         // 两个不同 cid 各自一行：只取第一个有数据的，不会把 cid 2 的地址
         // 混进 cid 1 的结果里
         let resp = concat!(
-            "+CGCONTRDP: 1,,\"apn-a\",\"\",\"\",\"10.0.0.2\"\r\n",
-            "+CGCONTRDP: 2,,\"apn-b\",\"\",\"\",\"10.0.0.9\"\r\n",
+            "+CGCONTRDP: 1,,\"apn-a\",\"10.0.0.2\"\r\n",
+            "+CGCONTRDP: 2,,\"apn-b\",\"10.0.0.9\"\r\n",
             "OK\r\n"
         );
         let (apn, v4, v6) = parse_active_context(resp);

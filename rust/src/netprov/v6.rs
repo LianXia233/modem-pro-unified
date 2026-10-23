@@ -322,6 +322,27 @@ pub fn kick_gap(attempts: u32) -> Duration {
     Duration::from_secs(secs.min(300))
 }
 
+/// 「一次都没见过 v6」时的兜底间隔：30 分钟（对齐 `luci-app-fm350` 的
+/// `V6_SILENT_RECOVERY_INTERVAL`）。
+///
+/// 纯 IPv4 环境（运营商没给 v6，或本卡就没开 v6）下，接口只会一次次 down/up，
+/// 日志每分钟刷一条 —— 参考实现实测后把这种情况判成「环境如此」，只留一条
+/// 兜底巡检。这里沿用：前面几轮仍按 [`kick_gap`] 快速重试（覆盖 PDP 刚激活、
+/// RA 还没到的窗口），连续几轮都没见过 v6 之后才退到 30 分钟。
+pub const SILENT_RECOVERY_INTERVAL: Duration = Duration::from_secs(1800);
+
+/// 连续多少轮没见过 v6 之后转 30 分钟兜底。
+pub const SILENT_AFTER_ATTEMPTS: u32 = 4;
+
+/// 本轮该等多久再重拉（`seen` = 这个接口曾经拿到过全局 v6）。
+pub fn recovery_gap(attempts: u32, seen: bool) -> Duration {
+    if !seen && attempts >= SILENT_AFTER_ATTEMPTS {
+        SILENT_RECOVERY_INTERVAL
+    } else {
+        kick_gap(attempts)
+    }
+}
+
 /// 接口起来多久之后才开始考虑「是不是没拿到 v6」。
 ///
 /// 350 系列从 PDP 激活到 RA 到达实测要十几秒；太早重拉只会把刚发出的 RS 打断。
@@ -331,9 +352,12 @@ pub const KICK_MIN_UPTIME: u64 = 20;
 ///
 /// - 只有 `dhcpv6` / `ra` 需要（`static` 的地址由 UCI 直接配，不走客户端）；
 /// - 已经有全局 v6 ⇒ 永远不重拉；
-/// - 接口还没 up ⇒ 立刻拉起（`ifup`，不是重启）；
 /// - up 但不足 [`KICK_MIN_UPTIME`] ⇒ 再等等；
-/// - 其余按 [`kick_gap`] 退避，避免每 15 秒一轮把接口反复拆掉。
+/// - 其余（含「一直没 up」）一律按 [`recovery_gap`] 退避，只有第一次（`since_last`
+///   为空）立即动手 —— 否则 15 秒一轮的组网循环会把接口反复拆掉，客户端
+///   连一次完整的 RS / DHCPv6 交涉都跑不完；
+/// - 连续 [`SILENT_AFTER_ATTEMPTS`] 轮都没见过 v6 ⇒ 判定环境如此，退到
+///   [`SILENT_RECOVERY_INTERVAL`]（30 分钟）只做兜底。
 pub fn should_kick(
     mode: V6Mode,
     up: bool,
@@ -341,19 +365,25 @@ pub fn should_kick(
     has_v6: bool,
     attempts: u32,
     since_last: Option<Duration>,
+    seen: bool,
 ) -> bool {
     if !matches!(mode, V6Mode::Dhcpv6 | V6Mode::Ra) || has_v6 {
         return false;
     }
-    if !up {
-        return true;
-    }
-    if uptime < KICK_MIN_UPTIME {
+    // 起来还不够久 ⇒ 再等等（RA / DHCPv6 还在协商，别把刚发出的 RS 打断）。
+    //
+    // ⚠️ 「接口还没 up」**不能**无条件立刻重拉。`kick_sibling` 是 ifdown+ifup，
+    // 而 odhcp6c 的 soltimeout 是 120 秒：组网循环 15 秒一轮、每轮都拆一次，
+    // 客户端连一次完整的 RS / DHCPv6 交涉都跑不完，接口于是永远停在 pending。
+    // 实机日志就是这个形状 ——「已运行 0s 仍无全局 IPv6（第 N 次重拉）」每 15 秒 +1，
+    // 重拉了 60 次也没等到一个地址。所以 down 与 up 一样按 kick_gap 退避；
+    // 只有「从没拉过」（since_last = None）才立刻拉起，新建接口不必干等。
+    if up && uptime < KICK_MIN_UPTIME {
         return false;
     }
     match since_last {
         None => true,
-        Some(d) => d >= kick_gap(attempts),
+        Some(d) => d >= recovery_gap(attempts, seen),
     }
 }
 
@@ -361,6 +391,8 @@ pub fn should_kick(
 struct KickState {
     last: Option<Instant>,
     attempts: u32,
+    /// 这个接口**曾经**拿到过全局 v6（决定退到 [`SILENT_RECOVERY_INTERVAL`] 还是 [`kick_gap`]）。
+    seen: bool,
 }
 
 static KICK_STATE: OnceLock<Mutex<HashMap<String, KickState>>> = OnceLock::new();
@@ -381,11 +413,12 @@ pub fn maybe_rekick(name: &str, mode: V6Mode, live: IfaceLive) -> bool {
     if live.has_v6 {
         st.last = None;
         st.attempts = 0;
+        st.seen = true;
         return false;
     }
     let now = Instant::now();
     let since = st.last.map(|t| now.saturating_duration_since(t));
-    if !should_kick(mode, live.up, live.uptime, live.has_v6, st.attempts, since) {
+    if !should_kick(mode, live.up, live.uptime, live.has_v6, st.attempts, since, st.seen) {
         return false;
     }
     let attempt = st.attempts.saturating_add(1);

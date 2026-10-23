@@ -10,6 +10,55 @@
 
 ## [未发布]
 
+### 修复：350 系列「模组有 V6、接口没 V6」（实机 FM350-GL / 中国移动）
+
+实机现象：网络卡片显示模组有一个 IPv6，`ip -6 addr` 里接口却只有 link-local，
+`modem0_6` 一直 pending。抓下来是三个叠在一起的问题。
+
+**① `AT+CGCONTRDP` 把 DNS 服务器当成了本机地址（根因）**
+
+字段下标按 3GPP TS 27.007 §10.1.24（= 广和通手册 §12.2.10）是
+`cid, bearer_id, apn, <local_addr>, <gw_addr>, <DNS_prim>, <DNS_sec>, …`。
+原实现从第 3 位往后「扫第一个像地址的字段」，而 FM350-GL 的 `<local_addr>` /
+`<gw_addr>` 两列常年是空串 —— 于是扫进了 DNS 列，页面把运营商那台 IPv6 DNS
+显示成「模组本机 IPv6」。实测 `AT+GTDNS=1` 回的正是同一条 CGCONTRDP 里的那两个
+地址，可确认不是本机地址。同一处还把 IPv4 的 DNS 服务器当成了本机
+IPv4 显示。
+
+- `netprov` 侧没有可配的地址，`usable_static_v6()` 又是「结构合法就收」，所以
+  一旦用户把 v6 模式改成 `static`，这个 DNS 地址会被写成 `/128` 并配出一条
+  永远不通的默认路由。
+- 修法：只读 `f[3]`（`f[4]` 仅在「另一个地址家族」时收，否则那是网关），
+  新增 `split_local_addr()` 处理 `地址+掩码` 连写（IPv4 8 段 / IPv6 32 段），
+  DNS 列一律不参与。
+
+**② 350 系列地址源改为 CGPADDR 权威、CGCONTRDP 只作兜底**
+
+对齐参考实现 `luci-app-fm350` 的 `modem/pdp.rs`：该固件地址只在 `AT+CGPADDR`
+里，`::1` 占位即「无 IPv6」，绝不回落到 CGCONTRDP 的残留值。此分支只对
+`is_fibocom_350()` 生效，其它厂商的取值路径不变。
+
+**③ v6 兄弟接口每 15 秒被拆一次，客户端永远跑不完一次交涉（实机 v6 反复重启）**
+
+`should_kick` 原本「接口没 up ⇒ 立刻重拉」，而 `kick_sibling` 是 ifdown+ifup、
+odhcp6c 的 soltimeout 是 120 秒。组网循环 15 秒一轮，于是日志表现成
+「已运行 0s 仍无全局 IPv6（第 N 次重拉）」每轮 +1，重拉 60 次也没等到地址。
+
+- 接口没 up 也走退避，只有第一次（`since_last` 为空）立刻拉起。
+- 连续 4 轮都没见过 v6 ⇒ 退到 30 分钟兜底（`SILENT_RECOVERY_INTERVAL`，对齐
+  参考实现的 `V6_SILENT_RECOVERY_INTERVAL`），纯 IPv4 环境不再每分钟拆接口；
+  见过 v6 的接口仍按 30/60/120/240/300 秒恢复。
+
+### 实机验证（FM350-GL，RNDIS，ImmortalWrt SNAPSHOT aarch64）
+
+- 网络卡片：`ipv4=10.x`（真实地址）、`ipv6` 为空 —— 不再出现运营商 DNS 假地址；
+- v6 重拉节奏 15s → 60s → 120s → 240s → 30min；
+- IPv4 仍为 static（模组上报地址），上网正常。
+
+> 该卡（cmiot5g）实测**没有 IPv6**：`AT+CGDCONT` 为 `IPV4V6`、`AT+CGACT` 已激活，
+> 但 `AT+CGPADDR` 的 v6 位恒为 `::1` 占位；另建 `IPV6`-only 上下文激活同样只回
+> `::1`。所以此机型上「模组有 V6」本身就是上面 ① 造成的误报。
+
 ## [1.0.6] - 2026-10-23
 
 ### 修复：350 系列 static IPv4 下 IPv6 接口不创建
