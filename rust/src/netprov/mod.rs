@@ -277,6 +277,12 @@ pub struct WanPlan {
 /// 350 系列（FM350/RW350）实测：RNDIS 网卡不发 DHCPv6 的 RA 时，`dhcpv6` 这条路
 /// 拿不拿得到地址取决于运营商；**绝不能**把 `AT+CGPADDR` 里那个「只有接口标识」的
 /// 残值写成 `/128`（见 `v6::is_usable_global_v6`）。
+///
+/// ⚠️ **主接口被改成 `static` 时必须单独建 v6 兄弟接口**（即使 wan_mode=modem_pro）：
+/// `modem_pro` 协议只在 `proto=modem_pro` 时运行 `mp-client.sh`（里面才有 odhcp6c）。
+/// 350 系列因为模组内 DHCP 无响应而把主接口转成 `proto=static` 后，mp-client 不再
+/// 启动 —— 若还按「modem_pro 单接口」的老口径不建 `modem<id>_6`，模组明明有 IPv6，
+/// 主机侧也永远没有 odhcp6c/RA 去取，表现就是「插件认为没有 IPv6、不建 v6 接口」。
 #[allow(clippy::too_many_arguments)] // 计划参数就是这些，拆结构体会让每个调用点都更长
 pub fn plan_wan(
     modem_id: u32,
@@ -324,7 +330,7 @@ pub fn plan_wan(
         ip6addr: String::new(),
         dns: String::new(),
     }];
-    if v6.mode.wants_sibling() && mode.wants_dhcpv6_sibling() {
+    if v6.mode.wants_sibling() && (mode.wants_dhcpv6_sibling() || proto == PROTO_STATIC) {
         let mut v6_mode = v6.mode;
         let mut ip6addr = String::new();
         // `static` 模式没有可用地址时退回 dhcpv6：写个没有地址的 static 接口
@@ -1255,6 +1261,64 @@ mod tests {
             "",
         );
         assert_eq!(p.ifaces[0].proto, "dhcp");
+    }
+
+    #[test]
+    fn fm350_modem_pro_static_still_creates_v6_sibling() {
+        // 350 系列的 v4 被转成 static 后，主接口不再跑 modem_pro 协议，
+        // 也就没有 mp-client/odhcp6c —— 必须另建 modem<id>_6，否则模组有 IPv6
+        // 也永远取不到。这正是「明明有 V6，插件却不建 V6 接口」的根因。
+        let p = plan_wan(
+            0,
+            "ncm",
+            WanMode::ModemPro,
+            "eth2",
+            V6Plan::of(V6Mode::Dhcpv6, "", true),
+            20,
+            false,
+            "10.42.0.16",
+        );
+        assert_eq!(p.ifaces[0].proto, PROTO_STATIC);
+        assert_eq!(p.ifaces.len(), 2, "static 主接口必须配 v6 兄弟接口");
+        let s = &p.ifaces[1];
+        assert_eq!(s.name, "modem0_6");
+        assert_eq!(s.proto, PROTO_DHCPV6);
+        assert_eq!(s.device, "@modem0");
+        assert!(s.extendprefix, "dhcpv6 兄弟接口要把 /64 继续委派给 LAN");
+        assert_eq!(p.zone_networks, vec!["modem0", "modem0_6"]);
+
+        // RA 模式同样要建（proto=none + @主接口，sysctl/RS 由 after_reload 做）
+        let p = plan_wan(
+            0,
+            "ncm",
+            WanMode::ModemPro,
+            "eth2",
+            V6Plan::of(V6Mode::Ra, "", false),
+            20,
+            false,
+            "10.42.0.16",
+        );
+        assert_eq!(p.ifaces.len(), 2);
+        assert_eq!(p.ifaces[1].proto, PROTO_NONE);
+        assert_eq!(p.ifaces[1].device, "@modem0");
+    }
+
+    #[test]
+    fn modem_pro_without_static_keeps_single_iface() {
+        // 没有 static 覆盖时，modem_pro 自己跑 mp-client（udhcpc + odhcp6c），
+        // 不需要兄弟接口 —— 不能因为上面的修复把默认形态改成两张接口。
+        let p = plan_wan(
+            0,
+            "qmi",
+            WanMode::ModemPro,
+            "wwan0",
+            V6Plan::of(V6Mode::Dhcpv6, "", true),
+            20,
+            true,
+            "",
+        );
+        assert_eq!(p.ifaces.len(), 1);
+        assert_eq!(p.ifaces[0].proto, PROTO_MODEM_PRO);
     }
 
     #[test]

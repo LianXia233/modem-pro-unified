@@ -91,6 +91,8 @@ pub struct Modem {
     pub(super) sms_mem_pref: Mutex<String>,
     /// 本会话已经切到的存储区（避免每次读短信都发 `AT+CPMS`）。
     pub(super) sms_mem_active: Mutex<Option<String>>,
+    /// 本会话已确认过 `+CMTI` 上报（`AT+CNMI`）；模组复位 / 切口后要重设。
+    pub(super) sms_urc_ready: AtomicBool,
     /// 上一次流量采样（速率是差分出来的，见 model/traffic.rs）
     pub(super) traffic_prev: Mutex<Option<TrafficPrev>>,
     /// 速率式模组的**本地积分**累计量（见 model/traffic.rs）。
@@ -202,6 +204,7 @@ impl Modem {
             mode_cache: super::super::at::Ttl::new(Duration::from_secs(30)),
             sms_mem_pref: Mutex::new(String::new()),
             sms_mem_active: Mutex::new(None),
+            sms_urc_ready: AtomicBool::new(false),
             traffic_prev: Mutex::new(None),
             rate_total: Mutex::new(None),
             netscan_stop: Mutex::new(None),
@@ -284,6 +287,7 @@ impl Modem {
     /// 模组回 `ERROR` 时按错误处理，不能当成"卡里没短信"。
     pub fn read_sms(&self) -> Result<Vec<Sms>> {
         // 启动后第一次读短信时把 [sms] sms_memory 应用到模组（失败只 warn，沿用当前区）
+        self.ensure_sms_urc();
         self.apply_sms_memory_pref();
         let list = if self.sms_reads_via_pdu() {
             self.read_sms_via_pdu()?
@@ -342,9 +346,26 @@ impl Modem {
     /// 是否要走 PDU 模式读短信（机型特例：文本模式回的"正文"其实是十六进制 PDU，
     /// 按 UCS2 文本解会把 UDH 解成怪字符）。
     ///
-    /// 目前只钉住实测会这样的 FM350 系列；机型特例表补齐后并入。
+    /// FM350 / RW350 与 MT5700 / MT5710 都走 PDU：这两条支线的文本模式要么
+    /// 回十六进制 PDU，要么对 UDH/长短信支持不完整。
     fn sms_reads_via_pdu(&self) -> bool {
-        self.is_fibocom_mtk()
+        self.is_fibocom_mtk() || self.is_mt5700()
+    }
+
+    /// 是否为 MT5700 / MT5710（鼎桥 / TD Tech，巴龙平台）。
+    ///
+    /// 该系列不认 `AT+CMGS` 的 `>` 两段式，只接受「长度 + 字面 `\r` + PDU」
+    /// 的一次性提交；文本模式也不可靠，所以短信读写都走 PDU。
+    pub(crate) fn is_mt5700(&self) -> bool {
+        if self.vendor() != Vendor::TDTech {
+            return false;
+        }
+        let model = self.model().unwrap_or_default();
+        if model.trim().is_empty() {
+            // 厂商识别本来就是按 `MT5700` / `MT5710` 关键字命中的
+            return true;
+        }
+        is_tdtech_mt5700(&model) || is_tdtech_mt5700(&self.model_raw().unwrap_or_default())
     }
 
     /// 是否为 MTK 平台的广和通模组（FM350 / RW350 系列）。
@@ -704,6 +725,9 @@ impl Modem {
             list.insert(0, port.to_string());
         }
         *self.sms.lock().unwrap() = None;
+        // 换了命令口可能换到另一台设备：短信上报模式要重新确认
+        self.sms_urc_ready
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         // 手动指定可能指向另一台机器：IMEI 缓存一并作废
         *self.imei_cache.lock().unwrap() = None;
         self.identify()
@@ -889,6 +913,9 @@ impl Modem {
                 log::debug!("模组 id={} 换卡后复位未拿到 OK: {e}", self.id);
             }
             log::warn!("模组 id={} 已发 AT+CFUN=1,1 让新卡生效", self.id);
+            // 复位后 CNMI 回到默认（MT5700 是 0,0,0,0,0）：下次碰短信时重设
+            self.sms_urc_ready
+                .store(false, std::sync::atomic::Ordering::Relaxed);
         }
         kind.to_string()
     }
@@ -1060,11 +1087,21 @@ pub fn is_fibocom_350(model: &str) -> bool {
     u.contains("FM350") || u.contains("RW350")
 }
 
+/// 鼎桥 **MT5700 / MT5710** 系列（TD Tech，巴龙平台）。
+///
+/// 短信侧的关键差异：`AT+CMGS` 不实现 `>` 提示符两段式，只认「长度 + 字面
+/// `\r` + PDU」的一次性形态（见 `model/sms.rs` 的 `PduSubmitForm::OneShot`）。
+/// 判定与 [`Vendor::TDTech`] 的识别关键字保持一致（`MT5700` / `MT5710`）。
+pub fn is_tdtech_mt5700(model: &str) -> bool {
+    let u = model.to_ascii_uppercase();
+    u.contains("MT5700") || u.contains("MT5710")
+}
+
 #[cfg(test)]
 mod identity_tests {
     use super::{
-        at_resp_is_error, has_letter_and_digit, is_fibocom_350, labeled_version_value,
-        short_model_name, split_at_lines, Modem, Vendor,
+        at_resp_is_error, has_letter_and_digit, is_fibocom_350, is_tdtech_mt5700,
+        labeled_version_value, short_model_name, split_at_lines, Modem, Vendor,
     };
     use std::time::Duration;
 
@@ -1081,6 +1118,22 @@ mod identity_tests {
         // 高通平台与别的型号不能误伤（它们的指令族完全不同）
         for m in ["FM160-CN", "FM650-CN", "RM520N-GL", "", "RW351"] {
             assert!(!is_fibocom_350(m), "{m:?} 不该算 350 系列");
+        }
+    }
+
+    #[test]
+    fn tdtech_mt5700_family_matches_model_lines() {
+        for m in [
+            "MT5700M-CN",
+            "mt5700",
+            "MT5710-CN",
+            "Manufacturer: TD Tech Ltd.|Model: MT5700M-CN|Revision: X|OK",
+        ] {
+            assert!(is_tdtech_mt5700(m), "{m:?} 应算 MT5700 系列");
+        }
+        // 别的鼎桥/华为型号不能误伤：短信提交形态完全不同
+        for m in ["MT5730", "MT5720", "FM350-GL", "", "TD Tech"] {
+            assert!(!is_tdtech_mt5700(m), "{m:?} 不该算 MT5700 系列");
         }
     }
 

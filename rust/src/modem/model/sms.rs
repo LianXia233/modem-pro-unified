@@ -8,20 +8,28 @@
 //! 本模块只做纯解析（可单测），收发与缓存见 [`super::modem::Modem`]。
 //!
 //! 写侧（发 / 删 / 切存储区）也在本文件末尾，口径要点：
-//!   · 发短信走文本模式 `AT+CMGS`：**含非 ASCII 就切 UCS2**（`AT+CSCS="UCS2"` +
+//!   · 普通模组走文本模式 `AT+CMGS`：**含非 ASCII 就切 UCS2**（`AT+CSCS="UCS2"` +
 //!     `AT+CSMP=17,167,0,8`），地址与正文都按 UCS2 十六进制下发；发完一律切回 IRA，
 //!     否则后面读短信时正文会变成一串十六进制（字符集是模组全局状态）；
-//!   · `AT+CMGS` 是**两步指令**：先等 `>` 提示符再发正文 + Ctrl-Z，不能用一问一答的写法；
+//!   · FM350 / RW350 走 PDU 模式的标准两段式：`AT+CMGS=<len>` → 等 `>` →
+//!     PDU + Ctrl-Z。文本模式在这条 MTK 支线上中文与长短信都不可靠（实测）；
+//!   · MT5700 / MT5710 走 PDU 模式的**一次性形态**：`AT+CMGS=<len>` + 字面
+//!     `\r`（反斜杠 + r）+ PDU + CR，整条一次写完。该固件不实现 `>` 提示符握手，
+//!     真 CR 只会让模组静默；只有本地 `ERROR` / `+CME ERROR` 才退回标准两段式，
+//!     `+CMS ERROR` 与超时一律不重试（结果不明，重试会重复投递）；
+//!   · 长短信按 UDH 拼接（8 位参考号，GSM7 每段 153 septet / UCS2 每段 67 单元），
+//!     不再把每一段当成独立短信发出去；
 //!   · 删除：`AT+CMGD=<index>` 单条，`AT+CMGD=1,4` 全部（`4` = 删所有类型）。
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
 
 use crate::error::{self, msg};
 
-use super::super::at::{is_ok, Prio};
+use super::super::at::{error_line, is_ok, Prio};
 
 /// 一条短信。
 #[derive(Debug, Clone, Default, Serialize)]
@@ -843,6 +851,17 @@ const UCS2_LIMIT: usize = 70;
 const ASCII_LIMIT: usize = 160;
 /// 发一条要比普通命令耐心：模组要等到网络回执才吐 OK。
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+/// `AT+CMGS=<len>` 之后等 `>` 提示符的预算（标准两段式）。
+const SMS_PROMPT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// PDU 提交的两种形态（见模块头）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PduSubmitForm {
+    /// MT5700 / MT5710：`AT+CMGS=<len>` + 字面 `\r` + PDU + CR，整条一次写完。
+    OneShot,
+    /// FM350 / RW350 及其它标准 3GPP 模组：`AT+CMGS=<len>` → `>` → PDU + Ctrl-Z。
+    TwoStep,
+}
 
 /// 一次发送的结果。
 #[derive(Debug, Clone, Serialize)]
@@ -868,10 +887,17 @@ impl super::Modem {
         if content.is_empty() {
             return Err(msg("短信内容不能为空"));
         }
-        // 广和通 MTK 平台（FM350 系列）走 PDU 模式：文本模式在它上面
-        // 中文与长短信都不可靠（实测），所以整条发送序列换成 PDU。
+        // `+CMTI` 掉电不保存（MT5700 手册 8.3.4）：每次会话第一次碰短信时补一次。
+        self.ensure_sms_urc();
+        // MT5700 / MT5710：只认「长度 + 字面 \r + PDU」的一次性形态，
+        // 标准两段式在它上面会静默（见模块头）。
+        if self.is_mt5700() {
+            return self.send_sms_pdu(phone, content, PduSubmitForm::OneShot);
+        }
+        // 广和通 MTK 平台（FM350 / RW350）走标准两段式 PDU：文本模式在它上面
+        // 中文与长短信都不可靠（实测）。
         if self.is_fibocom_mtk() {
-            return self.send_sms_pdu(phone, content);
+            return self.send_sms_pdu(phone, content, PduSubmitForm::TwoStep);
         }
         // 号码里的 + 在 UCS2 下也要一起编码，所以只看有没有非 ASCII 字符
         let ucs2 = !content.is_ascii() || !phone.is_ascii();
@@ -922,64 +948,109 @@ impl super::Modem {
         })
     }
 
-    /// PDU 模式发短信（广和通 MTK 平台专用路径）。
+    /// PDU 模式发短信（MT5700 / FM350 系列专用路径）。
     ///
-    /// 序列：`AT+CMGF=0` → `AT+CMGS=<TPDU 字节数>` → 等 `>` 提示符 →
-    /// 写十六进制 PDU + Ctrl-Z → 等 OK。
+    /// 分片由 [`build_submit_parts`] 完成：单条能装下就不带 UDH；超长则按 8 位
+    /// 参考号加连接头（GSM7 每段 153 septet / UCS2 每段 67 个 UTF-16 单元），
+    /// 让接收端能把它们重新拼成一条。
     ///
-    /// 与文本模式的差别不只是编码：文本模式在该平台上中文与长短信都不可靠，
-    /// 所以这里是整条序列替换，不是在原序列上打补丁。
-    fn send_sms_pdu(&self, phone: &str, content: &str) -> error::Result<SmsSendResult> {
-        let parts = split_content_for_pdu(content);
-        let mut note = None;
-        if parts.len() > 1 {
-            note = Some(format!("内容超长，已分成 {} 条发出", parts.len()));
+    /// 提交形态按 `form` 分流：MT5700 一次性、FM350 标准两段式。
+    fn send_sms_pdu(
+        &self,
+        phone: &str,
+        content: &str,
+        form: PduSubmitForm,
+    ) -> error::Result<SmsSendResult> {
+        let parts = build_submit_parts(phone, content).map_err(msg)?;
+        if parts.is_empty() {
+            return Err(msg("短信内容不能为空"));
         }
-
-        let mut ucs2 = false;
         let total = parts.len();
+        let ucs2 = string_to_gsm7(content).is_none();
+        let note = if total > 1 {
+            Some(format!("内容超长，已分成 {total} 段长短信发送"))
+        } else {
+            None
+        };
+
         self.with_at_prio(Prio::Bulk, |p| {
             let t = self.cmd_timeout;
             p.command("AT+CMGF=0", t)?;
-            // 分段发送中途失败时，要说清「已经成功几条、一共几条」——
+            // 分段发送中途失败时，要说清「已经成功几段、一共几段」——
             // 只报一句「发送失败」的话，用户不知道该不该重发整条
-            for (i, part) in parts.iter().enumerate() {
-                let (pdu, len) = build_submit_pdu(phone, part).map_err(msg)?;
-                ucs2 = string_to_gsm7(part).is_none();
-                p.write_raw(&format!("AT+CMGS={len}\r"))?;
-                let prompt = p.read_until_marker(">", t)?;
-                if !prompt.contains('>') {
-                    return Err(msg(format!(
-                        "第 {} 条没给出发送提示符（>），已成功 {}/{} 条",
-                        i + 1,
-                        i,
-                        total
-                    )));
-                }
-                p.write_raw(&format!("{pdu}\u{1a}"))?;
-                let resp = p.read_response(SEND_TIMEOUT)?;
+            for part in &parts {
+                let resp = match submit_pdu_part(p, part, form) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        // 模组可能正卡在「等 PDU」的半开输入态：不 ESC 的话，
+                        // 紧跟着的 AT+CPMS? 会被当成 PDU 吞掉。
+                        let _ = p.write_raw("\u{1b}");
+                        return Err(msg(format!(
+                            "第 {}/{} 段发送失败（已成功 {}/{} 段）：{e}；\
+                             结果不明时请勿重复发送",
+                            part.part_number,
+                            part.parts_count,
+                            part.part_number - 1,
+                            part.parts_count
+                        )));
+                    }
+                };
                 if !is_ok(&resp) {
-                    return Err(msg(format!(
-                        "第 {} 条被模组拒绝（已成功 {}/{} 条）：{}",
-                        i + 1,
-                        i,
-                        total,
-                        resp.trim()
+                    let _ = p.write_raw("\u{1b}");
+                    return Err(msg(pdu_send_failure(
+                        (part.part_number - 1) as usize,
+                        part.parts_count as usize,
+                        &resp,
                     )));
                 }
             }
             Ok(())
         })?;
-        // 短信模式是全局状态：不切回文本模式的话，后续按文本模式读的操作会失效
-        let _ = self.at_cmd_prio(Prio::Bulk, "AT+CMGF=1");
+        // 短信模式是全局状态：FM350 后续要按文本模式读，切回 1；
+        // MT5700 本来就走 PDU，留在 0（它的文本模式不可靠）。
+        let restore = match form {
+            PduSubmitForm::OneShot => "AT+CMGF=0",
+            PduSubmitForm::TwoStep => "AT+CMGF=1",
+        };
+        let _ = self.at_cmd_prio(Prio::Bulk, restore);
 
         Ok(SmsSendResult {
             modem_id: self.id,
             phone: phone.to_string(),
-            parts: parts.len(),
+            parts: total,
             ucs2,
             note,
         })
+    }
+
+    /// 保证 `+CMTI` 上报开着（MT5700 掉电不保存，FM350 也按同一模式）。
+    ///
+    /// 只对这两条支线下发；别的厂商不碰（用户可能自己配过 `AT+CNMI`）。
+    /// 每会话最多成功尝试一次：失败也不反复占串口，读短信本身不依赖它。
+    pub(super) fn ensure_sms_urc(&self) {
+        if !(self.is_mt5700() || self.is_fibocom_mtk()) {
+            return;
+        }
+        if self.sms_urc_ready.load(Ordering::Relaxed) {
+            return;
+        }
+        let _ = self.with_at_prio(Prio::Bulk, |p| -> error::Result<()> {
+            let t = self.cmd_timeout;
+            let cur = p.command("AT+CNMI?", t).unwrap_or_default();
+            if !cur.to_uppercase().contains("2,1,0,2") {
+                match p.command("AT+CNMI=2,1,0,2,0", t) {
+                    Ok(r) if is_ok(&r) => {}
+                    Ok(r) => log::debug!(
+                        "模组 id={}：AT+CNMI 未被接受（{}），/api 主动读短信仍可用",
+                        self.id,
+                        r.trim()
+                    ),
+                    Err(e) => log::debug!("模组 id={}：AT+CNMI 设置失败：{e}", self.id),
+                }
+            }
+            Ok(())
+        });
+        self.sms_urc_ready.store(true, Ordering::Relaxed);
     }
 
     /// 删一条短信（按存储位置）。
@@ -1070,9 +1141,92 @@ impl super::Modem {
         }
         let back = self.with_at_prio(Prio::Bulk, |p| p.command("AT+CPMS?", self.cmd_timeout))?;
         let st = parse_storage(&back).ok_or_else(|| msg("切换后回读存储区失败"))?;
-        *self.sms_mem_active.lock().unwrap() = Some(st.current.to_uppercase());
+        // 六字段固件不回区名：用刚下发的值记「已生效」，否则每次读短信都会重切一遍
+        let active = if st.current.is_empty() {
+            m.clone()
+        } else {
+            st.current.to_uppercase()
+        };
+        *self.sms_mem_active.lock().unwrap() = Some(active);
         Ok(st)
     }
+}
+
+/// 提交一片 PDU：按模组系列选一次性或标准两段式。
+///
+/// MT5700 的一次性形态被**本地**命令层拒绝（`ERROR` / `+CME ERROR`）时，PDU 还没
+/// 进入网络侧，换标准两段式重试一次不构成重复投递；`+CMS ERROR`（网络侧已拒）与
+/// 超时（结果不明）一律原样返回，由调用方停手。
+fn submit_pdu_part(
+    p: &mut super::super::at::AtPort,
+    part: &SubmitPart,
+    form: PduSubmitForm,
+) -> error::Result<String> {
+    match form {
+        PduSubmitForm::TwoStep => submit_two_step(p, part),
+        PduSubmitForm::OneShot => {
+            // `\\r` 在 Rust 源里是「反斜杠 + r」两个字符，正是 MT5700 要的分隔符。
+            let frame = one_shot_frame(part);
+            p.write_raw(&frame)?;
+            let resp = p.read_response(SEND_TIMEOUT)?;
+            if is_ok(&resp) || !is_local_reject(&resp) {
+                return Ok(resp);
+            }
+            log::info!("短信提交：一次性形态被模组本地拒绝，退回标准两段式重试一次");
+            let _ = p.write_raw("\u{1b}");
+            submit_two_step(p, part)
+        }
+    }
+}
+
+/// MT5700 的一次性提交帧（字面 `\r` 分隔，末尾真 CR 收尾）。
+fn one_shot_frame(part: &SubmitPart) -> String {
+    format!("AT+CMGS={}\\r{}\r", part.tpdu_length, part.pdu)
+}
+
+/// 标准 3GPP 两段式：`AT+CMGS=<len>` → 等 `>` → PDU + Ctrl-Z。
+fn submit_two_step(
+    p: &mut super::super::at::AtPort,
+    part: &SubmitPart,
+) -> error::Result<String> {
+    p.write_raw(&format!("AT+CMGS={}\r", part.tpdu_length))?;
+    let prompt = p.read_until_marker(">", SMS_PROMPT_TIMEOUT)?;
+    if !prompt.contains('>') {
+        // 没等到提示符就写 PDU 会被模组当成一条新 AT 命令，回一个无关的 ERROR
+        return Err(msg("模组没给出发送提示符（>），短信未发出"));
+    }
+    p.write_raw(&format!("{}\u{1a}", part.pdu))?;
+    p.read_response(SEND_TIMEOUT)
+}
+
+/// 模组是否在**本地命令解析层**拒绝了这次提交（PDU 尚未进网络侧）。
+fn is_local_reject(resp: &str) -> bool {
+    if resp.to_uppercase().contains("+CMS ERROR") {
+        return false;
+    }
+    error_line(resp).is_some()
+}
+
+/// 把一次失败的提交写成给人看的一句话（区分「被拒」与「结果不明」）。
+fn pdu_send_failure(index: usize, total: usize, resp: &str) -> String {
+    let detail = resp.trim();
+    let detail = if detail.is_empty() {
+        "(无应答)"
+    } else {
+        detail
+    };
+    let reason = if error_line(resp).is_some() {
+        "被模组拒绝"
+    } else {
+        "未收到模组确认（可能已发出，请勿重复发送）"
+    };
+    format!(
+        "第 {}/{} 段{reason}（已成功 {}/{} 段）：{detail}",
+        index + 1,
+        total,
+        index,
+        total
+    )
 }
 
 /// 按单条容量切分正文（按**字符**切，超宽的 emoji 在 UCS2 里占两个单元也算两个字符）。
@@ -1108,6 +1262,26 @@ pub fn utf16_bytes(s: &str) -> Vec<u8> {
 /// GSM7 单条上限（septet 数）；UCS2 单条上限 70 个 UTF-16 单元（140 字节）。
 const GSM7_PDU_LIMIT: usize = 160;
 const UCS2_PDU_UNITS: usize = 70;
+/// 带 UDH 时每段的正文容量（153 + 7 个 UDH septet = 160；67 + 3 个 UCS2 码元 = 70）。
+const GSM7_CONCAT_LIMIT: usize = 153;
+const UCS2_CONCAT_UNITS: usize = 67;
+/// TP-UD 的字节上限（TS 23.040：140 octets）。
+const UD_MAX_OCTETS: usize = 140;
+/// 8 位连接头 UDH：UDHL + IEI + IEDL + ref + total + seq = 6 字节。
+const CONCAT_UDH_LEN: usize = 6;
+
+/// 一片待提交的 SMS-SUBMIT。
+#[derive(Debug, Clone)]
+pub struct SubmitPart {
+    /// 完整 PDU（含 SMSC 字段 `00`）的十六进制串。
+    pub pdu: String,
+    /// `AT+CMGS` 要的长度：**不含** SMSC 字段的 TPDU 字节数。
+    pub tpdu_length: usize,
+    /// 当前段序号（1 起）。
+    pub part_number: u8,
+    /// 总段数。
+    pub parts_count: u8,
+}
 
 /// 单个字符在 GSM7 里占几个 septet（扩展字符是 2）。
 fn gsm7_cost(c: char) -> usize {
@@ -1118,40 +1292,102 @@ fn gsm7_cost(c: char) -> usize {
     }
 }
 
-/// 按单条容量切分正文（PDU 模式，按**真实占用的 septet / UTF-16 单元**切）。
-///
-/// 与文本模式的 `split_content` 的区别：这里按实际容量算 ——
-/// GSM7 的扩展字符占 2 个 septet、emoji 占 2 个 UTF-16 单元，
-/// 按字符数切会超出单条上限，模组要么拒发要么静默截断。
-pub fn split_content_for_pdu(content: &str) -> Vec<String> {
+/// 按给定容量切分正文（成本函数决定每个字符占多少单位）。
+fn split_with_limit(content: &str, limit: usize, cost: fn(char) -> usize) -> Vec<String> {
     let chars: Vec<char> = content.chars().collect();
     if chars.is_empty() {
         return Vec::new();
     }
-    let gsm7 = string_to_gsm7(content).is_some();
-    let (limit, cost): (usize, fn(char) -> usize) = if gsm7 {
-        (GSM7_PDU_LIMIT, gsm7_cost)
-    } else {
-        (UCS2_PDU_UNITS, |c| c.len_utf16())
-    };
-
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut used = 0usize;
     for c in chars {
-        let cost = cost(c);
+        let c_cost = cost(c);
         // 单个字符就超限时也要能发出去：先落地当前段，再单独起一段
-        if used + cost > limit && !cur.is_empty() {
+        if used + c_cost > limit && !cur.is_empty() {
             out.push(std::mem::take(&mut cur));
             used = 0;
         }
         cur.push(c);
-        used += cost;
+        used += c_cost;
     }
     if !cur.is_empty() {
         out.push(cur);
     }
     out
+}
+
+/// 按单条容量切分正文（PDU 模式，按**真实占用的 septet / UTF-16 单元**切）。
+///
+/// 与文本模式的 `split_content` 的区别：这里按实际容量算 ——
+/// GSM7 的扩展字符占 2 个 septet、emoji 占 2 个 UTF-16 单元，
+/// 按字符数切会超出单条上限，模组要么拒发要么静默截断。
+///
+/// 这里算的是**单条**容量（160 / 70）；长短信的实际分段由
+/// [`build_submit_parts`] 按 UDH 扣除后的容量重切。
+#[cfg(test)]
+pub fn split_content_for_pdu(content: &str) -> Vec<String> {
+    if string_to_gsm7(content).is_some() {
+        split_with_limit(content, GSM7_PDU_LIMIT, gsm7_cost)
+    } else {
+        split_with_limit(content, UCS2_PDU_UNITS, char::len_utf16)
+    }
+}
+
+/// 构造 UDH 的 8 位连接头（IEI=0x00）。
+fn concat_udh(reference: u8, total: u8, seq: u8) -> Vec<u8> {
+    vec![
+        (CONCAT_UDH_LEN - 1) as u8, // UDHL：不含自身
+        0x00,                       // IEI：8 位参考号的连接头
+        0x03,                       // IEDL
+        reference,
+        total,
+        seq,
+    ]
+}
+
+/// 把 UDH 字节摊成 LSB-first 的 septet 序列（48 bit → 7 个 septet，末位补 0）。
+///
+/// GSM7 的 UDH 与正文共享同一条比特流：`pack7` 之前先把 UDH 转成 septet，
+/// 它自然占据前 7 个 septet（第 7 个的最高位就是规范要求的填充位）。
+fn udh_as_septets(udh: &[u8]) -> Vec<u8> {
+    let n = (udh.len() * 8).div_ceil(7);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let bit = i * 7;
+        let (idx, off) = (bit / 8, bit % 8);
+        let mut v = 0u16;
+        if idx < udh.len() {
+            v = (udh[idx] as u16) >> off;
+        }
+        if off > 0 && idx + 1 < udh.len() {
+            v |= (udh[idx + 1] as u16) << (8 - off);
+        }
+        out.push((v & 0x7F) as u8);
+    }
+    out
+}
+
+/// GSM7 + UDH：把 UDH 与正文拼成同一条 septet 流再压缩。
+///
+/// 返回 `(压缩后的 UD, TP-UDL)`；UDL 计的是 septet 总数（含 UDH 与填充位）。
+fn pack7_with_udh(udh: &[u8], seps: &[u8]) -> (Vec<u8>, usize) {
+    let mut all = udh_as_septets(udh);
+    all.extend_from_slice(seps);
+    (pack7(&all), all.len())
+}
+
+/// 8 位连接头参考号（1..=255 循环；同一收件人的短窗口内不撞号即可）。
+fn next_concat_reference() -> u8 {
+    static NEXT: AtomicU8 = AtomicU8::new(1);
+    let mut cur = NEXT.load(Ordering::Relaxed);
+    loop {
+        let next = if cur >= 255 { 1 } else { cur + 1 };
+        match NEXT.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return cur,
+            Err(actual) => cur = actual,
+        }
+    }
 }
 
 /// 构造 SMS-SUBMIT PDU（SMSC 长度置 0 → 使用模组内默认短信中心）。
@@ -1161,7 +1397,64 @@ pub fn split_content_for_pdu(content: &str) -> Vec<String> {
 ///
 /// 编码自适应：全文能塞进 GSM 7-bit 表就走 7-bit（更省、单条 160 字符），
 /// 否则回落 UCS2（中文必然走这条）。
+#[cfg(test)]
 pub fn build_submit_pdu(number: &str, text: &str) -> Result<(String, usize), String> {
+    build_single_pdu(number, text, None)
+}
+
+/// 按段构造要发出去的 SMS-SUBMIT（超长自动加 UDH 连接头）。
+///
+/// 单条能装下就不带 UDH；超过单条容量后按 153 septet / 67 个 UTF-16 单元
+/// 重切，并给每段加同一个 8 位参考号 —— 接收端据此还原成长短信。
+pub fn build_submit_parts(number: &str, text: &str) -> Result<Vec<SubmitPart>, String> {
+    if text.is_empty() {
+        return Err("短信内容为空".to_string());
+    }
+    let gsm7 = string_to_gsm7(text).is_some();
+    let (limit, cost): (usize, fn(char) -> usize) = if gsm7 {
+        (GSM7_PDU_LIMIT, gsm7_cost)
+    } else {
+        (UCS2_PDU_UNITS, char::len_utf16)
+    };
+    let mut chunks = split_with_limit(text, limit, cost);
+    let concat = chunks.len() > 1;
+    if concat {
+        let (limit, cost) = if gsm7 {
+            (GSM7_CONCAT_LIMIT, gsm7_cost as fn(char) -> usize)
+        } else {
+            (UCS2_CONCAT_UNITS, char::len_utf16 as fn(char) -> usize)
+        };
+        chunks = split_with_limit(text, limit, cost);
+    }
+    if chunks.len() > 255 {
+        return Err("短信过长，超过 255 段拼接上限".to_string());
+    }
+    let total = chunks.len() as u8;
+    let reference = next_concat_reference();
+    let mut out = Vec::with_capacity(chunks.len());
+    for (i, chunk) in chunks.iter().enumerate() {
+        let udh = if concat {
+            Some(concat_udh(reference, total, (i + 1) as u8))
+        } else {
+            None
+        };
+        let (pdu, tpdu_length) = build_single_pdu(number, chunk, udh.as_deref())?;
+        out.push(SubmitPart {
+            pdu,
+            tpdu_length,
+            part_number: (i + 1) as u8,
+            parts_count: total,
+        });
+    }
+    Ok(out)
+}
+
+/// 构造单条 SMS-SUBMIT；`udh` 非空时写 TP-UDHI 并按规范前置连接头。
+fn build_single_pdu(
+    number: &str,
+    text: &str,
+    udh: Option<&[u8]>,
+) -> Result<(String, usize), String> {
     // `+` 开头或 `86` 开头按国际格式（0x91），否则国内格式（0x81）
     let (addr_type, digits) = if let Some(d) = number.strip_prefix('+') {
         (0x91u8, d.to_string())
@@ -1185,8 +1478,12 @@ pub fn build_submit_pdu(number: &str, text: &str) -> Result<(String, usize), Str
         k += 2;
     }
 
+    let mut first_octet = 0x01u8; // SMS-SUBMIT，无有效期
+    if udh.is_some() {
+        first_octet |= 0x40; // TP-UDHI
+    }
     let mut tpdu: Vec<u8> = vec![
-        0x01,               // SMS-SUBMIT，无有效期、无 UDH
+        first_octet,
         0x00,               // TP-MR
         digits.len() as u8, // 地址长度（数字个数）
         addr_type,
@@ -1194,19 +1491,39 @@ pub fn build_submit_pdu(number: &str, text: &str) -> Result<(String, usize), Str
     tpdu.extend_from_slice(&addr_bytes);
     tpdu.push(0x00); // TP-PID
 
-    if let Some(septets) = string_to_gsm7(text) {
-        tpdu.push(0x00); // TP-DCS: 7-bit
-        tpdu.push(septets.len() as u8); // UDL = septet 数
-        tpdu.extend_from_slice(&pack7(&septets));
-    } else {
-        let ucs2 = utf16_bytes(text);
-        if ucs2.len() > 255 {
-            return Err(format!("单条内容过长（{} 字节，上限 255）", ucs2.len()));
+    let ud: Vec<u8>;
+    let udl: usize;
+    match (string_to_gsm7(text), udh) {
+        (Some(septets), Some(u)) => {
+            tpdu.push(0x00); // TP-DCS: 7-bit
+            let (packed, seps) = pack7_with_udh(u, &septets);
+            ud = packed;
+            udl = seps;
         }
-        tpdu.push(0x08); // TP-DCS: UCS2
-        tpdu.push(ucs2.len() as u8); // UDL = 字节数
-        tpdu.extend_from_slice(&ucs2);
+        (Some(septets), None) => {
+            tpdu.push(0x00); // TP-DCS: 7-bit
+            udl = septets.len();
+            ud = pack7(&septets);
+        }
+        (None, _) => {
+            let mut body = Vec::with_capacity(udh.map_or(0, |u| u.len()) + text.len() * 2);
+            if let Some(u) = udh {
+                body.extend_from_slice(u);
+            }
+            body.extend_from_slice(&utf16_bytes(text));
+            tpdu.push(0x08); // TP-DCS: UCS2
+            udl = body.len();
+            ud = body;
+        }
     }
+    if ud.len() > UD_MAX_OCTETS {
+        return Err(format!(
+            "单段内容过长（{} 字节，上限 {UD_MAX_OCTETS}）",
+            ud.len()
+        ));
+    }
+    tpdu.push(udl as u8); // TP-UDL
+    tpdu.extend_from_slice(&ud);
 
     // 最终 PDU = 00（SMSC 长度 0） + TPDU
     let mut full = vec![0x00u8];
@@ -1214,16 +1531,45 @@ pub fn build_submit_pdu(number: &str, text: &str) -> Result<(String, usize), Str
     Ok((hex_string(&full), tpdu.len()))
 }
 
-/// 解析 `AT+CPMS?` 应答：`+CPMS: "SM",3,30,"SM",3,30,"SM",3,30`。
+/// 解析 `AT+CPMS?` 应答。
+///
+/// 两种形态都认：
+///   · 带区名：`+CPMS: "SM",3,30,"SM",3,30,"SM",3,30`；
+///   · 只有六个数字：`+CPMS: 3,50,3,50,1,30`（FM350 部分固件不带区名，
+///     顺序是 `<used1>,<total1>,<used2>,<total2>,<used3>,<total3>`）。
+///
+/// 六字段形态下区名留空 —— 用量是真实的，只是名字缺失；不去猜 SM/ME，
+/// 猜错会让用户以为短信存在另一个区里。个别固件回 `^CPMS:`，同样接受。
 pub fn parse_storage(resp: &str) -> Option<SmsStorage> {
-    let line = resp.lines().find(|l| l.to_uppercase().contains("+CPMS:"))?;
+    let line = resp
+        .lines()
+        .find(|l| l.to_uppercase().contains("CPMS:"))?;
     let up = line.to_uppercase();
-    let idx = up.find("+CPMS:")?;
-    let f = crate::modem::at::csv(&line[idx + "+CPMS:".len()..]);
+    let idx = up.find("CPMS:")? + "CPMS:".len();
+    let f = crate::modem::at::csv(&line[idx..]);
+    let at = |i: usize| f.get(i).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+
+    // FM350：六个纯数字，三组 used/total，没有区名
+    if f.len() >= 6 && f[0].parse::<i32>().is_ok() && f[2].parse::<i32>().is_ok() {
+        return Some(SmsStorage {
+            mem1: String::new(),
+            mem1_used: at(0),
+            mem1_total: at(1),
+            mem2: String::new(),
+            mem2_used: at(2),
+            mem2_total: at(3),
+            mem3: String::new(),
+            mem3_used: at(4),
+            mem3_total: at(5),
+            current: String::new(),
+            raw: line.trim().to_string(),
+            ..Default::default()
+        });
+    }
+
     if f.len() < 6 {
         return None;
     }
-    let at = |i: usize| f.get(i).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
     let mut st = SmsStorage {
         mem1: f[0].clone(),
         mem1_used: at(1),
@@ -1667,5 +2013,99 @@ mod tests {
         // 非 BCD → 空串（按"时间未知"处理）
         assert_eq!(pdu_time(&[0xFF, 0x40, 0x92, 0x01, 0x65, 0x44, 0x23]), "");
         assert_eq!(pdu_time(&[0x00]), "");
+    }
+
+    #[test]
+    fn storage_parse_six_numeric_and_caret_prefix() {
+        // FM350 部分固件：六个纯数字，无区名
+        let st = parse_storage("+CPMS: 3,50,3,50,1,30\r\nOK\r\n").unwrap();
+        assert_eq!((st.mem1_used, st.mem1_total), (3, 50));
+        assert_eq!((st.mem2_used, st.mem2_total), (3, 50));
+        assert_eq!((st.mem3_used, st.mem3_total), (1, 30));
+        assert!(st.mem1.is_empty(), "六字段形态不猜区名");
+        assert!(st.current.is_empty());
+
+        // 个别固件用 ^CPMS 前缀
+        let st = parse_storage("^CPMS: \"ME\",1,100,\"ME\",1,100\r\nOK\r\n").unwrap();
+        assert_eq!((st.current.as_str(), st.mem1_used, st.mem1_total), ("ME", 1, 100));
+    }
+
+    #[test]
+    fn submit_parts_single_has_no_udh() {
+        let parts = build_submit_parts("+8613800138000", "Hi").unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!((parts[0].part_number, parts[0].parts_count), (1, 1));
+        let b = hex_to_bytes(&parts[0].pdu).unwrap();
+        let p = 1 + b[0] as usize;
+        assert_eq!(b[p] & 0x40, 0, "单条不应写 TP-UDHI");
+        assert_eq!(b[p] & 0x03, 0x01, "必须是 SMS-SUBMIT");
+    }
+
+    #[test]
+    fn long_gsm7_parts_add_concat_udh_and_roundtrip() {
+        let text = "a".repeat(200);
+        let parts = build_submit_parts("13800138000", &text).unwrap();
+        assert_eq!(parts.len(), 2, "200 septet 应按 153/段拆成 2 段");
+        let mut merged = String::new();
+        for (i, part) in parts.iter().enumerate() {
+            assert_eq!((part.part_number, part.parts_count), ((i + 1) as u8, 2));
+            let b = hex_to_bytes(&part.pdu).unwrap();
+            let p = 1 + b[0] as usize;
+            assert_eq!(b[p] & 0x40, 0x40, "长短信必须写 TP-UDHI");
+            // 首段 153 个 a、次段 47 个；UDH 的填充位不能让正文错位
+            let (decoded, _) = decode_pdu(&part.pdu).unwrap();
+            assert_eq!(decoded.content.len(), if i == 0 { 153 } else { 47 });
+            merged.push_str(&decoded.content);
+        }
+        assert_eq!(merged, text, "UDH 与正文共用比特流后必须仍能逐字还原");
+    }
+
+    #[test]
+    fn long_ucs2_parts_add_concat_udh_and_roundtrip() {
+        let text = "中".repeat(100);
+        let parts = build_submit_parts("+8613800138000", &text).unwrap();
+        assert_eq!(parts.len(), 2, "100 个 UCS2 单元应按 67/段拆成 2 段");
+        let mut merged = String::new();
+        for (i, part) in parts.iter().enumerate() {
+            let (decoded, _) = decode_pdu(&part.pdu).unwrap();
+            assert_eq!(
+                decoded.content.chars().count(),
+                if i == 0 { 67 } else { 33 }
+            );
+            let b = hex_to_bytes(&part.pdu).unwrap();
+            // UDL = 6 字节 UDH + 正文（67 / 33 字符 × 2 字节）
+            let p = 1 + b[0] as usize;
+            let addr_len = b[p + 2] as usize;
+            // 首字节 + TP-MR + 地址长度/TOA + 号码 + PID + DCS
+            let udl_at = p + 4 + addr_len.div_ceil(2) + 2;
+            assert_eq!(b[udl_at] as usize, if i == 0 { 140 } else { 72 });
+            merged.push_str(&decoded.content);
+        }
+        assert_eq!(merged, text);
+    }
+
+    #[test]
+    fn one_shot_frame_uses_literal_backslash_r() {
+        let part = SubmitPart {
+            pdu: "0011".into(),
+            tpdu_length: 2,
+            part_number: 1,
+            parts_count: 1,
+        };
+        let f = one_shot_frame(&part);
+        assert_eq!(f.matches('\r').count(), 1, "只有末尾是真 CR");
+        assert!(f.contains("\\r"), "长度与 PDU 之间必须是字面反斜杠 + r");
+        assert!(f.starts_with("AT+CMGS=2\\r0011"), "{f:?}");
+    }
+
+    #[test]
+    fn fallback_only_on_local_command_errors() {
+        // 本地命令解析层：可以换两段式重试
+        assert!(is_local_reject("ERROR\r\n"));
+        assert!(is_local_reject("+CME ERROR: 3\r\n"));
+        // 网络侧拒绝 / 成功 / 超时静默：不能重试
+        assert!(!is_local_reject("+CMS ERROR: 500\r\n"));
+        assert!(!is_local_reject("+CMGS: 12\r\nOK\r\n"));
+        assert!(!is_local_reject("AT+CMGS=19\r\n"));
     }
 }

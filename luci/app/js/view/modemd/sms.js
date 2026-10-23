@@ -119,9 +119,13 @@ return view.extend({
 				var val = textarea.value;
 				var len = val.length;
 				var hasNonAscii = /[^\x00-\x7F]/.test(val);
-				var seg = hasNonAscii ? Math.ceil(len / 70) || 1 : Math.ceil(len / 160) || 1;
+				// 单条 160/70；超过一条就按 UDH 扣除后的 153/67 重算
+				var seg = Math.ceil(len / (hasNonAscii ? 70 : 160)) || 1;
+				if (seg > 1) seg = Math.ceil(len / (hasNonAscii ? 67 : 153)) || 1;
 				counter.children[0].textContent = '长度: ' + len + ' 字 (预计 ' + seg + ' 条)';
-				counter.children[1].textContent = hasNonAscii ? '编码: UCS2 UTF-16 (单条限 70 字)' : '编码: GSM7 (单条限 160 字)';
+				counter.children[1].textContent = hasNonAscii
+					? '编码: UCS2 UTF-16 (单条约 70 字，长短信每段 67 字)'
+					: '编码: GSM7 (单条约 160 字，长短信每段 153 字)';
 			});
 
 			document.body.appendChild(mask);
