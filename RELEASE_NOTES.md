@@ -1,45 +1,29 @@
-# modem-pro v1.0.7 发版说明
+# modem-pro v1.0.8 发版说明
 
-发布日期：2026-10-24 ｜ 标签 `v1.0.7` ｜ 版本号 `1.0.7-1`（`VERSION`）
+发布日期：2026-10-24 ｜ 标签 `v1.0.8` ｜ 版本号 `1.0.8-1`（`VERSION`）
 
-本版两条主线：**350 系列「模组有 V6、接口没 V6」的三层修复**（实机 FM350-GL /
-中国移动），以及 **内核 6.x 下一台模组被登记成多台的 discovery 修复**（实机
-Hiveton H5000M / ImmortalWrt SNAPSHOT / kernel 6.18.55 / Quectel RG520F-EB）。
-逐项细节见 [CHANGELOG.md](CHANGELOG.md) 的 [1.0.7] 条目。
+本版主线：**QMI/MBIM 模式下内置原生拨号后端显示「未运行」的修复**——对照上游
+[LianXia233/modem-pro](https://github.com/LianXia233/modem-pro) 的主机侧拨号链路
+（`hostdial*.go`）逐项核对，定位到四处移植缺口并全部按上游真实实现补齐，
+另修一处随释放步骤暴露的断开竞态。逐项细节见 [CHANGELOG.md](CHANGELOG.md) 的
+[1.0.8] 条目。
 
 ## 这版做了什么
 
-### 1. 350 系列「模组有 V6、接口没 V6」（实机 FM350-GL，RNDIS）
+「拨号上网」页的「内置原生拨号后端」卡片按 `/api/dial` 的 `host_dialer` 是否有
+会话显示徽标；此前 QMI/MBIM 模组上它长期显示「未运行」——不是 UI 判断错，而是
+会话真的建立不起来。四处根因与修法：
 
-三个叠在一起的问题，本版逐层修齐：
-
-| # | 问题 | 修法 |
+| # | 根因 | 修法（上游依据） |
 | --- | --- | --- |
-| ① 根因 | `AT+CGCONTRDP` 解析从第 3 位起「扫第一个像地址的字段」，而 FM350-GL 的 `<local_addr>` / `<gw_addr>` 列常年空串 —— 把运营商的 IPv6 DNS 显示成「模组本机 IPv6」；若用户把 v6 模式改 `static`，还会被写成 `/128` 并配出一条永远不通的默认路由 | 只读 `f[3]`（`f[4]` 仅在「另一个地址家族」时收，否则那是网关）；新增 `split_local_addr()` 处理 `地址+掩码` 连写（IPv4 8 段 / IPv6 32 段），DNS 列一律不参与 |
-| ② | 350 系列地址源可能回落到 CGCONTRDP 残留值 | 对齐参考实现 `luci-app-fm350`：地址只在 `AT+CGPADDR` 里，`::1` 占位即「无 IPv6」；CGCONTRDP 只作兜底。仅对 `is_fibocom_350()` 生效，其它厂商路径不变 |
-| ③ | v6 兄弟接口每 15 秒被拆一次（`should_kick` 见「没 up 就重拉」，而 odhcp6c 的 soltimeout 是 120 秒），客户端永远跑不完一次交涉 | 接口没 up 也走退避，只有第一次立刻拉起；节奏 **15 秒 ×10 → 61 秒 ×10 → 180 秒（无限兜底）**，纯 IPv4 环境也保持巡检以便运营商补开 v6 时自愈 |
+| ① QMI 主根因 | `raw_ip` 在运行中的网卡上写不进：主线内核 qmi_wwan 的 `raw_ip_store()` 对 `netif_running()` 的设备直接回 `-EBUSY`（"Cannot change a running device"），而 netifd 的 `modem_pro` 接口把数据网卡常年拉在 up——原实现直接写 sysfs，每一次都失败，会话起不来、5→60s 退避循环 | 移植上游 `prepareQMIWwanRawIP`：**down → 写 → up**，5 次 × 800ms 重试（覆盖模组刚重新枚举后的短暂 EBUSY 窗口）；已是 Y 不动，无该属性（GobiNet / MHI）视为不需要 |
+| ② QMI/MBIM 共同根因 | 缺「拉起前释放模组侧数据上下文」：模组只有一个数据承载，固件自拨 / 换卡复位后的残留会话 / 用户激活过的上下文占住承载时，WDS Start 被拒（QMUXError 0xe）、MBIM CONNECT Status=2 FAILURE，会话永远建立不起来 | 移植上游 `releaseHostDialDataContext`：每次拉起会话前对**非 IMS** 的激活上下文发 `AT+CGACT=0`（每个 cid 重试 3 次、间隔 1.5s，与上游 hostDialReleaseAttempts/Gap 一致）；手动拨号的交办路径同样先释放并记一步「释放模组侧数据承载」；释放失败不拦拉起（上游同口径，由统一退避兜底） |
+| ③ 放大器 | APN / PDP 管理缺「承载独占」闸门：QMI/MBIM 模组上 `set_apn` 会「先断后连」重新激活（`AT+CGACT=1`）并激活 IMS——用户改一次 APN 就把正在跑的原生会话顶掉；又因没有 ② 的释放步骤，之后再也恢复不了 | 移植上游 `modemUsesHostDialer` 口径：`set_apn` 对 QMI/MBIM **只写配置、不激活**（连 IMS 也不发），返回说明写明原因（上游 apiSetAPN 同款 autoNote）；`set_pdp` 对 QMI/MBIM **只允许停用**（上游 apiSetPDPActive 同款）。ECM / RNDIS / NCM 的行为不变 |
+| ④ 恢复缺口 | 缺「会话在跑但一直没有地址」的掉线自愈：模组重新枚举后 raw_ip 被复位这类「协议层已连接、承载早已废了」的情况无法自愈 | 移植上游 `hostDialRestartDue` 口径：会话探活之外每轮看链路事实（数据网卡有 IPv4 地址 + 载波），跑满 **60s** 没地址就重开会话（间隔 **120s**、最多 **10 次**、拿到地址即清零；只停不原地起，下一轮拉起） |
 
-实机验证（FM350-GL，cmiot5g）：网络卡片不再出现运营商 DNS 假地址；v6 重拉节奏
-15s ×10 → 61s ×10 → 180s；IPv4 仍为 static，上网正常。该卡实测没有 IPv6
-（`AT+CGPADDR` v6 位恒为 `::1`），此前「模组有 V6」的显示本身就是 ① 的误报。
-
-### 2. 内核 6.x：一台模组被登记成多台（discovery）
-
-`discovery::ports::describe()` 原本假设 `/sys/class/tty/<tty>/device` 直接指向 USB
-接口目录（`2-1:1.2`），但内核 6.x 的 usb-serial 指向接口下的**端口目录**
-（`2-1:1.2/ttyUSB2`），名字里没有冒号 —— 解析失败，`usb_dev` / `iface` / `vid` /
-`pid` 全为空。连锁后果：
-
-- `plan()` 退化成「每个串口一台设备」：一台两个 AT 口的模组被登记成两台，
-  自动组网给同一张网卡建出重复接口；
-- `vid/pid` 为空 → `modem_ports.json` 里既有的 `2c7c:0800` 规则永远匹配不上；
-- 两个拨号器抢同一个 `/dev/cdc-wdm0`，QMI CTL Sync 超时（service 0x00
-  message 0x0027），始终拨不上号。
-
-修法：新增 `split_usb_interface()`，从 canonical 路径逐级上溯找第一个
-`<bus>:<配置>.<接口>` 形状的目录；两种 sysfs 布局（接口目录 / 端口目录）都兼容，
-非 USB 串口仍正确拒绝。修复后按真实路径推演：`1.0/1.2/1.3` → 同组 `usb:2-1` →
-规则命中 → `primary=1.2`、`fallback=1.3` → 只登记 1 台。
+另修一处竞态：释放承载要占串口几秒，期间用户点「断开」的话（hangup 置
+`manual_stop` 并 bump 代次），取代次发生在 bump 之后、代次比对挡不住——
+现在拉起前复查一次 `manual_stop`，不让会话把用户的断开意图顶掉。
 
 ## 产物清单
 
@@ -66,33 +50,40 @@ opkg install /tmp/modem-pro_*.ipk
 
 ## 升级注意
 
-- 覆盖安装即可；版本号单一来源 `VERSION`（本版 `1.0.7-1`）。
-- **内核 6.x + usb-serial 模组（如 H5000M / RG520F-EB）**：升级后同一模组只登记
-  1 台、重复接口不再创建。若升级前已被登记成多台，建议重启插件（或整机）让发现
-  周期按正确分组重建接口。
-- **350 系列**：页面不再显示运营商 DNS 假地址；`modem<id>_6` 重拉节奏见上表 ③。
+- 覆盖安装即可；版本号单一来源 `VERSION`（本版 `1.0.8-1`）。
+- **QMI / MBIM 模组**：升级后插上模组 ≤15 秒内「内置原生拨号后端」应变为
+  `native-qmi` / `native-mbim`。若此前因改过 APN 卡住，现在会自动释放模组侧
+  承载并重拨，不需要重启模组。
+- **在 APN 管理里改 APN / 在 PDP 管理里点激活**：QMI/MBIM 模组上现在只写配置、
+  不激活（说明文案里会写原因）；PDP 卡片的「激活 / 重连」对这类模组会明确拒绝，
+  「停用」照常可用。要建立数据呼叫请用「一键拨号」或等自动重拨——这是有意的
+  承载独占保护，不是功能退化。
 - 无 API 路径与字段变更，无新增必填配置；`/etc/modemd/config.toml` 是 conffiles，
   升级不覆盖你的取值。
-- 排障入口：discovery 看 `logread -e modem-pro` 里「发现模组 … 规则=」行
-  （修复后 `group=` 应为 `usb:<bus>` 而非 `port:/dev/ttyUSBx`）；350 的 IPv6 看
-  「v6 接口 modem<id>_6 已运行 Ns 仍无全局 IPv6（第 N 次重拉）」。
+- 排障入口：`logread -e modem-pro` 里看「原生拨号」行——拉起前会记
+  「拉起前先让模组侧让出承载：…」；raw_ip 切换记「把 wwan0 的 qmi/raw_ip 置为 Y
+  （第 N 次尝试）」；自愈记「掉线自愈 —— 会话在跑但数据网卡一直没有地址（第 N 次重开）」。
 
 ## 已知边界（如实说明）
 
-- **discovery 修复未经完整拨号回归**：真机上只确认了 sysfs 路径形态、归组与规则
-  匹配逻辑（等价推演 + 单测），QMI 拨号全流程未在修复后重跑；350 系列修复有实机验证。
-- 质量：`cargo test --locked` **801 项通过**（相对 1.0.6 的 794 项新增 7 项）。
+- **原生拨号链路未经实机验证**：本版根因全部有上游真机记录与内核源码依据
+  （EBUSY 行为核对 torvalds/linux 当前 `qmi_wwan.c`），代码路径有单测覆盖，
+  但 QMI/MBIM 会话建立、释放承载、raw_ip 切换、掉线自愈均未在真机上跑过。
+  升级后请按上面「升级注意」的第一条确认。
+- 质量：`cargo test --locked` **805 项通过**（相对 1.0.7 的 801 项新增 6 项；
+  另有 2 个与本版无关的存量 `http::ws` 环境用例在本机沙箱失败，git stash 基线
+  相同、单跑即过）。
 - `cargo fmt --check`：本版触及文件已对齐，但**存量漂移仍在**
   （`sms.rs` / `netprov` 等历史文件，非本版改动，未越界重排）。
-- `cargo clippy` 报 **1 处存量 error**：`sms.rs:1476` 的 `cur >= 255` 对该类型
-  恒等价于 `cur == 255`（min/max comparison lint），行为正确但建议下版顺手改为
-  `==`；该文件本版未动，未越界修改。
-- 发布说明基于本地 x86_64 验证；musl 交叉编译与产物由 CI（OpenWrt SDK）完成，
-  以 Actions 运行结果为准。
+- `cargo clippy` 仍报 **1 处存量 error**：`sms.rs:1476` 的 `cur >= 255`
+  （行为正确，本版未触碰该文件）；改动文件 0 新告警。
+- 发布说明基于本地 x86_64 / WSL 验证；musl 交叉编译与产物由 CI（OpenWrt SDK）
+  完成，以 Actions 运行结果为准。
 
 ## 文档
 
-`CHANGELOG.md` 的 [1.0.7] 条目（本版全部细节）、`docs/INTEGRATION.md`
-（架构/数据流）、`docs/BUILD.md`（构建/CI/验证）、`docs/API.md`
-（`/api/*` + WebSocket 全表）、`docs/UPSTREAM_AUDIT.md`（审计与上游致谢）、
-`docs/SUPPORT_MATRIX.md`；历史文档的处置见 `docs/README.md`。
+`CHANGELOG.md` 的 [1.0.8] 条目（本版全部细节）、`docs/INTEGRATION.md`
+（架构/数据流，⑤b 已同步原生拨号的释放 / raw_ip / 自愈口径）、`docs/BUILD.md`
+（构建/CI/验证）、`docs/API.md`（`/api/*` + WebSocket 全表）、
+`docs/UPSTREAM_AUDIT.md`（审计与上游致谢）、`docs/SUPPORT_MATRIX.md`；
+历史文档的处置见 `docs/README.md`。
