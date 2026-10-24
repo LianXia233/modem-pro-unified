@@ -89,7 +89,17 @@ wechat/           企业微信推送（纯逻辑 + 传输 + 运行期状态）
      │   → pick_device（同 UCI 口径选网卡，多模组不串）
      │   → plan_native：控制口 sysfs 反查（usbmisc/usb/GobiQMI/mhi 四级，
      │     绝不猜 /dev/cdc-wdm0）+ qmap_mode 三路径 + QMAP 参数
-     │   会话探活：QMI Get Packet Service Status / MBIM ActivationState
+     │   会话探活：QMI Get Packet Service Status / MBIM ActivationState，
+     │   另看「链路事实」（数据网卡有 IPv4 地址 + 载波；跑满 60s 还没有就
+     │   按 120s 间隔重开、最多 10 次，拿到地址即清零 —— 对齐上游
+     │   hostDialRestartDue 的掉线自愈口径）
+     │   建会话前：先释放模组侧还激活着的数据上下文（AT+CGACT=0，只动非
+     │   IMS 上下文、每个 cid 重试 3 次 —— 移植上游 releaseHostDialDataContext；
+     │   模组只有一个数据承载，固件自拨 / 残留会话占着承载时 Start 会被拒，
+     │   会话建不起来、页面就一直「未运行」）
+     │   QMI 拉起前先把 qmi/raw_ip 切到 Y：必须在网卡 down 时写（主线内核
+     │   qmi_wwan 对运行中的设备回 EBUSY），down → 写 → up，5 次 × 800ms 重试
+     │   —— 对齐上游 prepareQMIWwanRawIP
      │   建会话前记代次、建好后比对（过期立即拆）；成功后回调
      │   Modem::note_native_up 写 connected（这是早先缺失的一环）
      └─ AT（ECM/RNDIS/NCM/unknown）
@@ -98,6 +108,9 @@ wechat/           企业微信推送（纯逻辑 + 传输 + 运行期状态）
          跑 Modem::dial（不阻塞组网循环），结果按状态分类记退避
    统一退避表（每模组一条）：AT 30/60/120/240/300s，Native 5/10/20/40/60s；
    同一错误持续则继续退避，错误变化才清零；用户重开开关时清空（立即重试）
+   承载独占闸门（移植上游 modemUsesHostDialer 口径）：QMI/MBIM 模组上
+   set_apn 只写配置不激活（IMS 也不发）、set_pdp 只允许停用 —— 模组侧一激活，
+   拨号器的数据呼叫就被模组拒（QMUXError 0xe / MBIM CONNECT FAILURE）
 
 ⑥ 断开（/api/dial/disconnect）
    先停原生会话 → 模组侧按配方挂断（hangup 首步 bump 代次，作废在途拨号）

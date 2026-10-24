@@ -10,6 +10,48 @@
 
 ## [未发布]
 
+### 修复：QMI/MBIM 模式下内置原生拨号后端显示「未运行」（对照上游 modem-pro 全量移植补缺）
+
+「拨号上网」页的「内置原生拨号后端」卡片按 `/api/dial` 的 `host_dialer` 是否有会话
+显示徽标；QMI/MBIM 模组上它长期显示「未运行」。逐项对照上游
+[LianXia233/modem-pro](https://github.com/LianXia233/modem-pro) 的主机侧拨号链路
+（`hostdial*.go`）后定位到四处缺口，全部按上游实现移植修复：
+
+1. **`raw_ip` 在运行中的网卡上写不进（QMI 主根因）**。主线内核 qmi_wwan 的
+   `raw_ip_store()` 对 `netif_running()` 的设备直接返回 `-EBUSY`
+   （"Cannot change a running device"），而 netifd 的 `modem_pro` 接口把数据网卡
+   常年拉在 up —— 原实现直接 `write(raw_ip, "Y")`，**每一次都失败**，会话起不来、
+   5→60s 退避循环，页面永远「未运行」。移植上游 `prepareQMIWwanRawIP`：
+   down → 写 → up，5 次 × 800ms 重试（覆盖模组刚重新枚举后的短暂 EBUSY 窗口），
+   已是 Y 则不动、没有该属性（GobiNet/MHI）视为不需要。
+   （`runtime/dialer/native/mod.rs`）
+2. **缺「拉起前释放模组侧数据上下文」**（移植上游 `releaseHostDialDataContext`）。
+   模组只有一个数据承载：固件自动连接、换卡/复位后的残留会话、用户在页面里
+   激活过的上下文都会把它占住 —— 原生拨号器的 WDS Start / MBIM CONNECT 随后被模组拒
+   （上游真机记录 QMUXError 0xe / CONNECT Status=2 FAILURE），会话永远建立不起来。
+   现在每次拉起会话前对非 IMS 的激活上下文发 `AT+CGACT=0`（每个 cid 重试 3 次、
+   间隔 1.5s，与上游 hostDialReleaseAttempts/Gap 一致）；手动拨号的交办路径同样先
+   释放并记一步「释放模组侧数据承载」。释放失败不拦拉起（与上游一致，由退避兜底）。
+   （`modem/model/dial.rs`、`runtime/dialer/mod.rs`）
+3. **APN / PDP 管理缺「承载独占」闸门**（移植上游 `modemUsesHostDialer` 口径）。
+   QMI/MBIM 模组上 `set_apn` 原来会「先断后连」重新激活上下文（`AT+CGACT=1`）并激活
+   IMS —— 模组侧一激活就把唯一数据承载占住，把正在跑的原生会话顶掉；又因没有第 2 条
+   的释放步骤，之后再也恢复不了。现在：`set_apn` 对 QMI/MBIM 只写配置、不激活
+  （连 IMS 也不发），并在返回说明里写明原因（上游 apiSetAPN 同款 autoNote）；
+   `set_pdp` 对 QMI/MBIM 只允许**停用**（上游 apiSetPDPActive 同款），激活/重连被拒。
+   ECM/RNDIS/NCM 的行为不变。
+4. **缺「会话在跑但一直没有地址」的掉线自愈**（移植上游 `hostDialRestartDue` 口径）。
+   会话探活（QMI 包状态 / MBIM 激活态）之外，每轮再看链路事实：数据网卡无 IPv4 地址、
+   或有地址但载波为 0，跑满 60s 就重开会话（两次间隔 120s、最多 10 次，拿到地址即清零；
+   重开只停不原地起，下一轮拉起）—— 对模组重新枚举后 raw_ip 被复位这类「协议层已连接、
+   承载早已废了」的情况能自愈。
+
+测试：新增 6 个单测（PDP 激活闸门按类型分派、释放无上下文时空操作、自愈的
+宽限/限速/限次/清零、`native_link_ok` 对不存在网卡返回 false、无 raw_ip 属性时
+`ensure_raw_ip` 视为不需要）；`cargo test --locked` 805 passed（改动前全量基线同为
+799+2 个与本改动无关的 `http::ws` 环境相关用例，单跑即过）；改动文件 clippy 0 新告警
+（存量告警与基线完全一致）。`docs/INTEGRATION.md` ⑤b 同步。
+
 ## [1.0.7] - 2026-10-24
 
 ### 修复：内核 6.x 下一台模组被登记成多台（实机 Hiveton H5000M / ImmortalWrt SNAPSHOT / kernel 6.18.55 / RG520F-EB）

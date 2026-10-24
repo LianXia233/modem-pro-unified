@@ -271,6 +271,18 @@ pub fn parent_iface(iface: &str) -> String {
 ///
 /// 返回 `true` = 现在是 raw IP（或本来没有这个 sysfs，不需要设）。
 /// 内核里这个属性有 `raw_ip` 与老版本的 `rawip` 两种写法，都试。
+///
+/// ## 为什么必须先 down 再写（对齐上游 `prepareQMIWwanRawIP`）
+///
+/// 主线 qmi_wwan 的 `raw_ip_store()` 在 `netif_running()` 时直接返回
+/// **-EBUSY**（"Cannot change a running device"）。而 netifd 的 `modem_pro`
+/// 接口把数据网卡常年拉在 up（udhcpc 就跑在它上面）—— 不 down 就写，
+/// **每一次都失败**：会话起不来 → 5→60s 退避 → 页面上原生拨号器永远「未运行」。
+/// 上游 `hostdial_posix.go` 正是为了这个才实现 down → 写 → up，
+/// 并对「模组刚重新枚举完、属性短暂 EBUSY」的窗口做 5 次 × 800ms 重试。
+///
+/// 网卡被留在 down 状态比切换失败更糟，所以每次尝试后都把网卡拉回来
+/// （哪怕这次没写成功）。写成功后 netifd 的 udhcpc 会按新模式重新取址。
 pub fn ensure_raw_ip(iface: &str) -> bool {
     let base = parent_iface(iface);
     for name in ["raw_ip", "rawip"] {
@@ -282,12 +294,47 @@ pub fn ensure_raw_ip(iface: &str) -> bool {
         if cur == "Y" || cur == "1" {
             return true;
         }
-        if let Err(e) = std::fs::write(&path, "Y\n") {
-            log::warn!("写 {path} 失败: {e}");
-            return false;
+        // raw_ip 只能在网卡 down 时改；模组刚重新枚举的头几秒属性还会短暂 EBUSY，
+        // 所以重试（与上游 rawIPAttempts=5 / rawIPRetryGap=800ms 一致）。
+        let mut last_err = None;
+        for attempt in 0..5 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                // 上一轮可能已经把值写下去了：先重读，避免无谓地再 down 一次
+                if let Ok(v) = std::fs::read_to_string(&path) {
+                    let v = v.trim();
+                    if v == "Y" || v == "1" {
+                        log::info!("原生拨号：{base} 的 qmi/{name} 已是 Y（数据面走 raw IP）");
+                        return true;
+                    }
+                }
+            }
+            let _ = std::process::Command::new("ip")
+                .args(["link", "set", "dev", &base, "down"])
+                .output();
+            let write = std::fs::write(&path, "Y\n");
+            // 每次尝试后都把网卡恢复起来（up 失败不影响成败判定）
+            let _ = std::process::Command::new("ip")
+                .args(["link", "set", "dev", &base, "up"])
+                .output();
+            match write {
+                Ok(_) => {
+                    log::info!(
+                        "原生拨号：把 {base} 的 qmi/{name} 置为 Y（第 {} 次尝试，数据面走 raw IP）",
+                        attempt + 1
+                    );
+                    return true;
+                }
+                Err(e) => {
+                    log::warn!("写 {path} 失败（第 {}/5 次尝试）: {e}", attempt + 1);
+                    last_err = Some(e);
+                }
+            }
         }
-        log::info!("原生拨号：把 {base} 的 qmi/{name} 置为 Y（数据面走 raw IP）");
-        return true;
+        if let Some(e) = last_err {
+            log::warn!("原生拨号：{path} 重试 5 次仍未写成（{e}），本轮不拉起拨号器");
+        }
+        return false;
     }
     // 没有这个属性：要么不是 qmi_wwan（比如 GobiNet），要么已经由驱动处理好
     true
@@ -501,6 +548,8 @@ pub struct Session {
     pub plan: NativePlan,
     inner: Inner,
     started_at: String,
+    /// 会话建立时刻（协调器的掉线自愈用它算「跑了多久还没地址」）。
+    pub started: std::time::Instant,
     /// 给页面看的一句话（v6 未起、订阅者未就绪等非致命情况）
     pub note: String,
 }
@@ -558,6 +607,7 @@ impl Session {
             plan,
             inner,
             started_at: crate::logging::rfc3339(crate::logging::unix_now()),
+            started: std::time::Instant::now(),
             note,
         };
         log::info!(
@@ -707,6 +757,13 @@ mod tests {
     fn find_control_returns_none_for_missing_iface() {
         // 不存在的网卡不能瞎猜 /dev/cdc-wdm0（多模组会建到别人身上）
         assert_eq!(find_control("definitely-not-an-iface"), None);
+    }
+
+    #[test]
+    fn raw_ip_is_a_noop_without_the_sysfs_attr() {
+        // 没有 qmi/raw_ip 属性（非 qmi_wwan 驱动 / 测试机）＝ 不需要也不允许设：
+        // 返回 true，绝不能因为找不到属性就判失败（GobiNet / MHI 走这条路）。
+        assert!(ensure_raw_ip("definitely-not-an-iface"));
     }
 
     // ---------- QMAP 计划 ----------

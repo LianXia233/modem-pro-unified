@@ -167,6 +167,14 @@ impl Modem {
             })
             .unwrap_or(false);
 
+        // QMI / MBIM（主机侧拨号）：数据承载归内置原生拨号器独占，模组侧**只写配置、
+        // 不激活**（上游 apiSetAPN 同款闸门：连显式要求激活也不激活）。模组侧一激活，
+        // 拨号器请求数据呼叫就被拒（QMI 实测 QMUXError 0xe；MBIM 实测 CONNECT
+        // Status=2 FAILURE、ActivationState 一直 Deactivated），IPv6 那条会话尤其
+        // 起不来 —— 页面上原生拨号器就一直「未运行」。激活交给拨号器；IMS 的激活
+        // 同样跳过（上游 doActivate=false 时 IMS 也不发）。
+        let host_dial = super::dial::wan_host_dial_by_daemon(&self.ensure_dial_kind());
+
         // 幂等路径不读 was_active：配置没变就不该动已建立的会话，
         // 「是不是激活着」在这里没有后续动作。
         if unchanged {
@@ -196,12 +204,14 @@ impl Modem {
             }
             steps.push("回读确认一致".to_string());
 
-            // 之前激活着的就先断后连，让新 APN 立即生效
+            // 之前激活着的就先断后连，让新 APN 立即生效。
+            // ⚠️ 主机侧拨号（QMI/MBIM）不走这里：先断后连会占住唯一数据承载
+            //（见上面 host_dial 闸门），承载的建立/释放归内置原生拨号器管。
             let activated = self.at_cmd_prio(Prio::Bulk, "AT+CGACT?");
             let was_active = build_contexts(&defined, &activated)
                 .iter()
                 .any(|c| c.cid == cid && c.active);
-            if was_active {
+            if was_active && !host_dial {
                 let _ = self.at_cmd_prio(Prio::Bulk, &format!("AT+CGACT=0,{cid}"));
                 let resp = self.at_cmd_prio(Prio::Bulk, &format!("AT+CGACT=1,{cid}"));
                 steps.push(if is_ok(&resp) {
@@ -212,8 +222,9 @@ impl Modem {
             }
         }
 
-        // IMS 是 VoLTE / IMS 短信的前提，顺手拉起来；失败不影响本次写入
-        if activate_ims {
+        // IMS 是 VoLTE / IMS 短信的前提，顺手拉起来；失败不影响本次写入。
+        // 主机侧拨号（QMI/MBIM）跳过：与上游口径一致，模组侧不为拨号器管的承载发激活。
+        if activate_ims && !host_dial {
             if let Some(ims) = contexts.iter().find(|c| c.internal) {
                 let resp = self.at_cmd_prio(Prio::Bulk, &format!("AT+CGACT=1,{}", ims.cid));
                 steps.push(if is_ok(&resp) {
@@ -225,6 +236,15 @@ impl Modem {
                     )
                 });
             }
+        }
+        // 主机侧拨号（QMI/MBIM）：把「为什么没激活」如实写进返回说明（上游同款 autoNote），
+        // 否则用户看到只有「已写入」，会以为 APN 没生效。
+        if host_dial {
+            steps.push(
+                "这是 QMI/MBIM（主机侧拨号）模式：只写配置、不激活 PDP —— 数据承载留给\
+                 内置原生拨号器，模组侧一激活它就被顶掉（拨号器会自动用新配置建立承载）"
+                    .to_string(),
+            );
         }
         Ok((self.params(), steps.join("；")))
     }
@@ -259,6 +279,17 @@ impl Modem {
     ) -> Result<(ParamsStatus, String)> {
         if cid <= 0 {
             return Err(msg("上下文 cid 要是正数"));
+        }
+        // QMI / MBIM（主机侧拨号）：数据承载归内置原生拨号器独占 —— 模组侧激活会把
+        // 承载占住，拨号器随后请求数据呼叫被拒、IPv6 起不来（上游 apiSetPDPActive
+        // 同款闸门）。这里只允许**停用**（放掉承载）；要上网用「拨号上网」，
+        // 那里拨号器会自己建承载。
+        if (active || reconnect) && super::dial::wan_host_dial_by_daemon(&self.ensure_dial_kind()) {
+            return Err(msg(
+                "这是 QMI/MBIM（主机侧拨号）模式：数据呼叫由内置原生拨号器激活，\
+                 模组侧不要手动激活（会占住唯一数据承载，拨号器随后被拒、IPv6 起不来）；\
+                 要上网请用「拨号上网」",
+            ));
         }
         let mut steps = Vec::new();
         if reconnect {

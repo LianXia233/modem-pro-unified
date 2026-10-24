@@ -156,6 +156,29 @@ struct Retry {
     reason: String,
 }
 
+/// 掉线自愈的计数（一台模组一份）。
+///
+/// 「会话在跑但数据网卡一直没有地址」时的重开记账 —— 移植自上游
+/// `hostDialRestartState`：会话跑满 [`HEAL_AFTER`] 还没地址就重开、
+/// 两次之间至少隔 [`HEAL_GAP`]、连开 [`HEAL_MAX`] 次后就只在日志里提醒；
+/// 拿到地址（或模组没了 / 用户停掉）⇒ 清零。
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct Heal {
+    last: Option<Instant>,
+    count: u32,
+}
+
+/// 会话跑了这么久还没地址才算「卡住」（含刚拨号的时间，上游 60s 同值）。
+#[cfg(unix)]
+const HEAL_AFTER: Duration = Duration::from_secs(60);
+/// 两次自愈重开之间至少隔这么久（上游 120s 同值）。
+#[cfg(unix)]
+const HEAL_GAP: Duration = Duration::from_secs(120);
+/// 连续自愈这么多次还没好就不再重开（链路真坏了不能无限打转，上游 10 次同值）。
+#[cfg(unix)]
+const HEAL_MAX: u32 = 10;
+
 /// 统一退避表：模组 id → 退避状态。
 #[derive(Default)]
 struct RetryTable(Mutex<HashMap<u32, Retry>>);
@@ -273,6 +296,32 @@ fn warn_legacy_bin_once(state: &AppState) {
     log::warn!("配置 host_dial_bin = {raw:?} 已失效：厂商拨号器已移除，改用内置 QMI/MBIM 实现");
 }
 
+/// 数据网卡现在的链路事实（对齐上游 `hostDialHasAddr` + `hostDialHasCarrier`）。
+///
+/// 有 IPv4 地址，且（读得到载波时）载波为 1。只有地址、没载波 = 已经掉线
+///（旧租约还挂着）；没地址直接不算在线。载波读不到（网卡刚好没了 / 平台
+/// 不导出）时按「有载波」处理 —— 该情况由会话探活（`alive()`）兜底。
+///
+/// 返回 `false` 不代表立刻拆会话：调用方 [`DialerSupervisor::heal_due`]
+/// 还有时长 / 限速 / 限次三道闸（刚拨号的前 60 秒是地址的正常协商窗口）。
+#[cfg(unix)]
+fn native_link_ok(dev: &str) -> bool {
+    let dev = dev.trim();
+    if dev.is_empty() {
+        return false;
+    }
+    let has_addr = crate::modem::model::dial::iface_addrs_cached(dev)
+        .iter()
+        .any(|a| !a.contains(':'));
+    if !has_addr {
+        return false;
+    }
+    match std::fs::read_to_string(format!("/sys/class/net/{dev}/carrier")) {
+        Ok(v) => v.trim() == "1",
+        Err(_) => true,
+    }
+}
+
 /// 自动连接的统一判定（纯函数，单测钉住所有拒绝理由）。
 ///
 /// 输入全部是**已采集的事实**，这里不读时钟也不碰串口：
@@ -317,6 +366,9 @@ pub struct DialerSupervisor {
     native: Mutex<HashMap<u32, native::Session>>,
     /// 统一退避表（两种后端共用一张，按模组隔离）。
     retry: RetryTable,
+    /// 掉线自愈记账（「会话在跑但一直没地址」的重开计数，按模组隔离）。
+    #[cfg(unix)]
+    heal: Mutex<HashMap<u32, Heal>>,
     /// 本协调器自己派出的 AT 拨号线程（模组 id）。
     ///
     /// 与 `Modem::dial_busy` 的分工：`dial_busy` 防的是**任何**两路拨号并发
@@ -456,6 +508,36 @@ impl DialerSupervisor {
             s.stop();
             log::info!("原生拨号：模组 {modem_id} 会话已停止");
         }
+        // 会话被策略/用户停掉 = 「模组没了」这一类：自愈计数清零
+        self.heal.lock().unwrap().remove(&modem_id);
+    }
+
+    /// 掉线自愈判定（纯决策，移植自上游 `hostDialRestartDue`）。
+    ///
+    /// 输入 `link_ok` = 数据网卡现在有地址且有载波。有地址 ⇒ 计数清零、不动作；
+    /// 没地址且（会话跑满 [`HEAL_AFTER`]、距上次重开超过 [`HEAL_GAP`]、
+    /// 次数未到 [`HEAL_MAX`]）⇒ 记一次并返回次数（调用方据此重开会话）。
+    fn heal_due(&self, modem_id: u32, started: Instant, link_ok: bool) -> Option<u32> {
+        let mut g = self.heal.lock().unwrap();
+        if link_ok {
+            g.remove(&modem_id);
+            return None;
+        }
+        let st = g.entry(modem_id).or_default();
+        if st.count >= HEAL_MAX {
+            return None; // 连开这么多次还没好：只在日志里提醒（调用方已记录），不再打转
+        }
+        if let Some(last) = st.last {
+            if last.elapsed() < HEAL_GAP {
+                return None;
+            }
+        }
+        if started.elapsed() < HEAL_AFTER {
+            return None; // 刚拉起来先给它时间拨（拨号器自己的 udhcpc 可能马上就装地址）
+        }
+        st.last = Some(Instant::now());
+        st.count += 1;
+        Some(st.count)
     }
 
     /// 该不该继续托管这个模组（三个开关 + 用户意图）。
@@ -546,7 +628,14 @@ impl DialerSupervisor {
             }
         };
 
+        // 「链路事实」先探好（在拿会话表锁之前做，fork 不占锁 —— 见遗留问题
+        // 「探活在全局会话表锁内执行」）：
+        // 数据网卡有 IPv4 地址，且（读得到载波时）有载波。
+        // 与上游口径一致：只有地址、没载波 = 已经掉线（旧租约还挂着）。
+        let link_ok = native_link_ok(&device);
+
         // 已在跑同一个计划：探活；掉线就重建
+        let mut heal_only = false;
         {
             let mut g = self.native.lock().unwrap();
             if let Some(s) = g.get_mut(&id) {
@@ -559,8 +648,30 @@ impl DialerSupervisor {
                             modem.note_native_down(epoch, "主机侧数据呼叫断开，准备重拨");
                             log::warn!("原生拨号：模组 {id} 数据呼叫已断开，重拨");
                         }
-                        // 传输层出错（None）不当作掉线：一次读超时不该把呼叫拆了
-                        _ => return,
+                        // 传输层出错（None）不当作掉线：一次读超时不该把呼叫拆了。
+                        // 但还要看一眼「链路事实」：会话在跑、数据网卡却一直拿不到
+                        // 地址（或地址还在、载波没了）是掉线的另一种形态 —— 上游
+                        // hostDialRestartDue 的口径：跑满 60s 没地址就重开（限速限次），
+                        // 拿到地址即清零。QMI/MBIM 的会话状态可能停在已连接而承载早就
+                        // 废了（实测：模组重新枚举后 raw_ip 被复位，地址永远不来）。
+                        _ => {
+                            match self.heal_due(id, s.started, link_ok) {
+                                None => return,
+                                Some(count) => {
+                                    let epoch = modem.dial_epoch();
+                                    modem.note_native_down(
+                                    epoch,
+                                    &format!("会话在跑但数据链路没有地址，重开原生会话（第 {count} 次）"),
+                                );
+                                    log::warn!(
+                                    "原生拨号：模组 {id} 掉线自愈 —— 会话在跑但数据网卡一直没有地址（第 {count} 次重开，下一轮拉起）"
+                                );
+                                    // 上游同口径：**只停不原地起** —— 控制口 / 承载留给
+                                    // 旧会话退干净，下一轮（≤15s）再拉起。
+                                    heal_only = true;
+                                }
+                            }
+                        }
                     }
                 } else {
                     // 连接参数变了（APN / PDN / IPv6 / 网卡）：按新计划重建。
@@ -576,6 +687,9 @@ impl DialerSupervisor {
             if let Some(mut s) = old {
                 s.stop();
             }
+        }
+        if heal_only {
+            return;
         }
 
         if !self.retry.due(id, Backend::Native) {
@@ -597,9 +711,27 @@ impl DialerSupervisor {
         }
         let _starting = Starting(id);
 
+        // 拉起前先把模组侧还激活着的数据上下文释放掉（移植自上游
+        // releaseHostDialDataContext：**每次**拉起拨号器之前都做 —— 固件自动连接 /
+        // 换卡复位后的残留会话 / 用户在页面里激活过的上下文会占住唯一数据承载，
+        // Start 被拒（QMUXError 0xe / MBIM CONNECT FAILURE）→ 会话建不起来 →
+        // 页面「未运行」。真机记录：手工 AT+CGACT=0 后重拨立刻就能通）。
+        // ⚠️ 释放失败不拦：那时 Start 会再被拒一次，由统一退避兜底（与上游一致）。
+        if let Some(note) = modem.release_host_dial_contexts() {
+            log::info!("原生拨号：模组 {id} 拉起前先让模组侧让出承载：{note}");
+        }
+
         // 代次在**建会话之前**记下：建的过程中用户可能点断开（`hangup` bump），
         // 建好后必须再比对一次 —— 代次变了就立刻拆掉，别让没人要的连接挂着。
         let epoch = modem.dial_epoch();
+        // ⚠️ 释放要占串口几秒，这期间用户可能点了「断开」（hangup 置 manual_stop
+        // 并 bump 代次）—— 代次比对挡不住这种情况（bump 发生在取代次**之前**）。
+        // 这里必须复查一次断开意图，否则会话被拉起来、状态又被 note_native_up
+        // 改回 connected，用户的「断开」就被顶掉了。
+        if modem.dial_status().manual_stop {
+            log::info!("原生拨号：模组 {id} 拉起前发现用户已断开（manual_stop），本轮不建会话");
+            return;
+        }
         match native::Session::start(plan.clone()) {
             Ok(mut s) => {
                 if !modem.dial_epoch_is(epoch) {
@@ -840,5 +972,57 @@ mod tests {
             false,
             true
         ));
+    }
+
+    // ---------- 掉线自愈（移植自上游 hostDialRestartDue） ----------
+
+    /// 把一个模组的自愈台账直接摆到「上次重开在 N 秒前」的状态。
+    #[cfg(unix)]
+    fn backdate_heal(sup: &DialerSupervisor, id: u32, last: Option<Instant>, count: u32) {
+        sup.heal.lock().unwrap().insert(
+            id,
+            Heal {
+                last: last.map(|t| t - Duration::from_secs(121)),
+                count,
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn heal_is_due_only_after_grace_gap_and_budget() {
+        let sup = DialerSupervisor::new();
+        // 没地址但刚拉起来（60s 宽限内）→ 不动
+        assert_eq!(sup.heal_due(1, Instant::now(), false), None);
+        // 跑满宽限 → 第一次自愈
+        let started = Instant::now() - Duration::from_secs(61);
+        assert_eq!(sup.heal_due(1, started, false), Some(1));
+        // 两次之间必须隔 HEAL_GAP（刚自愈过 → 不动）
+        assert_eq!(sup.heal_due(1, started, false), None);
+        // 上次自愈已过 HEAL_GAP → 再自愈，计数累加
+        backdate_heal(&sup, 1, Some(Instant::now()), 1);
+        assert_eq!(sup.heal_due(1, started, false), Some(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn heal_stops_after_budget_and_resets_on_link() {
+        let sup = DialerSupervisor::new();
+        let started = Instant::now() - Duration::from_secs(61);
+        // 连开 HEAL_MAX 次之后：不再打转（链路真坏了不能无限重开）
+        backdate_heal(&sup, 2, Some(Instant::now()), HEAL_MAX);
+        assert_eq!(sup.heal_due(2, started, false), None);
+        // 有地址 ⇒ 清零（上游 resetHostDialRestart 的语义）
+        backdate_heal(&sup, 3, Some(Instant::now()), HEAL_MAX);
+        assert_eq!(sup.heal_due(3, started, true), None);
+        assert!(!sup.heal.lock().unwrap().contains_key(&3), "有地址要清账");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_link_ok_is_false_for_missing_iface() {
+        // 测试机上不存在的网卡：没有地址 ⇒ 不在线（真实机器上由 sysfs / `ip` 决定）
+        assert!(!native_link_ok("definitely-not-an-iface"));
+        assert!(!native_link_ok("  "));
     }
 }

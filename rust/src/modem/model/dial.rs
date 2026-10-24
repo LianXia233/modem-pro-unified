@@ -773,7 +773,10 @@ pub fn match_dial_iface(name: &str) -> (bool, bool) {
 /// 于是用 `ip -4 -o addr show dev <dev>`：OpenWrt 自带 iproute2，输出稳定，
 /// 一行一台地址。**带 5 秒缓存**是因为 `/api/dial` 与 `/api/snapshot` 都会被
 /// 页面轮询，不缓存就会每 3 秒 fork 一个进程 —— 在 MT7621 这类小机器上很浪费。
-fn iface_addrs_cached(dev: &str) -> Vec<String> {
+///
+/// `pub(crate)`：拨号协调器的掉线自愈（`runtime::dialer`）也用它判
+/// 「会话在跑但数据网卡一直没有地址」（对齐上游 `hostDialHasAddr`）。
+pub(crate) fn iface_addrs_cached(dev: &str) -> Vec<String> {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
     static CACHE: Mutex<Option<(String, Instant, Vec<String>)>> = Mutex::new(None);
@@ -2216,6 +2219,81 @@ impl Modem {
         });
     }
 
+    /// 拉起原生会话前，把**模组侧还激活着的数据上下文**释放掉（`AT+CGACT=0`）。
+    ///
+    /// ## 为什么必须有这一步（移植自上游 `releaseHostDialDataContext`）
+    ///
+    /// 模组只有**一个数据承载**。固件自动连接、换卡 / 复位后的自拨、用户在
+    /// 「APN 管理 / PDP 管理」里的激活，都会把它占住 —— 原生拨号器随后请求
+    /// 数据呼叫就会被模组拒（实测 RM502Q-GL / FM160-CN：`requestSetupDataCall
+    /// QMUXResult = 0x1, QMUXError = 0xe`；MBIM 则是 CONNECT Status=2 FAILURE、
+    /// ActivationState 停在 Deactivated），会话永远建立不起来，页面上原生拨号器
+    /// 一直「未运行」。上游在**每次**拉起拨号器之前都做这个释放，真机记录：
+    /// 手工 `AT+CGACT=0,<cid>` 再重拨立刻就能通。
+    ///
+    /// 只动**非内部**（非 IMS / sos）的上下文；内部上下文是 VoLTE / IMS 短信的
+    /// 前提，不碰。回读里看不到激活上下文时，把本进程上次拨号用的数据 cid 补一刀
+    ///（上游同款兜底：进程重启后模组上可能还留着那条会话，「发一次也无害」）。
+    /// 每个 cid 重试 3 次（间隔 1.5s）：固件可能直接拒（还在用），也可能回 OK 但
+    /// 回读没跟上（上游 hostDialReleaseAttempts=3 / hostDialReleaseGap=1.5s）。
+    ///
+    /// 返回 `Some(说明)` 给日志 / 页面步骤；释放失败也照常返回说明 ——
+    /// 调用方记日志后**照常拉起**（与上游一致：那时 Start 会再被拒一次，
+    /// 由统一退避兜底，不在这里把链路判死）。
+    pub(crate) fn release_host_dial_contexts(&self) -> Option<String> {
+        const ATTEMPTS: usize = 3;
+        const GAP: Duration = Duration::from_millis(1500);
+
+        let st = self.params_refresh();
+        let mut cids: Vec<i32> = st
+            .contexts
+            .iter()
+            .filter(|c| c.active && !c.internal)
+            .map(|c| c.cid)
+            .collect();
+        if cids.is_empty() {
+            let last = self.dial_state.lock().unwrap().cid;
+            if last > 0 {
+                cids.push(last);
+            }
+        }
+        if cids.is_empty() {
+            return None;
+        }
+
+        let mut bad: Vec<String> = Vec::new();
+        for cid in &cids {
+            let mut ok = false;
+            for attempt in 1..=ATTEMPTS {
+                let resp = self.at_cmd_prio(Prio::Data, &format!("AT+CGACT=0,{cid}"));
+                if is_ok(&resp) {
+                    log::info!("原生拨号：模组侧数据上下文已释放 cid={cid}（第 {attempt} 次）");
+                    ok = true;
+                    break;
+                }
+                log::warn!(
+                    "原生拨号：释放模组侧数据上下文 cid={cid} 失败（第 {attempt}/{ATTEMPTS} 次）：{}",
+                    resp.trim()
+                );
+                if attempt < ATTEMPTS {
+                    std::thread::sleep(GAP);
+                }
+            }
+            if !ok {
+                bad.push(format!("cid={cid}"));
+            }
+        }
+        if !bad.is_empty() {
+            return Some(format!(
+                "模组侧数据上下文没能全停掉（{}）—— 两边抢同一个数据承载时原生拨号器会被拒",
+                bad.join("、")
+            ));
+        }
+        Some(format!(
+            "已停掉模组侧数据上下文 cid={cids:?}（数据承载归内置原生拨号器，两边抢同一个承载会互相顶掉）"
+        ))
+    }
+
     /// 最近一次**从模组读出来**的 APN（拨号时记下的）。内部专用 APN 不算。
     ///
     /// `pub(crate)`：拨号器托管要用它给 MBIM 补 `-s`（没 APN 拨号器直接退出）。
@@ -2405,6 +2483,18 @@ impl Modem {
         // 进程起来到拿到地址要几秒，所以这一步报的是「已交办」而不是「已连上」——
         // 页面随后由 dial 推送刷新。
         if wan_host_dial_by_daemon(&info.kind) {
+            // ① 让出模组侧数据承载（移植自上游 dialByHostDialer 的第①步）：
+            //    进程重启后模组上可能还留着上次激活的 cid；手动拨号前强制清一次，
+            //    否则原生拨号器的 Start 会被模组拒（唯一数据承载被占）。
+            let release_note = self.release_host_dial_contexts();
+            match release_note.as_deref() {
+                Some(note) => self.dial_step("释放模组侧数据承载（交给内置拨号器）", true, note),
+                None => self.dial_step(
+                    "释放模组侧数据承载（交给内置拨号器）",
+                    true,
+                    "模组侧没有我们激活的数据上下文",
+                ),
+            }
             // MBIM 没 APN 拨号器会直接退出：先拦，别记一个「已交办」再报错
             // （那样 steps 里留着一条 ok=true 的「交办」，跟 failed 状态自相矛盾）
             if info.kind.eq_ignore_ascii_case("mbim") && apn.is_empty() {
@@ -3459,6 +3549,41 @@ mod tests {
         let before = m.dial_epoch();
         let _ = m.hangup(1); // 端口不存在 ⇒ 必失败，但 bump 已经发生
         assert!(m.dial_epoch() > before);
+    }
+
+    // ---------- 主机侧拨号的承载独占（移植自上游 modemUsesHostDialer 闸门） ----------
+
+    #[test]
+    fn pdp_activation_is_blocked_for_host_dial_kinds() {
+        // QMI/MBIM：数据承载归内置原生拨号器独占。模组侧**激活**必须被闸门拒掉
+        // （上游 apiSetPDPActive 同款）—— 一激活，拨号器的 Start 就被模组拒
+        //（QMUXError 0xe），页面上原生拨号器就一直「未运行」。
+        let m = dev_modem();
+        m.dial_update(|s| s.kind = "qmi".into());
+        let err = m.set_pdp(1, true, false).unwrap_err().to_string();
+        assert!(err.contains("主机侧拨号"), "激活必须被闸门拦下：{err}");
+        let err = m.set_pdp(1, true, true).unwrap_err().to_string();
+        assert!(err.contains("主机侧拨号"), "重连也按激活拦：{err}");
+        // 停用（放掉承载）必须放行 —— 走到 AT 那步才失败（端口不存在），
+        // 错误信息是「停用失败」而不是闸门文案。
+        let err = m.set_pdp(1, false, false).unwrap_err().to_string();
+        assert!(
+            !err.contains("主机侧拨号") && err.contains("停用"),
+            "停用不该被闸门拦：{err}"
+        );
+        // 非主机侧类型（ECM 等）不受闸门影响：走 AT、报 AT 层的错误
+        let m = dev_modem();
+        m.dial_update(|s| s.kind = "ecm".into());
+        let err = m.set_pdp(1, true, false).unwrap_err().to_string();
+        assert!(!err.contains("主机侧拨号"), "ECM 不该被闸门拦：{err}");
+    }
+
+    #[test]
+    fn release_host_dial_contexts_is_a_noop_when_nothing_is_active() {
+        // 回读不到激活上下文、本进程也没拨过号（cid=0）⇒ 没有要释放的。
+        // 端口不存在 ⇒ 回读必然失败 ⇒ 走的就是这条空路径。
+        let m = dev_modem();
+        assert!(m.release_host_dial_contexts().is_none());
     }
 
     #[test]
