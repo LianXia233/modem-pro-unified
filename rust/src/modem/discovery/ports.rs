@@ -303,10 +303,10 @@ mod tests {
     /// 非 USB（板载串口、根目录）不能误判成 USB 接口。
     #[test]
     fn split_usb_interface_rejects_non_usb() {
-        assert!(
-            super::split_usb_interface(Path::new("/sys/devices/platform/serial8250/tty/ttyS0"))
-                .is_none()
-        );
+        assert!(super::split_usb_interface(Path::new(
+            "/sys/devices/platform/serial8250/tty/ttyS0"
+        ))
+        .is_none());
         assert!(super::split_usb_interface(Path::new("/")).is_none());
     }
 }

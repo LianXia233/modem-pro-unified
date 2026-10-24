@@ -10,6 +10,8 @@
 
 ## [未发布]
 
+## [1.0.7] - 2026-10-24
+
 ### 修复：内核 6.x 下一台模组被登记成多台（实机 Hiveton H5000M / ImmortalWrt SNAPSHOT / kernel 6.18.55 / RG520F-EB）
 
 `discovery::ports::describe()` 假设 `/sys/class/tty/<tty>/device` 直接指向 USB 接口目录
