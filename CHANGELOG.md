@@ -10,6 +10,40 @@
 
 ## [未发布]
 
+### 修复：内核 6.x 下一台模组被登记成多台（实机 Hiveton H5000M / ImmortalWrt SNAPSHOT / kernel 6.18.55 / RG520F-EB）
+
+`discovery::ports::describe()` 假设 `/sys/class/tty/<tty>/device` 直接指向 USB 接口目录
+（`2-1:1.2`），只取 `file_name()` 再按冒号切分。但内核 6.x 的 usb-serial 指向的是接口下的
+**端口目录**（`2-1:1.2/ttyUSB2`），名字里没有冒号 —— `rsplit_once(':')` 返回 `None`，
+函数提前返回，`usb_dev` / `iface` / `vid` / `pid` 全为空。
+
+连锁后果：
+
+- `PortInfo::group_key()` 退化成 `port:<路径>`，`plan()` 变成「每个串口一台设备」，
+  一台两个 AT 口的模组被登记成两台，自动组网给同一张网卡建两个重复接口；
+- `vid/pid` 为空 → `modem_ports.json` 里既有的 `2c7c:0800` 规则（`at_interfaces` 1.2/1.3）
+  永远匹配不上。
+
+真机日志：
+
+```
+发现模组 id=0 at=/dev/ttyUSB2 group=port:/dev/ttyUSB2 规则=未命中
+发现模组 id=1 at=/dev/ttyUSB3 group=port:/dev/ttyUSB3 规则=未命中
+```
+
+两个拨号器随后抢同一个 `/dev/cdc-wdm0`，QMI CTL Sync 超时（service 0x00 message 0x0027），
+始终拨不上号。
+
+修法：新增 `split_usb_interface()`，从 canonical 路径逐级上溯找第一个
+`<bus>:<配置>.<接口>` 形状的目录，返回 `(接口目录, bus, 接口号)`；`describe()` 用它取
+`iface_dir` / `bus` / `iface`，`vid/pid` 从接口目录的父目录（USB 设备目录）读，
+`driver` 优先取接口目录的（端口目录未必有 driver 链接）。两种布局都兼容，
+非 USB 仍返回 `None`。
+
+验证：新增 3 个单测（端口子目录 / 接口目录 / 非 USB）；`cargo test discovery` 全绿
+（18 passed）。按真实路径推演，`1.0/1.2/1.3` → 同组 `usb:2-1` → 规则命中 →
+`primary=1.2`、`fallback=1.3` → 只登记 1 台。
+
 ### 修复：350 系列「模组有 V6、接口没 V6」（实机 FM350-GL / 中国移动）
 
 实机现象：网络卡片显示模组有一个 IPv6，`ip -6 addr` 里接口却只有 link-local，

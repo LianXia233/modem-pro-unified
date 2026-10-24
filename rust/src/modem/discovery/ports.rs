@@ -73,25 +73,58 @@ pub fn describe(path: &str) -> PortInfo {
         info.usb_dev = pseudo_group_for(path);
         return info;
     };
-    info.driver = driver_of(&dev_link);
 
-    // `/sys/bus/usb/devices/1-1:1.2` 这种目录名里带冒号：冒号后是 `配置.接口`
-    let name = dev_link
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let Some((bus, iface)) = name.rsplit_once(':') else {
+    // `device` 的指向随驱动/内核而变：可能直接是接口目录（`2-1:1.2`），
+    // 也可能是接口下的端口目录（`2-1:1.2/ttyUSB2`）。两种都要能切出 bus/接口号 ——
+    // 切不出来时 `usb_dev` 为空，`plan()` 就会退化成「每个串口一台设备」，
+    // 一台多 AT 口的模组被登记成多台「模组」，端口规则也因 vid/pid 为空而匹配不上。
+    let Some((iface_dir, bus, iface)) = split_usb_interface(&dev_link) else {
         return info;
     };
-    if !iface.contains('.') {
-        return info;
-    }
-    info.usb_dev = bus.to_string();
-    info.iface = iface.to_string();
-    let usb_dir = dev_link.parent().unwrap_or(&dev_link);
+    // 驱动绑在接口上，优先取接口目录的（端口目录未必有 driver 链接）
+    let drv = driver_of(&iface_dir);
+    info.driver = if drv.is_empty() {
+        driver_of(&dev_link)
+    } else {
+        drv
+    };
+    info.usb_dev = bus;
+    info.iface = iface;
+    // 接口目录的父目录是 USB 设备目录（`2-1`），vid/pid 在那里
+    let usb_dir = iface_dir.parent().unwrap_or(&iface_dir);
     info.vid = read_trim(&usb_dir.join("idVendor"));
     info.pid = read_trim(&usb_dir.join("idProduct"));
     info
+}
+
+/// 从 `/sys/class/tty/<tty>/device` 的解析结果里切出 USB 接口目录。
+///
+/// 返回 `(接口目录, bus, 接口号)`，例如
+/// `/sys/.../usb2/2-1/2-1:1.2/ttyUSB2` → (`/sys/.../2-1:1.2`, `2-1`, `1.2`)。
+///
+/// 为什么不只看 `file_name()`：`device` 的指向随驱动/内核而变 —— 有的直接指向
+/// 接口目录 `2-1:1.2`，有的指向接口下的端口目录 `2-1:1.2/ttyUSB2`
+/// （内核 6.x 的 usb-serial 以后者居多）。所以从解析路径逐级往上找第一个
+/// 长得像「USB 接口」的目录。
+pub fn split_usb_interface(dev_link: &Path) -> Option<(PathBuf, String, String)> {
+    for dir in dev_link.ancestors() {
+        let name = match dir.file_name() {
+            Some(n) => n.to_string_lossy().to_string(),
+            None => continue,
+        };
+        // `2-1:1.2`：冒号前是 bus（`2-1`），冒号后是「配置.接口」（`1.2`）
+        let Some((bus, iface)) = name.rsplit_once(':') else {
+            continue;
+        };
+        if bus.is_empty() || !bus.contains('-') || !bus.chars().any(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if !iface.contains('.') || !iface.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            continue;
+        }
+        return Some((dir.to_path_buf(), bus.to_string(), iface.to_string()));
+    }
+    None
 }
 
 #[cfg(not(unix))]
@@ -202,6 +235,7 @@ pub fn port_exists(port: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{describe, is_at_candidate, port_exists};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn filters_ports() {
@@ -238,5 +272,41 @@ mod tests {
         assert!(info.usb_dev.is_empty());
         assert!(info.iface.is_empty());
         assert!(info.vid.is_empty());
+    }
+
+    /// `device` 指向接口下的端口目录（内核 6.x 的 usb-serial）时必须仍能归到接口，
+    /// 否则同一台模组的每个 AT 口会各自成组 —— 一台模组被登记成多台。
+    #[test]
+    fn split_usb_interface_accepts_port_subdir() {
+        let got = super::split_usb_interface(Path::new(
+            "/sys/devices/platform/soc/11200000.usb/usb2/2-1/2-1:1.2/ttyUSB2",
+        ))
+        .expect("端口目录必须能归到接口");
+        assert_eq!(got.1, "2-1");
+        assert_eq!(got.2, "1.2");
+        assert_eq!(
+            got.0,
+            PathBuf::from("/sys/devices/platform/soc/11200000.usb/usb2/2-1/2-1:1.2"),
+            "要返回接口目录本身，不是端口目录"
+        );
+    }
+
+    /// 老布局：`device` 直接指向接口目录。
+    #[test]
+    fn split_usb_interface_accepts_iface_dir() {
+        let got = super::split_usb_interface(Path::new("/sys/bus/usb/devices/1-1:1.2"))
+            .expect("接口目录必须能认出来");
+        assert_eq!(got.1, "1-1");
+        assert_eq!(got.2, "1.2");
+    }
+
+    /// 非 USB（板载串口、根目录）不能误判成 USB 接口。
+    #[test]
+    fn split_usb_interface_rejects_non_usb() {
+        assert!(
+            super::split_usb_interface(Path::new("/sys/devices/platform/serial8250/tty/ttyS0"))
+                .is_none()
+        );
+        assert!(super::split_usb_interface(Path::new("/")).is_none());
     }
 }
