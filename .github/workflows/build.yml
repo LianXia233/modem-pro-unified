@@ -38,6 +38,8 @@ on:
 
 permissions:
   contents: write
+  # 清理陈旧 artifact 需要 actions: write（删除其他 run 的构建产物）。
+  actions: write
 
 concurrency:
   group: build-${{ github.ref }}
@@ -391,3 +393,76 @@ jobs:
           make_latest: ${{ github.ref_type == 'tag' && 'true' || 'false' }}
           generate_release_notes: true
           files: dist/*
+
+      # 每次编译都出 Release，Release 会越积越多；这一步把陈旧的收掉：
+      #   · 其他 run 的 artifact —— 内容已随 Release 发布，留着只是冗余；
+      #   · 旧的 CI Release（build-* 标签）—— 只保留最近 KEEP_CI_RELEASES 个，
+      #     正式版本 Release（v* 标签）不动，那是版本历史。
+      # 当前 run 的 artifact 与刚发布的 Release 都不在清理范围内。
+      - name: 清理陈旧产物与旧 CI Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          KEEP_CI_RELEASES: "3"
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.error, urllib.request
+
+          TOKEN = os.environ["GH_TOKEN"]
+          REPO = os.environ["GH_REPO"]
+          KEEP = int(os.environ.get("KEEP_CI_RELEASES", "3"))
+          CUR = os.environ.get("GITHUB_RUN_ID", "")
+
+          def api(path, method="GET"):
+              req = urllib.request.Request(f"https://api.github.com{path}", method=method)
+              req.add_header("Authorization", f"Bearer {TOKEN}")
+              req.add_header("Accept", "application/vnd.github+json")
+              req.add_header("User-Agent", "ci-cleanup")
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as resp:
+                      return resp.status, resp.read().decode()
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read().decode()
+
+          # 1) run 状态表（只删已结束 run 的 artifact，避免打断正在跑的构建）
+          runs = {}
+          page = 1
+          while True:
+              code, out = api(f"/repos/{REPO}/actions/runs?per_page=100&page={page}")
+              if code != 200:
+                  break
+              items = json.loads(out).get("workflow_runs", [])
+              if not items:
+                  break
+              for r in items:
+                  runs[r["id"]] = r.get("status")
+              if len(items) < 100:
+                  break
+              page += 1
+
+          code, out = api(f"/repos/{REPO}/actions/artifacts?per_page=100")
+          arts = json.loads(out).get("artifacts", []) if code == 200 else []
+          deleted = 0
+          for a in arts:
+              rid = (a.get("workflow_run") or {}).get("id")
+              if rid is None or str(rid) == CUR:
+                  continue
+              if runs.get(rid) != "completed":
+                  continue
+              c, _ = api(f"/repos/{REPO}/actions/artifacts/{a['id']}", method="DELETE")
+              if c == 204:
+                  deleted += 1
+          print(f"清理旧 artifact：{deleted} 个（原有 {len(arts)}）")
+
+          # 2) 旧 CI Release（build-* 标签），保留最近 KEEP 个；正式版本 Release 不动
+          code, out = api(f"/repos/{REPO}/releases?per_page=100")
+          rels = json.loads(out) if code == 200 else []
+          ci = [r for r in rels if r["tag_name"].startswith("build-")]
+          ci.sort(key=lambda r: r.get("published_at") or "", reverse=True)
+          for r in ci[KEEP:]:
+              c, _ = api(f"/repos/{REPO}/releases/{r['id']}", method="DELETE")
+              print(f"删除旧 CI Release {r['tag_name']}：HTTP {c}")
+              if c == 204:
+                  api(f"/repos/{REPO}/git/refs/tags/{r['tag_name']}", method="DELETE")
+          print(f"CI Release 保留 {min(len(ci), KEEP)} / 共 {len(ci)} 个")
+          PY
