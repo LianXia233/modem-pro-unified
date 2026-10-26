@@ -115,6 +115,10 @@ ucode-mod-math netifd wwan usbutils odhcp6c`，以及内核模块
   （`aarch64_cortex-a53`），各出 APK（snapshots）与 IPK（24.10.x）。
 - **产物校验和**：Release 里的 `SHA256SUMS.txt` 在合并三个矩阵档后重算，
   覆盖全部已上传文件（各档自带的同名清单在合并时会被覆盖，故不直接使用）。
+- **陈旧清理**（release job 末步，`KEEP_CI_RELEASES=3`）：
+  删除**已结束** run 的 artifact（内容已随 Release 发布，保留只是冗余），
+  并把旧的 CI Release（`build-*` 标签）只保留最近 3 个；
+  正式版本 Release（`v*` 标签）不动，那是版本历史。当前 run 的产物不在清理范围。
 - **Rust**：`RUST_TOOLCHAIN: 1.93.0` + `MODEM_PRO_HOST_RUST=1`。
 - **stub**：feeds 只拉本地 `modem_pro` 与 `ci_stub`，`luci-base` / `odhcp6c` 用空包满足元数据，
   避免去编 LuCI 组件而缺 base feed 头文件。

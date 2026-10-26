@@ -29,6 +29,11 @@ Release；实测 run #39（手动触发）三个矩阵档全部 success，但 Re
 3. **校验和改为合并后重算**：三个矩阵档各带一份 `SHA256SUMS.txt`，
    `merge-multiple` 合并时同名文件互相覆盖，最终只剩最后一档的清单，
    与实际发布文件对不上；现在按合并后的全部文件重算一次再上传。
+4. **新增陈旧清理**（release job 末步）：既然每次编译都出 Release，Release 会越积越多。
+   现在每次编译结束自动清理：删除**已结束** run 的 artifact（内容已随 Release 发布），
+   并把旧的 CI Release（`build-*` 标签）只保留最近 3 个（`KEEP_CI_RELEASES`）；
+   正式版本 Release（`v*` 标签）不动 —— 那是版本历史。需 `actions: write` 权限。
+   实测首次清理：旧 run artifact 68 个全部删除。
 （`.github/workflows/build.yml`、`docs/BUILD.md`）
 
 ### 修复：FM350 NR 驻网时信号质量页面 RSRP/RSRQ 系统性偏低（CESQ 误按 LTE 表换算）
