@@ -154,7 +154,7 @@ jobs:
           PKG_VERSION:=1.0.0
           PKG_RELEASE:=1
           PKG_MAINTAINER:=CI
-          PKG_LICENSE:=GPL-2.0
+          PKG_LICENSE:=GPL-2.0-only
           include $(INCLUDE_DIR)/package.mk
           define Package/odhcp6c
             SECTION:=net
