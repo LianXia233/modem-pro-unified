@@ -107,10 +107,14 @@ ucode-mod-math netifd wwan usbutils odhcp6c`，以及内核模块
 
 `.github/workflows/build.yml`：
 
-- **触发**：推 `v*` 标签（编译 + 建 Release 并上传）或手动 `workflow_dispatch`（只出 artifact）。
-  **推 `main` 不触发**。
+- **触发**：推 `v*` 标签或手动 `workflow_dispatch` 都会触发编译，且**每次编译都发布
+  Release**：标签触发发到同名版本标签（说明取 `RELEASE_NOTES.md`，并更新「最新版本」标记），
+  手动触发发到 CI 标签 `build-<run_number>`（说明按提交/分支/运行号自动生成，
+  不抢占「最新版本」标记）。**推 `main` 本身不触发编译**。
 - **矩阵**：`armsr/armv8`（包架构 `aarch64_generic`）与 `mediatek/filogic`
   （`aarch64_cortex-a53`），各出 APK（snapshots）与 IPK（24.10.x）。
+- **产物校验和**：Release 里的 `SHA256SUMS.txt` 在合并三个矩阵档后重算，
+  覆盖全部已上传文件（各档自带的同名清单在合并时会被覆盖，故不直接使用）。
 - **Rust**：`RUST_TOOLCHAIN: 1.93.0` + `MODEM_PRO_HOST_RUST=1`。
 - **stub**：feeds 只拉本地 `modem_pro` 与 `ci_stub`，`luci-base` / `odhcp6c` 用空包满足元数据，
   避免去编 LuCI 组件而缺 base feed 头文件。

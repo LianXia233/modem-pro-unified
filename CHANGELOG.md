@@ -10,6 +10,27 @@
 
 ## [未发布]
 
+### 变更：CI 每次编译都发布 Release（手动触发不再只出 artifact）
+
+**问题**：`build.yml` 的 release job 条件是 `startsWith(github.ref, 'refs/tags/v')`，
+手动 `workflow_dispatch` 编译只把产物留在 artifact（14 天过期），拿不到可下载的
+Release；实测 run #39（手动触发）三个矩阵档全部 success，但 Release 一条没建。
+
+**改动**（`.github/workflows/build.yml`）：
+
+1. **release job 不再限定标签**：条件改为 `always() && needs.build.result == 'success'`
+   —— 无论标签触发还是手动触发都发布 Release；矩阵任一档失败则不发布（避免半成品）。
+2. **发布目标按来源区分**：
+   - 标签触发（`refs/tags/v*`）→ 同名版本标签，说明取仓库的 `RELEASE_NOTES.md`，
+     `make_latest=true`（维持「最新版本」指向正式版）；
+   - 手动触发 → CI 标签 `build-<run_number>`（不存在则按当前提交自动创建），
+     说明按提交 / 分支 / 运行号 / 产物清单自动生成，`make_latest=false`
+     （不抢占正式版的「最新版本」标记）。
+3. **校验和改为合并后重算**：三个矩阵档各带一份 `SHA256SUMS.txt`，
+   `merge-multiple` 合并时同名文件互相覆盖，最终只剩最后一档的清单，
+   与实际发布文件对不上；现在按合并后的全部文件重算一次再上传。
+（`.github/workflows/build.yml`、`docs/BUILD.md`）
+
 ### 修复：FM350 NR 驻网时信号质量页面 RSRP/RSRQ 系统性偏低（CESQ 误按 LTE 表换算）
 
 **现象**：FM350-GL（F22 固件 81600.0000.00.29.24.02，实机 192.168.10.1）NR 驻网（n41）时，
