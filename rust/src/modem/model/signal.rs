@@ -245,8 +245,17 @@ pub fn parse_qeng_servingcell(resp: &str) -> Option<(i32, i32, i32)> {
 /// 依据 Go `module/cell/cell.go:573` `ParseCESQSignal`（同一份换算法）。
 ///
 /// 字段序：`<rxlev>,<ber>,<rscp>,<ecno>,<rsrq>,<rsrp>,<ss_rsrq>,<ss_rsrp>,<ss_sinr>`。
-/// 前 6 格是 3GPP 标准量，第 7~9 格是广和通的 NR SSB 扩展；制式由「哪几格
-/// 不是 255」隐式给出：LTE 量有效走 LTE 表，否则走 NR 表。
+/// 前 6 格是 3GPP 标准量，第 7~9 格是广和通的 NR SSB 扩展。
+///
+/// ⚠️ **NR SSB 扩展格优先**：FM350 实机（F22/F27 系列 81600 固件）在 NR 驻网时
+/// 标准格 `<rsrq>` / `<rsrp>`（f[4] / f[5]）**并不回 255**，而是塞一份按 LTE 表
+/// 刻度的测量值（实测 28 / 38 → 换算 -6 dB / -103 dBm），与 GTCCINFO 服务小区行
+/// 同时刻的 NR SSB 实测（-11 dB / -79 dBm）差 5~24 dB。旧逻辑按「f[4]/f[5] 非
+/// 255 → LTE 表」隐式判制式，NR 驻网时永远命中 LTE 表，页面 RSRP/RSRQ 因此
+/// 系统性偏低。修法：`<ss_rsrp>`（f[7]）非 255 即认为模组给出了 NR SSB 测量，
+/// 以扩展格为准（与 `AT+GTCCINFO?` 逐格一致，实测验证）；扩展格缺失（LTE 驻网
+/// 时三格全 255）才退回 LTE 表 —— 制式由「扩展格在不在」显式给出，不再猜。
+///
 /// `<rxlev>` / `<rscp>` / `<ecno>` 在 LTE/NR 模组上恒为 99 / 255，不参与换算；
 /// 真正在 WCDMA 上要用它们（RSCP / EcIo）时，本函数已按「两项都为 0」提前退出。
 ///
@@ -264,19 +273,26 @@ pub fn parse_cesq(resp: &str) -> Option<(i32, i32, i32)> {
     let mut rsrp = 0;
     let mut rsrq = 0;
     let mut sinr = 0;
-    if let (Some(lte_rsrq), Some(lte_rsrp)) = (f[4].parse::<i32>().ok(), f[5].parse::<i32>().ok()) {
-        rsrp = lte_rsrp_index_dbm(lte_rsrp).unwrap_or(0);
-        rsrq = lte_rsrq_index_db(lte_rsrq).unwrap_or(0);
-    }
-    if rsrp == 0 && rsrq == 0 && f.len() >= 9 {
-        if let Ok(v) = f[7].parse::<i32>() {
+    let num = |i: usize| f.get(i).and_then(|s| s.parse::<i32>().ok());
+    if f.len() >= 9 {
+        if let Some(v) = num(7).filter(|v| *v != 255) {
+            // NR SSB 扩展格在：以它为准（NR 驻网的权威测量）。
             rsrp = nr_ss_rsrp_index_dbm(v).unwrap_or(0);
+            rsrq = num(6)
+                .filter(|v| *v != 255)
+                .and_then(nr_ss_rsrq_index_db)
+                .unwrap_or(0);
+            sinr = num(8)
+                .filter(|v| *v != 255)
+                .and_then(nr_ss_sinr_index_db)
+                .unwrap_or(0);
         }
-        if let Ok(v) = f[6].parse::<i32>() {
-            rsrq = nr_ss_rsrq_index_db(v).unwrap_or(0);
-        }
-        if let Ok(v) = f[8].parse::<i32>() {
-            sinr = nr_ss_sinr_index_db(v).unwrap_or(0);
+    }
+    if rsrp == 0 {
+        // SSB 缺失（LTE 驻网时扩展格全 255）：退回 LTE 标准格。
+        if let (Some(lte_rsrq), Some(lte_rsrp)) = (num(4), num(5)) {
+            rsrp = lte_rsrp_index_dbm(lte_rsrp).unwrap_or(0);
+            rsrq = lte_rsrq_index_db(lte_rsrq).unwrap_or(0);
         }
     }
     if rsrp == 0 && rsrq == 0 {
@@ -450,6 +466,22 @@ mod tests {
     fn cesq_fibocom_ssb() {
         let resp = "+CESQ: 99,99,255,255,255,255,30,60,21\r\nOK\r\n";
         assert_eq!(parse_cesq(resp), Some((-97, -29, -13)));
+    }
+
+    #[test]
+    fn cesq_nr_serving_reports_lte_scale_fields() {
+        // FM350-GL 实机 NR 驻网（n41，81600.0000.00.29.24.02）同时刻抓包：
+        //   +CESQ: 15,99,255,255,28,38,65,78,97
+        //   GTCCINFO 服务小区行 1,9,460,0,…,504990,643,5041,500,25,78,78,65
+        // 标准格 <rsrq>=28 / <rsrp>=38 非 255（旧逻辑会按 LTE 表换算成 -6 / -103，
+        // 与实际差 5~24 dB）；NR SSB 扩展格 65/78/97 与 GTCCINFO 逐格一致：
+        //   ss_rsrp 78 → 78-157 = -79 dBm；ss_rsrq 65 → 65*0.5-43.5 = -11 dB；
+        //   ss_sinr 97 → 97*0.5-23.5 = 25 dB。
+        let resp = "+CESQ: 15,99,255,255,28,38,65,78,97\r\nOK\r\n";
+        assert_eq!(parse_cesq(resp), Some((-79, -11, 25)));
+        // SINR 抖动一格（97→95）只影响 SINR，不牵连 RSRP/RSRQ。
+        let resp2 = "+CESQ: 15,99,255,255,28,38,65,78,95\r\nOK\r\n";
+        assert_eq!(parse_cesq(resp2), Some((-79, -11, 24)));
     }
 
     #[test]

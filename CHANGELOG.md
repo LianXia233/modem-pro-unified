@@ -10,6 +10,26 @@
 
 ## [未发布]
 
+### 修复：FM350 NR 驻网时信号质量页面 RSRP/RSRQ 系统性偏低（CESQ 误按 LTE 表换算）
+
+**现象**：FM350-GL（F22 固件 81600.0000.00.29.24.02，实机 192.168.10.1）NR 驻网（n41）时，
+「信号质量」卡片显示 RSRP=-103 dBm / RSRQ=-6 dB / SINR=25 dB，而「基站信息」页
+`AT+GTCCINFO?` 服务小区行同时刻给出 RSRP=-79 dBm / RSRQ=-11 dB / SINR=25 dB ——
+RSRP 偏低 24 dB、RSRQ 偏高 5 dB，SINR 反而正确。
+
+**根因**：`parse_cesq`（`modem/model/signal.rs`）按「标准格 `<rsrq>`/`<rsrp>`（f[4]/f[5]）
+非 255 → LTE 表」隐式判制式。该固件在 NR 驻网时标准格**不回 255**（实测恒为 28 / 38，
+按 LTE 表换算恰为 -6 dB / -103 dBm，与页面显示逐值吻合），真正的 NR SSB 测量在广和通
+扩展格 f[6..8]；旧逻辑因 rsrp≠0 永远走不到 SSB 分支，只在 SINR 缺格时才兜底发
+`AT+GTCCINFO?` 补 SINR —— 这解释了「RSRP/RSRQ 错、SINR 对」的组合。
+
+**修复**：`parse_cesq` 改为 **NR SSB 扩展格优先** —— `<ss_rsrp>`（f[7]）非 255 即认为
+模组给出了 NR SSB 测量，三值全部取扩展格（与 `AT+GTCCINFO?` 服务小区行逐格一致，
+实机验证）；扩展格缺失（LTE 驻网时全 255）才退回 LTE 标准格，制式判定由「猜」改为
+「看扩展格在不在」。新增实机回归用例 `cesq_nr_serving_reports_lte_scale_fields`
+（同时刻 CESQ + GTCCINFO 抓包交叉验证）；既有 LTE 样例行为不变。
+（`modem/model/signal.rs`）
+
 ## [1.0.8] - 2026-10-24
 
 ### 修复：QMI/MBIM 模式下内置原生拨号后端显示「未运行」（对照上游 modem-pro 全量移植补缺）
