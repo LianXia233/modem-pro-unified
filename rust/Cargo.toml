@@ -1,7 +1,7 @@
 # modem-pro 统一包的 Rust 后端（守护进程 modemd）。
 #
 # 目标平台：OpenWrt 25.x（musl）。宿主平台（Windows/Linux）也能 `cargo build` 做开发自测。
-# 依赖刻意保持精简（见 docs/INTEGRATION.md「后端迁移策略」）：
+# 依赖刻意保持精简：
 #   · tiny_http     —— 同步、轻量的 HTTP/1.1 服务器（不引入 tokio/axum 这层异步栈）
 #   · serialport    —— AT 串口（关掉 default features，避免 Linux 侧拖进 libudev）
 #   · toml          —— 读取 /etc/modemd/config.toml

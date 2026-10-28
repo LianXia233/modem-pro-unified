@@ -7,7 +7,6 @@
 #   · 默认配置与 init 脚本（files/、packaging/）
 #
 # 版本号唯一来源：仓库根 VERSION（形如 1.0.0-1），打包时注入 MODEMD_VERSION。
-# 构建说明见 docs/BUILD.md。
 
 include $(TOPDIR)/rules.mk
 
@@ -88,7 +87,7 @@ else ifeq ($(MODEM_PRO_HOST_RUST),1)
   endef
 else
   define MODEMD/Compile
-	$(error 未找到 rust 包支持：请先启用 feeds/packages（lang/rust），或设 MODEM_PRO_HOST_RUST=1 用宿主工具链直编。详见 docs/BUILD.md)
+	$(error 未找到 rust 包支持：请先启用 feeds/packages（lang/rust），或设 MODEM_PRO_HOST_RUST=1 用宿主工具链直编)
   endef
 endif
 

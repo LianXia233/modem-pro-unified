@@ -4,7 +4,6 @@
 //! 失败时**仍然把状态带回去**（data = DialState），页面据此显示「卡在哪一步」，
 //! 而不是只弹一句错误；错误信息走 msg。
 //!
-//! 契约见 docs/API.md。
 
 use std::collections::HashMap;
 

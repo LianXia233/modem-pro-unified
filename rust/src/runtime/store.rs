@@ -23,7 +23,7 @@
 //! `SchedStore` 与 `HostNicStore`（`runtime/hostnic.rs`）走 `.tmp` + `rename`；
 //! `quota` / `imei` / `atport` / `atport_bind` 是**直接覆盖写** —— 写一半掉电会留下
 //! 损坏文件，靠上面的「损坏按空台账」兜住（代价是丢一次账，不是起不来服务）。
-//! 统一成原子写属实机写盘行为变更，未做，见 docs/UPSTREAM_AUDIT.md 的取舍说明。
+//! 统一成原子写属实机写盘行为变更，未做。
 
 use std::collections::HashMap;
 use std::sync::Mutex;

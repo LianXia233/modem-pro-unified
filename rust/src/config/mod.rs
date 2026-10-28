@@ -6,7 +6,7 @@
 //!   · 「不写也算开」的开关（require_luci_login / wechat.listen）
 //!     由各分节的 `Default` + `normalize()` 兜底。
 //!
-//! 分节各自成文件，便于按域扩展（迁移清单见 docs/INTEGRATION.md）。
+//! 分节各自成文件，便于按域扩展。
 
 mod dial;
 mod duration;

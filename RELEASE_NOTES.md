@@ -46,8 +46,6 @@ apk add --allow-untrusted /tmp/modem-pro-*.apk
 opkg install /tmp/modem-pro_*.ipk
 ```
 
-构建与安装后验证见 [`docs/BUILD.md`](docs/BUILD.md)。
-
 ## 升级注意
 
 - 覆盖安装即可；版本号单一来源 `VERSION`（本版 `1.0.8-1`）。
@@ -82,8 +80,4 @@ opkg install /tmp/modem-pro_*.ipk
 
 ## 文档
 
-`CHANGELOG.md` 的 [1.0.8] 条目（本版全部细节）、`docs/INTEGRATION.md`
-（架构/数据流，⑤b 已同步原生拨号的释放 / raw_ip / 自愈口径）、`docs/BUILD.md`
-（构建/CI/验证）、`docs/API.md`（`/api/*` + WebSocket 全表）、
-`docs/UPSTREAM_AUDIT.md`（审计与上游致谢）、`docs/SUPPORT_MATRIX.md`；
-历史文档的处置见 `docs/README.md`。
+`CHANGELOG.md` 的 [1.0.8] 条目（本版全部细节）。

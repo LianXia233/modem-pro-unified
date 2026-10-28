@@ -2,13 +2,73 @@
 
 本项目采用 [语义化版本](https://semver.org/lang/zh-CN/)；版本号单一来源为仓库根 `VERSION`。
 
-> **文档状态（2026-10-20 起）**：提交 `66853b8` 删除了当时的全部 `docs/` 文件（5777 行）。
-> 现行权威文档只有 `docs/INTEGRATION.md`、`docs/BUILD.md`、`docs/API.md`、
-> `docs/UPSTREAM_AUDIT.md`、`docs/SUPPORT_MATRIX.md` 与索引 `docs/README.md`。
-> 本文件历史条目中提到的 `PORTING.md` / `PROGRESS.md` / `HANDOFF.md` / `PRIVACY.md` /
-> `DIAL_AUDIT.md` **均已被删除**，只是历史记录，不得作为当前设计依据。
+> **文档状态（2026-10-29 起）**：`docs/` 已整体移除（2026-10-20 曾重建一轮，
+> 之后与代码状态再次脱节，不再随仓库维护）。本文件历史条目中提到的任何
+> `docs/*.md`（含 `PORTING.md` / `PROGRESS.md` / `HANDOFF.md` / `PRIVACY.md` /
+> `DIAL_AUDIT.md` / `INTEGRATION.md` / `BUILD.md` / `API.md` / `UPSTREAM_AUDIT.md` /
+> `SUPPORT_MATRIX.md` / `DIAL_STATE_MACHINE.md`）**均只是历史记录**，
+> 不得作为当前设计依据；当前事实以源码、`config.toml` 注释与 git 历史为准。
 
 ## [未发布]
+
+### 变更：移除 docs/ 文档集，仓库内不再维护文档
+
+**原因**：文档与代码状态脱节（WebUI 退役、拨号器多次演进后，`docs/` 里的
+架构图、接口契约、审计结论已对不上当前实现），维护者决定不再随仓库维护文档，
+以源码、`config.toml` 逐项注释与 CHANGELOG 作为事实来源。
+
+**删除**：`docs/`（`README.md` / `INTEGRATION.md` / `BUILD.md` / `API.md` /
+`DIAL_STATE_MACHINE.md` / `UPSTREAM_AUDIT.md` / `SUPPORT_MATRIX.md`，共 7 个文件）。
+
+**改动**：清除全部指向 `docs/*` 的引用 —— `README.md`（文档节改为「事实来源」
+清单：路由表 / config.toml 注释 / CHANGELOG）、`RELEASE_NOTES.md`、`Makefile`
+两处构建提示、`scripts/check-desensitize.sh`（指向早已删除的 `PRIVACY.md`）、
+`rust/Cargo.toml` 与源码注释约 15 处「契约见 docs/API.md」类指引（语义保留，
+指针移除）；指向**上游仓库**文档的引用（QModem `support_list.md` 等）与
+CHANGELOG 历史条目原样保留。
+
+### 变更：对照上游移植拨号器能力（generic MHI 数据面 + 拨号失败自愈复位）
+
+**对照基线**（全部以源码为准，`e00a306 → 4c11622` 与 Go `397e014`）：
+`FUjr/QModem` 的 generic MHI / 嵌套 QMI 数据接口系列提交
+（`mhi_generic.h`、`QMIThread.c:324-357,774-935`、`modem_netdev.sh`）
+与 `ouyangzq/modem-pro` 的 `hostdial_sync.go` 复位节流。
+
+**移植 1：generic MHI（主线 PCIe 驱动）数据面** —— 此前控制口发现只认
+`cdc-wdm` / `GobiQMI` / `mhi_QMI` 三种布局，`mhi_pci_generic` / `mhi_net` /
+`mhi_wwan_*` 这类主线 MHI 驱动的模组（控制口在 `/dev/wwan*`）算不出计划，
+MBIM 还被硬性限定 cdc-wdm。现在：
+
+- `native/mod.rs`：新增 `ControlKind::MhiGeneric` 与 wwan 类控制口发现
+  （`/sys/class/wwan/*/type` 精确匹配 `QMI`/`MBIM`、端口必须落在数据网卡
+  device 的 `mhi<N>` 控制器子树内、`/dev` 节点存在、**候选数 ≠ 1 直接放弃**
+  —— 上游 `cm_mhi_detect` 的 fail-closed 口径；`_IP_SW` 软件通道排除）；
+- `qmi.rs`：`wda_set_data_format_rawip`（裸 IP、无聚合，TLV 布局照抄
+  quectel-CM generic-MHI 分支）+ `wds_bind_mhi`（与 BindMux 同消息号 0x00A2
+  但**省略 mux id TLV**）+ `validate_data_format_rawip`（应答强校验：设备
+  报非裸 IP 或仍聚合即失败）；
+- `qmi_link.rs`：generic MHI 会话顺序 = WDA(裸 IP) → BindMhi(v4/v6 各一次)
+  → Start；MBIM 解锁 wwan(MBIM) 控制口；
+- 假设备顺序测试覆盖完整帧序列（绑定帧无 0x11、WDA 无 0x15/0x16）。
+
+**移植 2：`[net] reset_before_dial` 自愈复位**（此前配置注释明示「未实现」，
+Go 上游已落地）：原生路径对同一模组连续失败 ≥5 次（错误变化清零重数）且距
+上次复位超过冷却期（`reset_before_dial_cooldown`，默认 300s、钳 60~3600），
+在工作线程里发 `AT+CFUN=1,1` 并等 AT 口恢复（≤150s，3s 轮询），完成后清退避
+立即重拨。复位只作用于 QMI/MBIM 原生路径 —— AT 路径的持续失败（没插卡/
+无服务）不触发；用户断开 / 重开开关 / 模组消失都会清账，不会冷不丁重启模组。
+`reset_before_dial` 默认关（复位会中断数据面 30 秒以上）。
+
+**不移植**（本轮核对后主动放弃，均有源码依据）：QModem 的拨号凭据体系
+（`MGAUTH`/`AUTHDATA`/QMI auth TLV + PAP/CHAP 互换重试）—— 本仓库 `[net]`
+与 APN 参数都没有 user/pass/auth 字段，凭据面不存在，孤立的指令移植无处
+落地；双 SIM 槽 apn2 回退（SIM 槽管理是独立功能面）；主线 `qmi_wwan` 的
+`add_mux` 内核侧建口（本地 QMAP 路径面向厂商驱动 `qmi_wwan_q/f`、GobiNet、
+`pcie_mhi`，BindMux 即通，改内核侧无真机可验）。
+
+（`rust/src/runtime/dialer/qmi.rs`、`native/mod.rs`、`native/qmi_link.rs`、
+`runtime/dialer/mod.rs`、`modem/model/device.rs`、`config/net.rs`、
+`files/etc/modemd/config.toml`）
 
 ### 变更：退役内置 WebUI，前端只保留 LuCI
 

@@ -3,7 +3,7 @@
 //! 页面进「拨号上网」先 GET 一次（状态 + 类型 + 表，一次拉全，不用发三次请求）。
 //! `force=1` 表示重新识别 USB 类型（不走 30 秒缓存）—— 页面上「重新识别」按钮用它。
 //!
-//! 契约见 docs/API.md，字段：
+//! 字段：
 //!   `modem_id / state / usb / class_notes / types / auto_wan / wan_ipv6 /
 //!    wan_ipv6_mode / wan_ipv6_modes / dial_enabled / wan_mode / wan_mode_label /
 //!    wan_modes / wan_dns`。

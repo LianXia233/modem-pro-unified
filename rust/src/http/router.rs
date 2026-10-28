@@ -15,7 +15,7 @@ use super::{auth, handlers, request, response, AppState};
 /// 接口全表：`(METHOD, PATH)`。
 ///
 /// 运行时不再用它做兜底（每个接口都有 handler，未登记就是 404）；保留它是为了
-/// 和 `docs/API.md` 对照，并让测试能校验「表里没有重复项」。
+/// 让测试能校验「表里没有重复项」。
 #[cfg_attr(not(test), allow(dead_code))]
 pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/version"),

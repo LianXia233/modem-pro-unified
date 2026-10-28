@@ -6,7 +6,7 @@
 //!   · `both`      —— 两种都要：modem<id>(modem_pro) + modem<id>_6(dhcpv6)
 //!
 //! 写回配置后由组网循环（≤15 秒一轮）接手：会就地改主接口 proto、按需补/删
-//! modem<id>_6，防火墙那段也跟着对账（见 netprov/）。契约见 docs/API.md。
+//! modem<id>_6，防火墙那段也跟着对账（见 netprov/）。
 
 use std::collections::HashMap;
 

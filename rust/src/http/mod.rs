@@ -13,7 +13,7 @@
 //!   · `auth`       —— 「跟随 LuCI 登录」闸门
 //!   · `handlers/*` —— 每个接口一个文件
 //!
-//! 接口契约见 docs/API.md，迁移清单见 docs/API.md。
+//! 接口全表见 router.rs 的 ROUTES。
 
 mod auth;
 pub(crate) mod cache;
