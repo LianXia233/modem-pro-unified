@@ -13,7 +13,6 @@ use serde::Deserialize;
 /// 两家都提供 Anycast 的 v4 + v6 双栈，任何一族不可用都有同族的备选顶上。
 ///
 /// ⚠️ 改这里要同步三处：本常量、`files/etc/modemd/config.toml` 的 `[net] wan_dns`
-/// 注释、以及 `docs/DIAL_STATE_MACHINE.md` 里提到默认值的地方。
 /// 老机器升级后配置文件里没有这一行也走本常量（`config.toml` 是 conffile，升级不覆盖）。
 pub const DEFAULT_WAN_DNS: &str = "119.29.29.29 223.5.5.5 2402:4e00:: 2400:3200::1";
 
@@ -49,6 +48,13 @@ pub struct NetConfig {
     pub wan_dns: String,
     pub dial_enabled: bool,
     pub allow_roaming: bool,
+    /// 连续拨号失败后的自愈复位（**默认关**）：内置拨号器（QMI/MBIM 原生路径）
+    /// 对同一模组连续失败 5 次后发 `AT+CFUN=1,1` 重启模组。典型场景：QMI 会话
+    /// 被强拆后残留在模组里（Start 一直被 QMUXError 0xe 拒）。只作用于原生
+    /// 路径；AT 路径的持续失败（没插卡/无服务/欠费）不会触发复位。
+    pub reset_before_dial: bool,
+    /// 两次自愈复位之间至少隔多少秒（默认 300；实际使用钳在 60~3600）。
+    pub reset_before_dial_cooldown: i64,
 }
 
 impl Default for NetConfig {
@@ -68,6 +74,8 @@ impl Default for NetConfig {
             wan_dns: DEFAULT_WAN_DNS.to_string(),
             dial_enabled: true,
             allow_roaming: true,
+            reset_before_dial: false,
+            reset_before_dial_cooldown: 300,
         }
     }
 }
@@ -99,6 +107,10 @@ impl NetConfig {
             "" => self.wan_dns = DEFAULT_WAN_DNS.to_string(),
             "off" | "none" | "carrier" => self.wan_dns = String::new(),
             _ => self.wan_dns = self.wan_dns.trim().to_string(),
+        }
+        // 自愈复位冷却：<=0 按默认 300（使用时还会钳在 60~3600，见拨号协调器）。
+        if self.reset_before_dial_cooldown <= 0 {
+            self.reset_before_dial_cooldown = 300;
         }
     }
 }

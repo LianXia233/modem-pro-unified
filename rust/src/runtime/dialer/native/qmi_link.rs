@@ -199,6 +199,27 @@ impl QmiLink {
         Ok(qmi::parse_data_format_rx_urb(&payload))
     }
 
+    /// generic MHI 的数据格式：**裸 IP、无聚合**，并对设备应答做强校验。
+    ///
+    /// 内核 `mhi_net` 只吃裸 IP 帧：设备若报「链路协议非 2」或「仍在聚合」，
+    /// 继续拨只会建起一条内核和固件各说各话的死链路 —— 按上游
+    /// 「generic MHI requires raw IP without data aggregation」的口径直接失败。
+    pub fn set_data_format_rawip(
+        &mut self,
+        client: u8,
+        ep_type: u32,
+        iface_id: u32,
+    ) -> Result<(), String> {
+        let tid = self.next_tid();
+        let frame = qmi::wda_set_data_format_rawip(tid, client, ep_type, iface_id);
+        let deadline = Instant::now() + CTL_TIMEOUT;
+        self.write_frame(&frame, deadline)?;
+        let payload = self.read_response(qmi::SVC_WDA, qmi::WDA_SET_DATA_FORMAT, tid, deadline)?;
+        qmi::result(&payload)
+            .map_err(|(r, e)| format!("Set Data Format 失败 result={r} error={e}"))?;
+        qmi::validate_data_format_rawip(&payload)
+    }
+
     /// 把 WDS client 绑到 QMAP 的 mux 上（`Bind Mux Data Port`）。
     ///
     /// 必须**每个 WDS client 各绑一次**（v4 走 service 1、v6 走 0x11），
@@ -216,6 +237,28 @@ impl QmiLink {
         let payload = self.read_response(service, qmi::WDS_BIND_MUX_DATA_PORT, tid, deadline)?;
         qmi::result(&payload)
             .map_err(|(r, e)| format!("Bind Mux Data Port 失败 result={r} error={e}"))?;
+        Ok(())
+    }
+
+    /// generic MHI：把 WDS client 绑到**未复用**的 MHI 数据端点。
+    ///
+    /// 与 [`QmiLink::bind_mux`] 同一个消息号（0x00A2），但没有 mux id TLV ——
+    /// mhi_net 的数据通道不分 mux，绑定只是告诉固件「这个 client 接管该端点」
+    /// （对齐 quectel-CM `WdsBindMhiEndpoint()`）。同样每个 client 各绑一次。
+    pub fn bind_mhi(
+        &mut self,
+        service: u8,
+        client: u8,
+        ep_type: u32,
+        iface_id: u32,
+    ) -> Result<(), String> {
+        let tid = self.next_tid();
+        let frame = qmi::wds_bind_mhi(tid, service, client, ep_type, iface_id);
+        let deadline = Instant::now() + CTL_TIMEOUT;
+        self.write_frame(&frame, deadline)?;
+        let payload = self.read_response(service, qmi::WDS_BIND_MUX_DATA_PORT, tid, deadline)?;
+        qmi::result(&payload)
+            .map_err(|(r, e)| format!("Bind MHI Endpoint 失败 result={r} error={e}"))?;
         Ok(())
     }
 
@@ -294,9 +337,12 @@ impl QmiSession {
     /// 建立呼叫：v4 必须成功；v6 失败只记 note（很多网络本来就不给 v6）。
     ///
     /// `qmap` 非空时按 quectel-CM `requestSetEthMode()` 的顺序先做
-    /// `WDA Set Data Format`，再把 v4/v6 两个 WDS client 绑到同一个 mux 上。
+    /// `WDA Set Data Format`，再把 v4/v6 两个 WDS client 绑到同一个 mux 上；
+    /// `mhi_generic` 时走 generic MHI 路径：精简 WDA（裸 IP、无聚合）+
+    /// `BindMhi`（无 mux id）。
     ///
     /// 返回 `(会话, 备注)`；备注是给页面看的一句话（非致命情况）。
+    #[allow(clippy::too_many_arguments)] // 会话参数本来就这么多（与 NativePlan 一一对应）
     pub fn start(
         wdm: &str,
         iface: &str,
@@ -305,12 +351,13 @@ impl QmiSession {
         pdn: i64,
         disable_autoconnect: bool,
         qmap: Option<qmi::QmapSettings>,
+        mhi_generic: bool,
     ) -> Result<(Self, String), String> {
         if !super::ensure_raw_ip(iface) {
             return Err(format!("{iface} 的 qmi/raw_ip 设置失败"));
         }
         let link = QmiLink::open(wdm)?;
-        Self::start_with(link, apn, ipv6, pdn, disable_autoconnect, qmap)
+        Self::start_with(link, apn, ipv6, pdn, disable_autoconnect, qmap, mhi_generic)
     }
 
     /// 真正的会话流程（与 [`QmiLink::open`] 解耦，便于用假设备跑顺序测试）。
@@ -321,12 +368,14 @@ impl QmiSession {
         pdn: i64,
         disable_autoconnect: bool,
         qmap: Option<qmi::QmapSettings>,
+        mhi_generic: bool,
     ) -> Result<(Self, String), String> {
         link.sync()?;
         let client4 = link.client_id(qmi::SVC_WDS)?;
 
         let mut note = String::new();
-        // v6 的 client 提前申请：QMAP 要在 Start 之前把两个 client 都绑到 mux 上
+        // v6 的 client 提前申请：QMAP / generic MHI 都要在 Start 之前把两个
+        // client 各自绑好
         let mut client6 = None;
         if ipv6 {
             match link.client_id(qmi::SVC_WDS_IPV6) {
@@ -338,7 +387,51 @@ impl QmiSession {
         // QMAP：数据格式 + 绑 mux（缺了这两步，驱动不会 add_mux，数据口永远 NO-CARRIER）
         let mut wda_client = None;
         let mut qmap = qmap;
-        if let Some(mut q) = qmap {
+        if mhi_generic {
+            // generic MHI（mhi_net / mhi_wwan_*）：裸 IP、无聚合，绑定不带 mux id
+            let wda = match link.client_id(qmi::SVC_WDA) {
+                Ok(w) => w,
+                Err(e) => {
+                    let _ = link.release_client_id(qmi::SVC_WDS, client4);
+                    if let Some(c6) = client6 {
+                        let _ = link.release_client_id(qmi::SVC_WDS_IPV6, c6);
+                    }
+                    return Err(format!("generic MHI 需要 WDA client，申请失败：{e}"));
+                }
+            };
+            let setup = link
+                .set_data_format_rawip(wda, qmi::EP_TYPE_PCIE, qmi::QMAP_IFACE_USB)
+                .and_then(|_| {
+                    link.bind_mhi(
+                        qmi::SVC_WDS,
+                        client4,
+                        qmi::EP_TYPE_PCIE,
+                        qmi::QMAP_IFACE_USB,
+                    )
+                });
+            if let Err(e) = setup {
+                let _ = link.release_client_id(qmi::SVC_WDA, wda);
+                let _ = link.release_client_id(qmi::SVC_WDS, client4);
+                if let Some(c6) = client6 {
+                    let _ = link.release_client_id(qmi::SVC_WDS_IPV6, c6);
+                }
+                return Err(format!("generic MHI 初始化失败：{e}"));
+            }
+            if let Some(c6) = client6 {
+                if let Err(e) = link.bind_mhi(
+                    qmi::SVC_WDS_IPV6,
+                    c6,
+                    qmi::EP_TYPE_PCIE,
+                    qmi::QMAP_IFACE_USB,
+                ) {
+                    // v6 绑不上就只走 v4，别让整条呼叫失败
+                    note = format!("IPv6 绑定 MHI 端点失败：{e}");
+                    let _ = link.release_client_id(qmi::SVC_WDS_IPV6, c6);
+                    client6 = None;
+                }
+            }
+            wda_client = Some(wda);
+        } else if let Some(mut q) = qmap {
             let wda = match link.client_id(qmi::SVC_WDA) {
                 Ok(w) => w,
                 Err(e) => {
@@ -513,8 +606,8 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::sync::{Arc, Mutex};
 
-    /// 假设备记录下来的请求：`(service, message, transaction, client)`。
-    type Seen = Arc<Mutex<Vec<(u8, u16, u16, u8)>>>;
+    /// 假设备记录下来的请求：`(service, message, transaction, client, payload)`。
+    type Seen = Arc<Mutex<Vec<(u8, u16, u16, u8, Vec<u8>)>>>;
 
     /// 组一帧应答：结果码 + body。
     fn reply(service: u8, client: u8, tid: u16, msg: u16, body: &[u8]) -> Vec<u8> {
@@ -523,7 +616,7 @@ mod tests {
         qmi::encode(service, client, tid, msg, &p)
     }
 
-    /// 假设备：按请求回最小合法应答，并记录收到的 (service, message, transaction, client)。
+    /// 假设备：按请求回最小合法应答，并记录收到的 (service, message, transaction, client, payload)。
     fn fake_device(mut stream: UnixStream, seen: Seen) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let mut buf: Vec<u8> = Vec::new();
@@ -538,9 +631,13 @@ mod tests {
                     let Some(m) = qmi::take(&mut buf) else {
                         break;
                     };
-                    seen.lock()
-                        .unwrap()
-                        .push((m.service, m.message, m.transaction, m.client));
+                    seen.lock().unwrap().push((
+                        m.service,
+                        m.message,
+                        m.transaction,
+                        m.client,
+                        m.payload.clone(),
+                    ));
                     let body: Vec<u8> = match (m.service, m.message) {
                         (qmi::SVC_CTL, qmi::CTL_GET_CLIENT_ID) => {
                             let svc = qmi::find_tlv(&m.payload, 0x01, false)
@@ -605,8 +702,9 @@ mod tests {
         let stream = unsafe { File::from_raw_fd(a.into_raw_fd()) };
         let link = QmiLink::from_file(stream);
         let qmap = qmi::QmapSettings::usb(0x81, 16 * 1024);
-        let (mut sess, note) = QmiSession::start_with(link, "ctnet", true, 0, true, Some(qmap))
-            .expect("假设备应能让会话建立");
+        let (mut sess, note) =
+            QmiSession::start_with(link, "ctnet", true, 0, true, Some(qmap), false)
+                .expect("假设备应能让会话建立");
         assert!(note.is_empty(), "{note}");
 
         // 呼叫与取址
@@ -625,7 +723,7 @@ mod tests {
 
         // 请求顺序
         let seen = seen.lock().unwrap();
-        let seq: Vec<(u8, u16)> = seen.iter().map(|(s, m, _, _)| (*s, *m)).collect();
+        let seq: Vec<(u8, u16)> = seen.iter().map(|(s, m, ..)| (*s, *m)).collect();
         assert_eq!(seq[0], (qmi::SVC_CTL, qmi::CTL_SYNC));
         assert_eq!(seq[1], (qmi::SVC_CTL, qmi::CTL_GET_CLIENT_ID));
         let wda_pos = seq
@@ -644,21 +742,82 @@ mod tests {
         assert!(bind_pos < start_pos, "绑 mux 必须早于 Start");
         assert!(
             seen.iter()
-                .any(|(s, m, _, _)| *s == qmi::SVC_WDS_IPV6 && *m == qmi::WDS_BIND_MUX_DATA_PORT),
+                .any(|(s, m, ..)| *s == qmi::SVC_WDS_IPV6 && *m == qmi::WDS_BIND_MUX_DATA_PORT),
             "v6 client 也要绑 mux"
         );
         // 用的是设备分配的 WDA client id（3），而不是 WDS 的 1
-        assert!(seen
-            .iter()
-            .any(|(s, m, _, c)| *s == qmi::SVC_WDA && *m == qmi::WDA_SET_DATA_FORMAT && *c == 3));
+        assert!(seen.iter().any(|(s, m, _, c, _)| *s == qmi::SVC_WDA
+            && *m == qmi::WDA_SET_DATA_FORMAT
+            && *c == 3));
         // Start 用的是 WDS client 1
         assert!(seen
             .iter()
-            .any(|(s, m, _, c)| *s == qmi::SVC_WDS && *m == qmi::WDS_START_NETWORK && *c == 1));
+            .any(|(s, m, _, c, _)| *s == qmi::SVC_WDS && *m == qmi::WDS_START_NETWORK && *c == 1));
         drop(seen);
 
         sess.stop();
         // 关掉本端 fd，假设备读到 EOF 才会退出（否则 join 永远等）
+        drop(sess);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn generic_mhi_session_binds_endpoints_without_mux() {
+        let (a, b) = UnixStream::pair().expect("socketpair");
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let handle = fake_device(b, seen.clone());
+
+        let stream = unsafe { File::from_raw_fd(a.into_raw_fd()) };
+        let link = QmiLink::from_file(stream);
+        let (mut sess, note) = QmiSession::start_with(link, "ctnet", true, 0, true, None, true)
+            .expect("假设备应能让 generic MHI 会话建立");
+        assert!(note.is_empty(), "{note}");
+        assert_eq!(sess.alive(), Some(true));
+        // 裸 IP 路径没有 QMAP 状态可报
+        assert!(sess.status()["qmap"].is_null());
+
+        let g = seen.lock().unwrap();
+        let seq: Vec<(u8, u16)> = g.iter().map(|(s, m, ..)| (*s, *m)).collect();
+        let wda_pos = seq
+            .iter()
+            .position(|x| *x == (qmi::SVC_WDA, qmi::WDA_SET_DATA_FORMAT))
+            .expect("必须下发裸 IP 数据格式");
+        let bind_pos = seq
+            .iter()
+            .position(|x| *x == (qmi::SVC_WDS, qmi::WDS_BIND_MUX_DATA_PORT))
+            .expect("v4 必须绑 MHI 端点");
+        let start_pos = seq
+            .iter()
+            .position(|x| *x == (qmi::SVC_WDS, qmi::WDS_START_NETWORK))
+            .expect("必须 Start");
+        assert!(wda_pos < bind_pos, "先设数据格式再绑端点");
+        assert!(bind_pos < start_pos, "绑端点必须早于 Start");
+        assert!(
+            g.iter()
+                .any(|(s, m, ..)| *s == qmi::SVC_WDS_IPV6 && *m == qmi::WDS_BIND_MUX_DATA_PORT),
+            "v6 client 也要绑 MHI 端点"
+        );
+        // 绑定帧：无 mux id（0x11），带 client type（0x13）
+        let bind = g
+            .iter()
+            .find(|(s, m, ..)| *s == qmi::SVC_WDS && *m == qmi::WDS_BIND_MUX_DATA_PORT)
+            .unwrap();
+        assert_eq!(qmi::find_tlv(&bind.4, 0x11, false), None);
+        assert_eq!(
+            qmi::find_tlv(&bind.4, 0x13, false),
+            Some(&1u32.to_le_bytes()[..])
+        );
+        // WDA 帧：精简版（0x12/0x13 = 0，无 0x15/0x16）
+        let wda = g.iter().find(|(s, ..)| *s == qmi::SVC_WDA).unwrap();
+        assert_eq!(
+            qmi::find_tlv(&wda.4, 0x12, false),
+            Some(&0u32.to_le_bytes()[..])
+        );
+        assert_eq!(qmi::find_tlv(&wda.4, 0x15, false), None);
+        assert_eq!(qmi::find_tlv(&wda.4, 0x16, false), None);
+        drop(g);
+
+        sess.stop();
         drop(sess);
         let _ = handle.join();
     }

@@ -2,7 +2,7 @@
 //!
 //! 对应 `POST /api/modem/reset` 与 `POST /api/modem/clock`。
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -62,6 +62,24 @@ impl Modem {
                 confirmed: false,
                 note: Some("指令已下发但未收到确认（重启会断开 AT 口，属预期）".to_string()),
             })
+        }
+    }
+
+    /// 等模组 AT 口恢复（复位/重启之后的轮询探针）。
+    ///
+    /// 返回 `true` = 超时内回了 OK。轮询周期约 6 秒（AT 超时 ~3s + 间隔 3s）：
+    /// 打开失败本身有 5 秒冷却闸（`at::cooldown`），轮询更密只是空转。
+    /// 上游口径（`hostdial_sync.go`）：复位后最多等 150 秒。
+    pub fn wait_at_ready(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if is_ok(&self.at_cmd_prio(Prio::Signal, "AT")) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_secs(3));
         }
     }
 

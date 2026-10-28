@@ -37,13 +37,14 @@
 //! ## 接入方式
 //!
 //! 原生拨号是**唯一**路径（`[net] host_dial_bin = "native"`，空值/`rust`/`builtin`
-//! 同义）。控制口支持三种驱动布局：
+//! 同义）。控制口支持四种驱动布局：
 //!
 //! | 驱动 | 控制口 | 说明 |
 //! | --- | --- | --- |
 //! | `qmi_wwan*` / `cdc_mbim` | `/dev/cdc-wdmN` | USB 主力路径 |
 //! | GobiNet | `/dev/GobiQMIx` | 与 cdc-wdm 同一套 QMUX 帧 |
 //! | `pcie_mhi` | `/dev/mhi_QMIx` | PCIe / MHI，帧格式相同，端点类型不同 |
+//! | 主线 MHI（`mhi_net` / `mhi_wwan_*`） | `/dev/wwan*`（`/sys/class/wwan`） | generic MHI：裸 IP、无聚合、BindMhi（无 mux id） |
 //!
 //! RNDIS 模组（FM350 / RW350）不走这里：它们没有 QMI 控制口，
 //! 数据面由模组侧 AT 拨号完成。
@@ -71,6 +72,34 @@ pub enum ControlKind {
     GobiNet,
     /// `pcie_mhi`：`/dev/mhi_QMIx`（PCIe 模组）。
     Mhi,
+    /// 主线 MHI（`mhi_net` / `mhi_wwan_qmi` / `mhi_wwan_mbim`）：
+    /// `/dev/wwan*`，控制口类型从 `/sys/class/wwan/*/type` 读出。
+    /// 固件侧按「裸 IP、无聚合」配数据格式，端点绑定不带 mux id。
+    MhiGeneric,
+}
+
+/// wwan 类控制口的协议类型（`/sys/class/wwan/*/type` 的内容）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WwanProto {
+    Qmi,
+    Mbim,
+}
+
+impl WwanProto {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WwanProto::Qmi => "qmi",
+            WwanProto::Mbim => "mbim",
+        }
+    }
+
+    /// sysfs `type` 文件里的原文（quectel-CM `cm_mhi_detect` 按整行精确比对）。
+    fn sysfs_name(self) -> &'static str {
+        match self {
+            WwanProto::Qmi => "QMI",
+            WwanProto::Mbim => "MBIM",
+        }
+    }
 }
 
 impl ControlKind {
@@ -79,6 +108,7 @@ impl ControlKind {
             ControlKind::CdcWdm => "cdc-wdm",
             ControlKind::GobiNet => "gobinet",
             ControlKind::Mhi => "mhi",
+            ControlKind::MhiGeneric => "mhi-generic",
         }
     }
 
@@ -92,7 +122,7 @@ impl ControlKind {
 
     /// PCIe/MHI 的 QMAP 端点类型是 `DATA_EP_TYPE_PCIE`。
     pub fn is_pcie(self) -> bool {
-        self == ControlKind::Mhi
+        matches!(self, ControlKind::Mhi | ControlKind::MhiGeneric)
     }
 }
 
@@ -101,28 +131,48 @@ impl ControlKind {
 pub struct ControlDev {
     pub path: String,
     pub kind: ControlKind,
+    /// wwan 类控制口的协议类型；其余布局为 `None`。
+    pub wwan: Option<WwanProto>,
 }
 
 /// 从数据网卡反查控制口。
 ///
-/// 顺序：`cdc-wdm` → GobiNet → MHI。**不猜** `/dev/cdc-wdm0`：多模组时会把
-/// 呼叫建到别人身上，所以每一路都要求 sysfs 能对上，对不上就返回 `None`。
-pub fn find_control(iface: &str) -> Option<ControlDev> {
+/// 顺序：`cdc-wdm` → GobiNet → 厂商 MHI → 主线 MHI（wwan 类）。**不猜**
+/// `/dev/cdc-wdm0`：多模组时会把呼叫建到别人身上，所以每一路都要求 sysfs
+/// 能对上，对不上就返回 `None`。wwan 类还要求端口协议与请求的链路一致
+/// （QMI 链路配 `QMI` 口、MBIM 链路配 `MBIM` 口）。
+pub fn find_control(iface: &str, link: DataLink) -> Option<ControlDev> {
     if let Some(path) = find_cdc_wdm(iface) {
         return Some(ControlDev {
             path,
             kind: ControlKind::CdcWdm,
+            wwan: None,
         });
     }
     if let Some(path) = find_gobinet(iface) {
         return Some(ControlDev {
             path,
             kind: ControlKind::GobiNet,
+            wwan: None,
         });
     }
-    find_mhi(iface).map(|path| ControlDev {
+    if let Some(path) = find_mhi(iface) {
+        return Some(ControlDev {
+            path,
+            kind: ControlKind::Mhi,
+            wwan: None,
+        });
+    }
+    // 主线 MHI（mhi_net / mhi_wwan_*）：控制口在 /sys/class/wwan，
+    // 类型由 `type` 文件给出，必须与要拨的链路一致才接。
+    let want = match link {
+        DataLink::Qmi => WwanProto::Qmi,
+        DataLink::Mbim => WwanProto::Mbim,
+    };
+    find_wwan_mhi(iface, want).map(|path| ControlDev {
         path,
-        kind: ControlKind::Mhi,
+        kind: ControlKind::MhiGeneric,
+        wwan: Some(want),
     })
 }
 
@@ -255,6 +305,89 @@ fn find_mhi(iface: &str) -> Option<String> {
     None
 }
 
+/// 从设备 realpath 里取出 MHI 控制器路径（`…/mhi0/…` → `…/mhi0`）。
+///
+/// 只认**整段** `mhi<数字>` 路径组件；`mhi_wwan` 这类厂商驱动名不是控制器，
+/// 不能当锚点（对齐 quectel-CM `cm_mhi_detect` 的判定：组件内必须是纯数字）。
+pub fn mhi_controller_from_realpath(real: &Path) -> Option<PathBuf> {
+    let s = real.to_str()?;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        // 找 `/mhi<数字>(/|$)`：组件名恰为 mhi+纯数字
+        if bytes[i] == b'/'
+            && s[i + 1..].starts_with("mhi")
+            && s[i + 4..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .count()
+                > 0
+        {
+            let digits = s[i + 4..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .count();
+            let rest = &s[i + 4 + digits..];
+            if rest.is_empty() || rest.starts_with('/') {
+                return Some(PathBuf::from(&s[..i + 4 + digits]));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 从 wwan 类端口里挑控制口（纯函数，便于用假目录表测试）。
+///
+/// 候选必须同时满足：`type` 文件内容精确等于期望协议、端口 realpath 位于该
+/// MHI 控制器子树内、`/dev/<端口名>` 存在。**候选数 ≠ 1 直接放弃** ——
+/// 上游 `cm_mhi_detect` 的 fail-closed 口径：独立端点保持歧义时绝不按
+/// 目录顺序瞎选，选错控制口会把呼叫建到别的通道上。
+pub fn pick_wwan_control(
+    controller: &Path,
+    want: WwanProto,
+    ports: &[(String, String, PathBuf)],
+    dev_exists: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let mut hits: Vec<String> = ports
+        .iter()
+        .filter(|(name, ty, real)| {
+            let prefix = format!("{}/", controller.display());
+            ty.trim() == want.sysfs_name()
+                && (real == controller || real.starts_with(&prefix))
+                && dev_exists(name)
+        })
+        .map(|(name, _, _)| name.clone())
+        .collect();
+    hits.sort();
+    if hits.len() == 1 {
+        return Some(format!("/dev/{}", hits.remove(0)));
+    }
+    None
+}
+
+/// 主线 MHI 的控制口发现：数据网卡挂在 `mhi<N>` 控制器下，且该控制器子树里
+/// 恰有一个期望协议的 wwan 端口（`/dev/wwan*`）。
+fn find_wwan_mhi(iface: &str, want: WwanProto) -> Option<String> {
+    let dev = sysfs_device(iface)?;
+    // 软件通道（`_IP_SW`）不是数据端点，出现在路径里直接放弃（上游同口径）
+    if dev.to_str()?.contains("_IP_SW") {
+        return None;
+    }
+    let controller = mhi_controller_from_realpath(&dev)?;
+    let mut ports = Vec::new();
+    for entry in std::fs::read_dir("/sys/class/wwan").ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let port = PathBuf::from(format!("/sys/class/wwan/{name}"));
+        let ty = std::fs::read_to_string(port.join("type")).unwrap_or_default();
+        let real = std::fs::canonicalize(&port).unwrap_or(port);
+        ports.push((name, ty, real));
+    }
+    pick_wwan_control(&controller, want, &ports, |n| {
+        Path::new(&format!("/dev/{n}")).exists()
+    })
+}
+
 /// QMAP 的父口名（`wwan0_1` → `wwan0`）。
 pub fn parent_iface(iface: &str) -> String {
     // 只认 QMAP 的 `<父口>_<mux>`（后缀必须是数字）；`rmnet_data0` 这类名字
@@ -358,6 +491,8 @@ pub struct NativePlan {
     pub pdn: i64,
     /// QMAP 参数（非 QMAP 模组为 `None`）。
     pub qmap: Option<qmi::QmapSettings>,
+    /// 主线 MHI（generic MHI）：WDA 走「裸 IP、无聚合」，端点绑定不带 mux id。
+    pub mhi_generic: bool,
     /// MBIM session id（QMI 忽略）。
     pub session: u32,
 }
@@ -514,21 +649,32 @@ pub fn plan_native(
         return Err(PlanError::NoDevice);
     }
     let parent = parent_iface(device);
-    let control = find_control(device).ok_or_else(|| {
+    let control = find_control(device, link).ok_or_else(|| {
         PlanError::NoWdm(format!(
-            "/sys/class/net/{parent}/device 下没有 cdc-wdm / GobiQMI / mhi_QMI 控制口"
+            "/sys/class/net/{parent}/device 下没有 cdc-wdm / GobiQMI / mhi_QMI / wwan 控制口"
         ))
     })?;
-    if link == DataLink::Mbim && control.kind != ControlKind::CdcWdm {
+    // MBIM 的控制口协议由内核驱动实现（cdc_mbim / mhi_wwan_mbim），其余布局
+    // （GobiNet / 厂商 pcie_mhi）只有 QMUX，没有 MBIM 帧。
+    if link == DataLink::Mbim
+        && !matches!(control.kind, ControlKind::CdcWdm | ControlKind::MhiGeneric)
+    {
         return Err(PlanError::Unsupported(format!(
-            "MBIM 需要 cdc-wdm 控制口，{} 上只有 {}",
+            "MBIM 需要 cdc-wdm 或 wwan(MBIM) 控制口，{} 上只有 {}",
             parent,
             control.kind.as_str()
         )));
     }
     let qmap_mode = crate::netprov::provision::qmap_mode(&parent);
     let pdn = resolve_pdn(device, pdn, qmap_mode);
-    let qmap = qmap_settings(control.kind, qmap_mode, pdn, qmap_size(&parent, device));
+    // generic MHI 固定走「裸 IP、无聚合 + BindMhi」：不读 qmap_mode（mhi_net
+    // 没有这个 sysfs，就算有也不是 QMAP 语义），也不算聚合窗口。
+    let mhi_generic = control.kind == ControlKind::MhiGeneric;
+    let qmap = if mhi_generic {
+        None
+    } else {
+        qmap_settings(control.kind, qmap_mode, pdn, qmap_size(&parent, device))
+    };
     Ok(NativePlan {
         modem_id,
         vendor,
@@ -539,6 +685,7 @@ pub fn plan_native(
         ipv6,
         pdn,
         qmap,
+        mhi_generic,
         session: caps.mbim_session,
     })
 }
@@ -578,6 +725,7 @@ impl Session {
                     plan.pdn,
                     caps.disable_autoconnect,
                     plan.qmap,
+                    plan.mhi_generic,
                 )
                 .map_err(|e| format!("{}：{e}", plan.describe()))?;
                 (Inner::Qmi(s), note)
@@ -729,12 +877,14 @@ mod tests {
             control: ControlDev {
                 path: "/dev/cdc-wdm0".into(),
                 kind: ControlKind::CdcWdm,
+                wwan: None,
             },
             iface: "wwan0".into(),
             apn: "ctnet".into(),
             ipv6: true,
             pdn: 1,
             qmap: Some(qmi::QmapSettings::usb(0x81, 16 * 1024)),
+            mhi_generic: false,
             session: 0,
         };
         let s = p.describe();
@@ -756,7 +906,7 @@ mod tests {
     #[test]
     fn find_control_returns_none_for_missing_iface() {
         // 不存在的网卡不能瞎猜 /dev/cdc-wdm0（多模组会建到别人身上）
-        assert_eq!(find_control("definitely-not-an-iface"), None);
+        assert_eq!(find_control("definitely-not-an-iface", DataLink::Qmi), None);
     }
 
     #[test]
@@ -816,6 +966,112 @@ mod tests {
         assert!(ControlKind::CdcWdm.handles_data_format());
         assert!(!ControlKind::GobiNet.handles_data_format());
         assert!(ControlKind::Mhi.is_pcie());
+        assert!(
+            ControlKind::MhiGeneric.is_pcie(),
+            "generic MHI 也是 PCIe 端点"
+        );
         assert_eq!(ControlKind::GobiNet.as_str(), "gobinet");
+        assert_eq!(ControlKind::MhiGeneric.as_str(), "mhi-generic");
+    }
+
+    // ---------- generic MHI（主线 mhi_net / mhi_wwan_*） ----------
+
+    #[test]
+    fn mhi_controller_is_extracted_from_realpath_components() {
+        use std::path::PathBuf;
+        // 数据网卡的 device 指回 MHI 控制器子树
+        let p = PathBuf::from("/sys/devices/pci0000:00/0000:01:00.0/mhi0/net/mhi_netdev0");
+        assert_eq!(
+            mhi_controller_from_realpath(&p),
+            Some(PathBuf::from("/sys/devices/pci0000:00/0000:01:00.0/mhi0"))
+        );
+        // 厂商驱动名（mhi_wwan）不是控制器，不能当锚点
+        assert_eq!(
+            mhi_controller_from_realpath(&PathBuf::from(
+                "/sys/devices/pci0000:00/0000:01:00.0/mhi_wwan/net/wwan0"
+            )),
+            None
+        );
+        // 没有 MHI 组件的普通 USB 路径
+        assert_eq!(
+            mhi_controller_from_realpath(&PathBuf::from(
+                "/sys/devices/pci0/usb1/1-1.2/1-1.2:1.0/net/wwan0"
+            )),
+            None
+        );
+        // mhi0 与 mhi01 必须按整段组件区分，不能前缀误配
+        let deep = PathBuf::from("/sys/devices/x/mhi01/net/wwan0");
+        assert_eq!(
+            mhi_controller_from_realpath(&deep),
+            Some(PathBuf::from("/sys/devices/x/mhi01"))
+        );
+    }
+
+    #[test]
+    fn wwan_control_requires_exact_type_and_unique_candidate() {
+        let controller = Path::new("/sys/devices/x/mhi0");
+        let ports = |qmi: bool, mbim: bool| {
+            let mut v: Vec<(String, String, PathBuf)> = Vec::new();
+            if qmi {
+                v.push((
+                    "wwan0qmi0".into(),
+                    "QMI\n".into(),
+                    PathBuf::from("/sys/devices/x/mhi0/wwan0qmi0"),
+                ));
+            }
+            if mbim {
+                v.push((
+                    "wwan0mbim0".into(),
+                    "MBIM\n".into(),
+                    PathBuf::from("/sys/devices/x/mhi0/wwan0mbim0"),
+                ));
+            }
+            v
+        };
+        let exists = |n: &str| n.starts_with("wwan");
+        // 唯一 QMI 口 ⇒ 命中
+        assert_eq!(
+            pick_wwan_control(controller, WwanProto::Qmi, &ports(true, false), exists),
+            Some("/dev/wwan0qmi0".to_string())
+        );
+        // 唯一 MBIM 口 ⇒ MBIM 命中；同一台设备查 QMI ⇒ 无候选
+        assert_eq!(
+            pick_wwan_control(controller, WwanProto::Mbim, &ports(false, true), exists),
+            Some("/dev/wwan0mbim0".to_string())
+        );
+        assert_eq!(
+            pick_wwan_control(controller, WwanProto::Qmi, &ports(false, true), exists),
+            None
+        );
+        // 类型拼写不精确（带尾随空格的 trim 可以，别的名字不行）
+        let mut wrong = ports(true, false);
+        wrong[0].1 = "QMI_WWAN\n".into();
+        assert_eq!(
+            pick_wwan_control(controller, WwanProto::Qmi, &wrong, exists),
+            None
+        );
+        // 端口在别的控制器子树 ⇒ 不算
+        let mut other = ports(true, false);
+        other[0].2 = PathBuf::from("/sys/devices/x/mhi1/wwan0qmi0");
+        assert_eq!(
+            pick_wwan_control(controller, WwanProto::Qmi, &other, exists),
+            None
+        );
+        // /dev 节点不存在 ⇒ 不算
+        assert_eq!(
+            pick_wwan_control(controller, WwanProto::Qmi, &ports(true, false), |_| false),
+            None
+        );
+        // 两个同名候选 ⇒ fail-closed（绝不按目录顺序瞎选）
+        let mut dup = ports(true, false);
+        dup.push((
+            "wwan1qmi0".into(),
+            "QMI\n".into(),
+            PathBuf::from("/sys/devices/x/mhi0/wwan1qmi0"),
+        ));
+        assert_eq!(
+            pick_wwan_control(controller, WwanProto::Qmi, &dup, exists),
+            None
+        );
     }
 }

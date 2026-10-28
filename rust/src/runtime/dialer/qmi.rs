@@ -402,6 +402,82 @@ pub fn wds_bind_mux(transaction: u16, service: u8, client: u8, s: &QmapSettings)
     encode(service, client, transaction, WDS_BIND_MUX_DATA_PORT, &p)
 }
 
+/// generic MHI（`mhi_net` / `mhi_wwan_*` 主线驱动）的 WDA `Set Data Format`：
+/// **裸 IP、无聚合**。
+///
+/// 依据 quectel-CM `WdaSetDataFormat()` 的 `ep_type == PCIE && rx_urb_size == 0`
+/// 分支（QMIThread.c:336-357）：TLV `0x10` no-QOS、`0x11` = 2（raw IP）、
+/// `0x12` / `0x13` = 0（上下行都不聚合）、`0x17` 端点；**不带** 0x15/0x16 ——
+/// 内核侧 `mhi_net` 只吃裸 IP 帧，固件若还按 QMAP 聚合发送，数据面对不上。
+pub fn wda_set_data_format_rawip(
+    transaction: u16,
+    client: u8,
+    ep_type: u32,
+    iface_id: u32,
+) -> Vec<u8> {
+    let mut p = Vec::new();
+    p.extend(tlv(0x10, &[0x00]));
+    p.extend(tlv(0x11, &2u32.to_le_bytes()));
+    p.extend(tlv(0x12, &0u32.to_le_bytes()));
+    p.extend(tlv(0x13, &0u32.to_le_bytes()));
+    let mut ep = Vec::with_capacity(8);
+    ep.extend(ep_type.to_le_bytes());
+    ep.extend(iface_id.to_le_bytes());
+    p.extend(tlv(0x17, &ep));
+    encode(SVC_WDA, client, transaction, WDA_SET_DATA_FORMAT, &p)
+}
+
+/// 校验 generic MHI 的 `Set Data Format` 应答（quectel-CM QMIThread.c:843-857）。
+///
+/// 设备回报的链路协议必须是裸 IP（TLV `0x11` = 2），上下行聚合（`0x12`/`0x13`）
+/// 必须为 0 —— 哪怕一条不满足都算失败（「generic MHI requires raw IP without
+/// data aggregation」）。TLV 缺失不拦：老固件可能不回显，此时按请求值生效。
+pub fn validate_data_format_rawip(payload: &[u8]) -> Result<(), String> {
+    if let Some(v) = find_tlv(payload, 0x11, true) {
+        if v.len() >= 4 {
+            let proto = u32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+            if proto != 2 {
+                return Err(format!(
+                    "设备不接受裸 IP 数据格式（link protocol = {proto}）"
+                ));
+            }
+        }
+    }
+    for t in [0x12u8, 0x13u8] {
+        if let Some(v) = find_tlv(payload, t, true) {
+            if v.len() >= 4 {
+                let agg = u32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+                if agg != 0 {
+                    return Err(format!(
+                        "设备仍开启数据聚合（TLV {t:#04x} = {agg}）：generic MHI 只支持无聚合裸 IP"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// generic MHI 的端点绑定：与 [`wds_bind_mux`] **同一个消息号**（0x00A2），
+/// 但**不带 mux id TLV**（0x11）—— 对齐上游 `WdsBindMhiEndpoint()`
+/// （QMIThread.c:324-338）：TLV `0x10` 端点（ep_type + iface_id）+
+/// `0x13` client type（1 = tethered）。
+pub fn wds_bind_mhi(
+    transaction: u16,
+    service: u8,
+    client: u8,
+    ep_type: u32,
+    iface_id: u32,
+) -> Vec<u8> {
+    let mut p = Vec::new();
+    let mut ep = Vec::with_capacity(8);
+    ep.extend(ep_type.to_le_bytes());
+    ep.extend(iface_id.to_le_bytes());
+    p.extend(tlv(0x10, &ep));
+    p.extend(tlv(0x13, &1u32.to_le_bytes()));
+    encode(service, client, transaction, WDS_BIND_MUX_DATA_PORT, &p)
+}
+
 // ---------------------------------------------------------------- 应答解析
 
 /// Start 应答里的连接句柄（TLV 0x01，跳过结果码）。
@@ -725,6 +801,101 @@ mod tests {
         let mut short = tlv(0x02, &[0, 0, 0, 0]);
         short.extend(tlv(0x16, &[1, 2]));
         assert_eq!(parse_data_format_rx_urb(&short), None);
+    }
+
+    #[test]
+    fn rawip_data_format_is_the_simplified_mhi_layout() {
+        // 对齐 quectel-CM 的 generic-MHI 分支：裸 IP + 无聚合，不带 0x15/0x16
+        let mut buf = wda_set_data_format_rawip(3, 7, EP_TYPE_PCIE, QMAP_IFACE_USB);
+        let m = take(&mut buf).expect("完整帧");
+        assert_eq!(m.service, SVC_WDA);
+        assert_eq!(m.client, 7);
+        assert_eq!(m.message, WDA_SET_DATA_FORMAT);
+        assert_eq!(
+            find_tlv(&m.payload, 0x11, false),
+            Some(&2u32.to_le_bytes()[..])
+        );
+        assert_eq!(
+            find_tlv(&m.payload, 0x12, false),
+            Some(&0u32.to_le_bytes()[..])
+        );
+        assert_eq!(
+            find_tlv(&m.payload, 0x13, false),
+            Some(&0u32.to_le_bytes()[..])
+        );
+        assert_eq!(
+            find_tlv(&m.payload, 0x15, false),
+            None,
+            "裸 IP 不带聚合参数"
+        );
+        assert_eq!(find_tlv(&m.payload, 0x16, false), None);
+        let ep = find_tlv(&m.payload, 0x17, false).expect("端点 TLV");
+        assert_eq!(
+            u32::from_le_bytes([ep[0], ep[1], ep[2], ep[3]]),
+            EP_TYPE_PCIE
+        );
+        assert_eq!(
+            u32::from_le_bytes([ep[4], ep[5], ep[6], ep[7]]),
+            QMAP_IFACE_USB
+        );
+        assert_eq!(find_tlv(&m.payload, 0x10, false), Some(&[0u8][..]));
+    }
+
+    #[test]
+    fn rawip_data_format_validation_follows_quectel_gates() {
+        let ok = |tlvs: Vec<(u8, Vec<u8>)>| {
+            let mut p = tlv(0x02, &[0, 0, 0, 0]);
+            for (t, v) in tlvs {
+                p.extend(tlv(t, &v));
+            }
+            validate_data_format_rawip(&p)
+        };
+        // 裸 IP + 无聚合（应答回显）⇒ 通过
+        assert!(ok(vec![
+            (0x11, 2u32.to_le_bytes().to_vec()),
+            (0x12, 0u32.to_le_bytes().to_vec()),
+            (0x13, 0u32.to_le_bytes().to_vec()),
+        ])
+        .is_ok());
+        // TLV 全缺（老固件不回显）⇒ 按请求值生效，放行
+        assert!(ok(vec![]).is_ok());
+        // 链路协议不是裸 IP ⇒ 拒绝（内核 mhi_net 只吃裸 IP）
+        assert!(ok(vec![(0x11, 1u32.to_le_bytes().to_vec())]).is_err());
+        // 仍在聚合 ⇒ 拒绝
+        assert!(ok(vec![
+            (0x11, 2u32.to_le_bytes().to_vec()),
+            (0x12, 5u32.to_le_bytes().to_vec())
+        ])
+        .is_err());
+        assert!(ok(vec![
+            (0x11, 2u32.to_le_bytes().to_vec()),
+            (0x13, 9u32.to_le_bytes().to_vec())
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn bind_mhi_omits_the_mux_id_tlv() {
+        // 与 BindMux 同一个消息号，但没有 0x11 —— 这是它存在的全部意义
+        let mut buf = wds_bind_mhi(9, SVC_WDS_IPV6, 4, EP_TYPE_PCIE, QMAP_IFACE_USB);
+        let m = take(&mut buf).expect("完整帧");
+        assert_eq!(m.service, SVC_WDS_IPV6);
+        assert_eq!(m.client, 4);
+        assert_eq!(m.message, WDS_BIND_MUX_DATA_PORT);
+        assert_eq!(
+            find_tlv(&m.payload, 0x11, false),
+            None,
+            "generic MHI 不带 mux id"
+        );
+        assert_eq!(
+            find_tlv(&m.payload, 0x13, false),
+            Some(&1u32.to_le_bytes()[..])
+        );
+        let ep = find_tlv(&m.payload, 0x10, false).expect("端点 TLV");
+        assert_eq!(
+            u32::from_le_bytes([ep[0], ep[1], ep[2], ep[3]]),
+            EP_TYPE_PCIE
+        );
     }
 
     #[test]

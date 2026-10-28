@@ -179,6 +179,37 @@ const HEAL_GAP: Duration = Duration::from_secs(120);
 #[cfg(unix)]
 const HEAL_MAX: u32 = 10;
 
+/// 自愈复位：连续失败到这个次数才重启模组（上游 `reset_before_dial` 阈值 5 同值）。
+#[cfg(unix)]
+const RESET_AFTER_FAILS: u32 = 5;
+/// 复位后等 AT 口恢复的上限（上游 150s 同值，见 [`Modem::wait_at_ready`]）。
+#[cfg(unix)]
+const RESET_WAIT_AT: Duration = Duration::from_secs(150);
+
+/// 自愈复位的台账（一台模组一份）。
+///
+/// 与 [`RetryTable`] 分开记：退避表是两种后端**共用**的节奏，而复位只服务
+/// 原生后端 —— AT 路径的持续失败（没插卡 / 无服务 / 欠费）不该触发模组重启。
+/// 记法与退避表一致：错误变化清零重数（情况变了不该按旧账复位）。
+#[cfg(unix)]
+#[derive(Debug, Default, Clone)]
+struct Rescue {
+    /// 上次复位的时刻（冷却节流锚点）；`None` = 还没复位过。
+    last: Option<Instant>,
+    /// 连续失败次数（原生会话建立成功即清零）。
+    fails: u32,
+    /// 上次失败原因（用于「错误变了就重数」）。
+    reason: String,
+}
+
+/// 该不该自愈复位（纯函数）。
+///
+/// 连续失败到 [`RESET_AFTER_FAILS`] 且距上次复位已过 `cooldown` 才算到期。
+#[cfg(unix)]
+fn rescue_due(fails: u32, last: Option<Instant>, cooldown: Duration, now: Instant) -> bool {
+    fails >= RESET_AFTER_FAILS && last.map_or(true, |t| now.duration_since(t) >= cooldown)
+}
+
 /// 统一退避表：模组 id → 退避状态。
 #[derive(Default)]
 struct RetryTable(Mutex<HashMap<u32, Retry>>);
@@ -369,6 +400,12 @@ pub struct DialerSupervisor {
     /// 掉线自愈记账（「会话在跑但一直没地址」的重开计数，按模组隔离）。
     #[cfg(unix)]
     heal: Mutex<HashMap<u32, Heal>>,
+    /// 自愈复位台账（原生路径连续失败的记账，按模组隔离）。
+    #[cfg(unix)]
+    rescue: Mutex<HashMap<u32, Rescue>>,
+    /// 正在自愈复位的模组（复位线程要等 AT 口恢复，期间别再派拨号）。
+    #[cfg(unix)]
+    rescuing: Mutex<std::collections::HashSet<u32>>,
     /// 本协调器自己派出的 AT 拨号线程（模组 id）。
     ///
     /// 与 `Modem::dial_busy` 的分工：`dial_busy` 防的是**任何**两路拨号并发
@@ -405,17 +442,25 @@ impl DialerSupervisor {
         #[cfg(unix)]
         self.stop_session(modem_id);
         self.retry.clear(modem_id);
+        // 用户主动断开不是「连续失败」：复位台账一并清掉，别让下次重开开关
+        // 时因为旧账直接触发一次谁都没准备好的模组重启。
+        #[cfg(unix)]
+        self.rescue.lock().unwrap().remove(&modem_id);
     }
 
     /// 用户重新打开某个开关（拨号总开关 / 自动拨号 / 关飞行模式）时清退避：
     /// 不该让人等完一个已经毫无意义的 5 分钟窗口。
     pub fn reset_backoff(&self, modem_id: u32) {
         self.retry.clear(modem_id);
+        #[cfg(unix)]
+        self.rescue.lock().unwrap().remove(&modem_id);
     }
 
     /// 同上，全部模组（开关是全局的）。
     pub fn reset_backoff_all(&self) {
         self.retry.clear_all();
+        #[cfg(unix)]
+        self.rescue.lock().unwrap().clear();
     }
 
     /// 挂上 `AppState`（进程启动时调一次；之后 [`Self::kick`] 才能用）。
@@ -474,6 +519,7 @@ impl DialerSupervisor {
             log::info!("原生拨号：模组 {id} 已不在，停掉会话");
             self.stop_session(id);
             self.retry.clear(id);
+            self.rescue.lock().unwrap().remove(&id);
             self.in_flight.lock().unwrap().remove(&id);
             crate::netprov::provision::forget_device(id);
         }
@@ -561,7 +607,7 @@ impl DialerSupervisor {
     }
 
     /// 原生后端（QMI/MBIM）的一轮对账。
-    fn reconcile_native_one(&self, state: &AppState, modem: &Modem) {
+    fn reconcile_native_one(&self, state: &AppState, modem: &std::sync::Arc<Modem>) {
         let id = modem.id;
         let st = modem.dial_status();
         if let Some(why) = self.stop_reason(state, &st) {
@@ -575,6 +621,26 @@ impl DialerSupervisor {
                 }
             }
             return;
+        }
+
+        // 自愈复位（[net] reset_before_dial，默认关）：连续失败到阈值后把模组
+        // 重启一次。复位在工作线程里做（要等 AT 口恢复），期间本轮直接让路 ——
+        // 复位中的模组既不能拨（AT 口没回来）也不该被退避日志刷屏。
+        if state.cfg.net.reset_before_dial {
+            if self.rescuing.lock().unwrap().contains(&id) {
+                return;
+            }
+            let (fails, last) = {
+                let g = self.rescue.lock().unwrap();
+                g.get(&id).map(|r| (r.fails, r.last)).unwrap_or((0, None))
+            };
+            let cooldown = Duration::from_secs(
+                state.cfg.net.reset_before_dial_cooldown.clamp(60, 3600) as u64,
+            );
+            if rescue_due(fails, last, cooldown, Instant::now()) {
+                self.spawn_rescue(modem);
+                return;
+            }
         }
 
         // APN 四级回退（与一键拨号 / 自动拨号同一套优选语义，见
@@ -623,6 +689,7 @@ impl DialerSupervisor {
                 // 临时占用、网卡名还没出现），贸然拆掉会把唯一能用的连接弄丢。
                 let msg = e.to_string();
                 self.retry.fail(id, msg.clone());
+                self.note_native_fail(id, &msg);
                 log::warn!("原生拨号：模组 {id} 算不出计划: {e}");
                 return;
             }
@@ -740,6 +807,7 @@ impl DialerSupervisor {
                     return;
                 }
                 self.retry.ok(id);
+                self.note_native_ok(id);
                 log::info!("原生拨号：模组 {id} 拉起 {}", plan.describe());
                 // 权威状态由后端回调写入（这是早先缺失的一环：页面永远停在拨号中）
                 if !modem.note_native_up(epoch, &format!("native-{kind}"), &plan.describe()) {
@@ -753,9 +821,74 @@ impl DialerSupervisor {
                     "原生拨号：模组 {id} 建立会话失败（{}）: {e}",
                     plan.describe()
                 );
-                self.retry.fail(id, e);
+                self.retry.fail(id, e.clone());
+                self.note_native_fail(id, &e);
             }
         }
+    }
+
+    /// 原生路径记一次失败（复位台账；错误变化清零重数，与退避表同口径）。
+    fn note_native_fail(&self, modem_id: u32, reason: &str) {
+        let mut g = self.rescue.lock().unwrap();
+        let e = g.entry(modem_id).or_default();
+        if e.reason != reason {
+            e.fails = 0;
+            e.reason = reason.to_string();
+        }
+        e.fails = e.fails.saturating_add(1);
+    }
+
+    /// 原生会话建立成功：复位台账清零（复位的「连续失败」从此重新数）。
+    fn note_native_ok(&self, modem_id: u32) {
+        self.rescue.lock().unwrap().remove(&modem_id);
+    }
+
+    /// 自愈复位（工作线程）：`AT+CFUN=1,1` → 等 AT 口恢复（最多
+    /// [`RESET_WAIT_AT`]）→ 清退避，下一轮 reconcile 立即重拨。
+    ///
+    /// 复位期间 [`Self::rescuing`] 挡住该模组的对账；台账的 `last` 在**派发前**
+    /// 记下 —— 节流从复位发起时刻起算，而不是恢复时刻。
+    fn spawn_rescue(&self, modem: &std::sync::Arc<Modem>) {
+        let id = modem.id;
+        let fails = {
+            let mut g = self.rescue.lock().unwrap();
+            let e = g.entry(id).or_default();
+            e.last = Some(Instant::now());
+            e.fails
+        };
+        log::warn!(
+            "原生拨号：模组 {id} 连续失败 {fails} 次，按 [net] reset_before_dial 自愈复位（AT+CFUN=1,1）"
+        );
+        if !self.rescuing.lock().unwrap().insert(id) {
+            return;
+        }
+        struct Rescuing(u32);
+        impl Drop for Rescuing {
+            fn drop(&mut self) {
+                supervisor().rescuing.lock().unwrap().remove(&self.0);
+            }
+        }
+        let m = modem.clone();
+        std::thread::spawn(move || {
+            let _keep = Rescuing(id); // 线程结束（含 panic）自动摘牌
+            let sup = supervisor();
+            // 会话多半已经在失败时收掉了；复位前再收一次，别让旧会话占着控制口
+            sup.stop_session(id);
+            let epoch = m.dial_epoch();
+            m.note_native_down(epoch, "连续拨号失败，复位模组后重试");
+            if let Err(e) = m.reboot() {
+                log::warn!("原生拨号：模组 {id} 复位指令下发失败（继续等 AT 口）: {e}");
+            }
+            if m.wait_at_ready(RESET_WAIT_AT) {
+                log::info!("原生拨号：模组 {id} 复位完成、AT 口已恢复，清退避后重拨");
+            } else {
+                log::warn!(
+                    "原生拨号：模组 {id} 复位后 {} 秒内 AT 口未恢复，交回退避节奏",
+                    RESET_WAIT_AT.as_secs()
+                );
+            }
+            sup.retry.clear(id);
+        });
     }
 
     /// AT 路径的一轮对账（ECM / RNDIS / NCM / unknown）。
@@ -1024,5 +1157,39 @@ mod tests {
         // 测试机上不存在的网卡：没有地址 ⇒ 不在线（真实机器上由 sysfs / `ip` 决定）
         assert!(!native_link_ok("definitely-not-an-iface"));
         assert!(!native_link_ok("  "));
+    }
+
+    // ---------- 自愈复位（[net] reset_before_dial） ----------
+
+    #[cfg(unix)]
+    #[test]
+    fn rescue_is_due_only_after_threshold_and_cooldown() {
+        let now = Instant::now();
+        let cd = Duration::from_secs(300);
+        // 失败次数不够 ⇒ 永不复位（哪怕从没复位过）
+        assert!(!rescue_due(RESET_AFTER_FAILS - 1, None, cd, now));
+        // 够了且没复位过 ⇒ 到期
+        assert!(rescue_due(RESET_AFTER_FAILS, None, cd, now));
+        // 刚复位过（冷却期内）⇒ 不到期
+        assert!(!rescue_due(RESET_AFTER_FAILS + 3, Some(now), cd, now));
+        // 冷却已过 ⇒ 再到期
+        let old = now - Duration::from_secs(301);
+        assert!(rescue_due(RESET_AFTER_FAILS, Some(old), cd, now));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rescue_ledger_counts_like_the_backoff_table() {
+        let sup = DialerSupervisor::new();
+        // 错误变化 ⇒ 重数（与 RetryTable::fail 同口径）
+        sup.note_native_fail(1, "A");
+        sup.note_native_fail(1, "A");
+        sup.note_native_fail(1, "B");
+        let g = sup.rescue.lock().unwrap();
+        assert_eq!(g.get(&1).unwrap().fails, 1, "错误变了从 1 重新数");
+        drop(g);
+        // 成功清账
+        sup.note_native_ok(1);
+        assert!(!sup.rescue.lock().unwrap().contains_key(&1));
     }
 }
