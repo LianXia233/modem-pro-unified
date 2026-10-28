@@ -169,7 +169,7 @@ return view.extend({
 					E('div', { 'class': 'mp-metric-value', 'style': 'display:flex;align-items:center;' }, [ srvPill, bootPill ])
 				]),
 				E('div', { 'class': 'mp-metric-box' }, [
-					E('div', { 'class': 'mp-metric-label' }, '内置 WebUI 监听端口'),
+					E('div', { 'class': 'mp-metric-label' }, 'modemd API 监听端口'),
 					E('div', { 'class': 'mp-metric-value' }, [ portEl ])
 				])
 			]),

@@ -1,4 +1,4 @@
-//! `[ui]` 段：Web 界面与鉴权。
+//! `[ui]` 段：接口登录保护（内置 WebUI 已退役，鉴权只服务 `/api/*`）。
 
 use serde::Deserialize;
 

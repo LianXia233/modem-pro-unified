@@ -30,7 +30,7 @@ pub fn handle(req: Request, state: &AppState, query: &HashMap<String, String>) -
     // 原来的 `traffic` 来自模组 AT 计数器：FM350-GL 的 `AT+GTSTATIS` 回 ERROR，
     // 于是 `supported=false`、速率与累计恒为 0，页面四个指标全空。
     // 现在改成「网卡实际字节数」，与 `/api/traffic` 完全同源 ——
-    // 两个接口、两个前端（LuCI / 内置 WebUI）看到的是同一份数字。
+    // 两个接口看到的是同一份数字。
     if let Ok(t) = serde_json::to_value(state.ifstat.view()) {
         value["traffic"] = t;
     }

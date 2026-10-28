@@ -2,7 +2,7 @@
 //!
 //! [`ROUTES`] 是接口全表（方法 + 路径），与后端注册表一一对应；
 //! 每个登记项都必须有 handler（没有「待迁移」兜底了），
-//! 未登记的 `/api/*` 返回 404，其余交静态页。
+//! 未登记的 `/api/*` 与其余路径一律 404（内置 WebUI 已退役，不再托管静态页）。
 
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use tiny_http::{Method, Request};
 
 use crate::error::Result;
 
-use super::{auth, handlers, request, response, static_ui, AppState};
+use super::{auth, handlers, request, response, AppState};
 
 /// 接口全表：`(METHOD, PATH)`。
 ///
@@ -260,7 +260,7 @@ pub fn handle(req: Request, state: Arc<AppState>) -> Result<()> {
         ("POST", "/api/wechat/test") => handlers::wechat::test(req, &state),
         ("POST", "/api/wechat/logout") => handlers::wechat::logout(req, &state),
         _ if path.starts_with("/api/") => response::fail_status(req, 404, -1, "接口不存在"),
-        _ => static_ui::serve(req, &path),
+        _ => response::fail_status(req, 404, -1, "Not Found"),
     }
 }
 

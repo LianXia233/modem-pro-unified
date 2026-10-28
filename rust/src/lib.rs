@@ -8,7 +8,7 @@
 //!   · `netprov`  —— 模组上线自动组网（纯策略 + UCI 薄 IO + 编排）
 //!   · `ubus`     —— 与 rpcd 的会话交互（transport/rpc/session 分离）
 //!   · `modem`    —— AT 收发 / 发现 / 模型 / 厂商 / 清单
-//!   · `http`     —— 服务器 / 路由 / 请求 / 响应 / 鉴权 / 静态页 / handlers
+//!   · `http`     —— 服务器 / 路由 / 请求 / 响应 / 鉴权 / handlers
 //!   · `runtime`  —— PID / 信号 / 拨号器回收 / 后台巡检
 //!   · `wechat`   —— 企业微信推送（纯逻辑 + curl 传输 + 运行期状态）
 

@@ -1,5 +1,5 @@
 [server]
-# Web 界面（设备中心）监听地址。**改完必须重启服务**：/etc/init.d/modemd restart
+# modemd API 监听地址（LuCI 页面经它代理请求）。**改完必须重启服务**：/etc/init.d/modemd restart
 # 只想本机访问就写 127.0.0.1:9527；端口与 LuCI 的 80 不冲突，别用 80/443。
 listen = "0.0.0.0:9527"
 # 后台热插拔巡检间隔（秒）。**插拔自动检测就靠它**。
@@ -272,17 +272,18 @@ activate_ims = true
 # 「接口登录保护」约束。旧配置里的 sms_password / sms_password_required
 # 两行会被忽略（不再读取），可以删掉。
 
-# 是否要求「先登录路由器管理员账号」才给调接口（设备中心 / 小窗 / 脚本都算）。
+# 是否要求「先登录路由器管理员账号」才给调接口（非本机的直接调用都算；
+# LuCI 经 127.0.0.1 代理请求，天然免登录）。
 #
 # 做法（与路由器**同一套账号密码、同一个会话表**，见 module/luciauth/luciauth.go）：
-#   未登录时页面顶部弹登录框（默认用户名 root），密码交给 rpcd 验（`session login`，
-#   LuCI 登录走的就是同一条路），拿到的会话 ID 存在 modemd_sess cookie 里；
+#   密码交给 rpcd 验（`session login`，LuCI 登录走的就是同一条路），
+#   拿到的会话 ID 存在 modemd_sess cookie 里；
 #   之后每个请求拿它去问 rpcd（`session get`）。
 #   ⇒ 在 LuCI 里退出、或会话超时，这边立刻一起失效（最多少看一眼 15 秒的校验缓存）。
 #
 # ⚠️ 为什么不是直接拿 LuCI 的 cookie：真机（OpenWrt 25.12 / LuCI ucode）发的
 #    `sysauth_http` 带 **path=/cgi-bin/luci/**（+ SameSite=strict + HttpOnly）
-#    ⇒ 浏览器**不会**把它带到本页面端口，所以必须由我们自己发会话。
+#    ⇒ 浏览器**不会**把它带到 9527 端口，所以必须由我们自己发会话。
 #
 # 默认 **true（开）**，而且配置文件里**没有这一行**也算开（老版本升级上来的机器就是这样：
 # config.toml 是 conffile，升级包不会覆盖它，所以新加的键永远不出现 —— 用户 2026-10-06
@@ -290,7 +291,7 @@ activate_ims = true
 #   · LuCI「服务控制」页的「接口登录保护」开关（**推荐**：会写回这一行并重启服务）；
 #   · 手动把这一行改成 false（改完重启服务）。
 # 开启后：
-#   · 静态页面 / /api/version / /api/session / /api/login / /api/logout 仍放行
+#   · /api/version / /api/session / /api/login / /api/logout 仍放行
 #     （否则连登录都做不了；登录接口靠限流挡暴力猜密码：同 IP 60 秒 5 次）；
 #   · 127.0.0.1（设备本机）免登录 —— 本机脚本 / 排障 / 打包自检不受影响；
 #   · 这台机器上找不到 ubus（非 OpenWrt，比如 Windows 上跑 modemd）时整体不启用；

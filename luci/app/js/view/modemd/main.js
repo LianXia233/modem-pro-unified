@@ -1,7 +1,6 @@
 'use strict';
 'require view';
 'require ui';
-'require fs';
 'require modemd.fmt as fmt';
 
 /* 5G 终端主页面：二级菜单直通单入口，页内横向左右滑动 TAB 栏
@@ -43,13 +42,10 @@ return view.extend({
 
 	load: function () {
 		fmt.ensureCss();
-		return fs.read('/etc/modemd/config.toml').catch(function () { return ''; });
 	},
 
-	render: function (cfg) {
+	render: function () {
 		var self = this;
-		var m = /\[server\][\s\S]*?listen\s*=\s*["']?[^"'\n]*:(\d+)/.exec(cfg || '');
-		var webuiPort = m ? m[1] : '9527';
 
 		fmt.inTabHost = true;
 
@@ -67,7 +63,7 @@ return view.extend({
 			])
 		]);
 
-		var tabBarWrap = fmt.renderTabBar(initialTab, webuiPort, function (tabId) {
+		var tabBarWrap = fmt.renderTabBar(initialTab, function (tabId) {
 			self.switchTab(tabId, bodyPane);
 		});
 

@@ -1,6 +1,6 @@
 //! USB 网卡模式（`GET /api/usbnet`、`POST /api/usbnet/set`）。
 //!
-//! ## 契约（与 WebUI 一致）
+//! ## 契约（与 LuCI 前端一致）
 //!
 //! ```json
 //! {"value":"3","name":"RNDIS","supported":true,"need_reboot":true,

@@ -11,7 +11,6 @@
 //!   · `request`    —— query / 请求体解析
 //!   · `response`   —— 统一 JSON 响应 `{"code":..,"data":..,"msg":..}`
 //!   · `auth`       —— 「跟随 LuCI 登录」闸门
-//!   · `static_ui`  —— 编译期嵌入的调试台页面
 //!   · `handlers/*` —— 每个接口一个文件
 //!
 //! 接口契约见 docs/API.md，迁移清单见 docs/API.md。
@@ -30,7 +29,6 @@ mod response;
 mod router;
 pub(crate) mod schedule;
 mod server;
-mod static_ui;
 pub(crate) mod tasks;
 mod ws;
 

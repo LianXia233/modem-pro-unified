@@ -7,7 +7,7 @@ use super::loader;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
-    /// Web 界面监听地址，如 "0.0.0.0:9527"。
+    /// API 监听地址（LuCI 经它代理请求），如 "0.0.0.0:9527"。
     pub listen: String,
     /// 后台热插拔巡检间隔（秒）。<=0 关闭（只在启动时发现一次模组）。
     pub scan_interval: i64,

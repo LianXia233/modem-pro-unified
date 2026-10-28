@@ -316,7 +316,7 @@ return baseclass.extend({
 	},
 
 	/* 顶部可左右滑动的 TAB 导航栏（二级菜单关联） */
-	renderTabBar: function (activeTabId, port, onTabClick) {
+	renderTabBar: function (activeTabId, onTabClick) {
 		var tabs = [
 			{ id: 'overview', name: '设备中心', icon: '<path d="M12 2v20M8 22l4-15 4 15M6 16h12M9 10h6"/><circle cx="12" cy="4" r="2" fill="currentColor"/><path d="M5 4a10 10 0 0 1 14 0"/>' },
 			{ id: 'dial',     name: '拨号上网', icon: '<circle cx="6" cy="18" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="18" cy="18" r="3"/><path d="M8.5 16.5l7-7M9 18h6M18 9v6"/>' },
@@ -379,16 +379,6 @@ return baseclass.extend({
 		wrap.appendChild(arrowLeft);
 		wrap.appendChild(bar);
 		wrap.appendChild(arrowRight);
-
-		var p = port || '9527';
-		var btnWeb = document.createElement('a');
-		btnWeb.className = 'mp-btn mp-btn-default';
-		btnWeb.href = 'http://' + (typeof window !== 'undefined' ? window.location.hostname : '192.168.10.1') + ':' + p;
-		btnWeb.target = '_blank';
-		btnWeb.title = '在新窗口打开原生内置 WebUI（端口 :' + p + '）';
-		btnWeb.style.cssText = 'flex-shrink:0;padding:5px 12px;font-size:12px;border-radius:18px;margin-left:4px;';
-		btnWeb.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:4px;"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3"/></svg><span>WebUI ↗</span>';
-		wrap.appendChild(btnWeb);
 
 		if (activeTabEl) {
 			window.requestAnimationFrame(function () {

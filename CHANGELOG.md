@@ -10,6 +10,37 @@
 
 ## [未发布]
 
+### 变更：退役内置 WebUI，前端只保留 LuCI
+
+**背景**：1.0.0-3 定的口径就是「LuCI 验证成熟后 WebUI 可退役」（见历史条目
+「WebUI/LuCI 共存口径定稿」）。LuCI 现已 8 大页面 + 10 项工具全功能覆盖并长期稳定，
+按计划执行退役；`modemd` 从此只提供 `/api/*` 接口层，不再托管任何静态页面。
+
+**删除**：
+
+1. `rust/web/`（`index.html`、`mini.html`、`layouts/*.css`）—— 编译期嵌入的
+   调试台页面资产整体移除；
+2. `rust/src/http/static_ui.rs` —— 静态页托管模块（`include_str!` 嵌入 + 分发）随资产一起删除。
+
+**改动**：
+
+- `http/router.rs`：非 `/api/` 路径的兜底从「交静态页」改为直接 404（`/api/*` 未登记
+  路径仍 404 不变）；`http/mod.rs`、`lib.rs` 的模块清单同步更新；
+- `http/auth.rs`：放行名单不再包含「静态页」（非 `/api/` 路径本就无内容可放行），
+  `require_luci_login` 语义不变 —— 仍保护 `/api/*`，LuCI 走 127.0.0.1 代理天然免登录；
+- LuCI：删掉 TAB 栏右侧的「`WebUI ↗`」跳转按钮（`fmt.js` `renderTabBar`），随之删除
+  概览页 / 主入口从 config.toml 解析端口、拼跳转 URL 的死代码（`overview.js`、`main.js`
+  不再读 config.toml）；
+- LuCI「服务控制」页指标「内置 WebUI 监听端口」改称「modemd API 监听端口」
+  （端口本身保留：LuCI 代理仍按它转发）；
+- `config.toml`、`README.md`、`docs/API.md`：同步口径 —— `[server] listen` 是 API
+  监听地址，兼容性红线的同步对象只剩 `luci/`；
+- 各文件注释里指向 `rust/web/index.html` 的引用改为后端统一口径的表述。
+
+**不受影响**：`/api/*` 契约一字未动；WebSocket 推送（`/ws`、`/display/ws`）、
+企业微信短信转发、会话鉴权、定时任务全部保留；历史配置里 `[ui]`、`[server]` 的
+键完全兼容。
+
 ### 变更：CI 每次编译都发布 Release（手动触发不再只出 artifact）
 
 **问题**：`build.yml` 的 release job 条件是 `startsWith(github.ref, 'refs/tags/v')`，

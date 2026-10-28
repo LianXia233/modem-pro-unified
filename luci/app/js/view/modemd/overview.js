@@ -1,7 +1,6 @@
 'use strict';
 'require view';
 'require ui';
-'require fs';
 'require modemd.api as api';
 'require modemd.store as store';
 'require modemd.task as task';
@@ -67,7 +66,6 @@ return view.extend({
 			api.get('/api/version').catch(function () { return {}; }),
 			store.start(api),
 			api.get('/api/changes', { limit: 5 }).catch(function () { return {}; }),
-			fs.read('/etc/modemd/config.toml').catch(function () { return ''; }),
 			/* 快照（/api/snapshot）的 blocks 里**没有** cells 块（后端不给），
 			   概览要显示服务小区数量就得自己拉一份 —— 早先读 B.cells 永远 0。 */
 			api.get('/api/cells', { modem_id: store.id() != null ? store.id() : 0 }).catch(function () { return {}; })
@@ -78,15 +76,10 @@ return view.extend({
 		var self = this;
 		var ver = data[0] || {};
 		var changes = data[2] || {};
-		var cfg = data[3] || '';
-		this._cells = data[4] || {};
-
-		var m = /\[server\][\s\S]*?listen\s*=\s*["']?[^"'\n]*:(\d+)/.exec(cfg || '');
-		var webuiPort = m ? m[1] : '9527';
-		var webuiUrl = 'http://' + window.location.hostname + ':' + webuiPort + '/';
+		this._cells = data[3] || {};
 
 		var root = E('div', { 'class': 'mp-wrap' }, [
-			fmt.renderTabBar('overview', webuiPort),
+			fmt.renderTabBar('overview'),
 
 			/* 1. 顶部 Header 条 */
 			E('div', { 'class': 'mp-header' }, [

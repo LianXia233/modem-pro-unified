@@ -1,11 +1,11 @@
 //! 「跟随 LuCI 登录」闸门。
 //!
-//! 打开后（默认开），除静态页与少数放行接口外，`/api/*` 都要求请求里带着有效的
+//! 打开后（默认开），除少数放行接口外，`/api/*` 都要求请求里带着有效的
 //! LuCI 会话 cookie（`modemd_sess`），会话有效性交给 rpcd（ubus `session.get`）判定。
 //! ubus 调不起来（非 OpenWrt / rpcd 未起）时**放行并记日志**，避免把整机用户挡在门外。
 //!
-//! 放行名单：静态页、`/api/version`、`/api/session`、`/api/login`、`/api/logout`；
-//! 本机（127.0.0.1）请求免登录。
+//! 放行名单：`/api/version`、`/api/session`、`/api/login`、`/api/logout`；
+//! 本机（127.0.0.1）请求免登录。非 `/api/` 路径不再有静态页，由路由层直接 404。
 
 use tiny_http::Request;
 
@@ -51,7 +51,7 @@ pub fn is_authorized(state: &AppState, req: &Request) -> bool {
 /// 放行名单。
 pub fn is_public_path(path: &str) -> bool {
     if !path.starts_with("/api/") {
-        return true; // 静态资源
+        return true; // 无需保护：非 /api/ 路径已无静态页，路由层直接 404
     }
     matches!(
         path,
