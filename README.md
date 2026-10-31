@@ -1,98 +1,214 @@
-# modem-pro
+<div align="center">
 
-OpenWrt 上统一管理 **5G/LTE 模组**的单一软件包：覆盖 **13 家厂商共 92 个型号**
-（移远 Quectel、广和通 Fibocom、美格 Meig、芯讯通 SIMCom、华为 Huawei、百旺 Baiwang、
-合宙 OpenLuat、富士康 Foxconn、高新兴 Gosuncn、有方 Neoway、Sierra、Telit、Thales），
-一个 Rust 守护进程 `modemd`（**内置 QMI / MBIM 拨号**，含 QMAP 绑 mux）
-+ netifd 协议 + LuCI 前端。
+# 🛰️ Modem Pro · 统一模组管理系统
 
-> 本仓库由原先分离的两个工程合并而成：LuCI 前端插件与模组后端。现在是一个仓库、一个包、一份版本号。
+**适用于 OpenWrt 的新一代 5G/LTE 蜂窝模组一体化管控中心 · 原生 Rust 守护进程 · 覆盖 13 家厂商 92 款型号**
 
-## 组成
+[![Version](https://img.shields.io/badge/Version-v1.0.8--1-blue?style=flat-square&logo=git&logoColor=white)](VERSION)
+[![Daemon](https://img.shields.io/badge/Daemon-Rust%20modemd-DEA584?style=flat-square&logo=rust&logoColor=white)](rust/)
+[![Dialer](https://img.shields.io/badge/Dialer-Built--in%20QMI%20%7C%20MBIM-orange?style=flat-square)](#-自研原生-qmimbim-拨号器)
+[![Vendors](https://img.shields.io/badge/Vendors-13%20Brands%20%7C%2092%20Models-success?style=flat-square)](#-支持厂商与型号生态)
+[![UI Style](https://img.shields.io/badge/UI-White%20Glassmorphism-0ea5e9?style=flat-square)](#-特色视觉与交互亮点)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
 
-| 目录 | 内容 |
-| --- | --- |
-| `rust/` | `modemd` 守护进程（Rust，按功能域细分模块）；`runtime/dialer/` 是 QMI/MBIM 拨号实现 |
-| `files/` | netifd 协议脚本、默认 `config.toml`、mp-client wrapper |
-| `luci/` | LuCI 前端：协议 JS、控制器、i18n、视图、菜单、ACL |
-| `packaging/` | init 脚本与安装/卸载脚本 |
+<p align="center">
+  <b>单包全栈交付</b>：内置自研纯 Rust 原生 QMI / MBIM 拨号引擎 · netifd 双栈协议承载 · 白色毛玻璃现代 LuCI 界面<br>
+  涵盖全生命周期自动重拨 · 动态 SVG 射频仪表 · 8 大核心业务页面 · 10 大专业调试工具 · 企业微信状态告警
+</p>
 
-## 快速开始（设备端）
+</div>
+
+---
+
+> [!NOTE]
+> **📦 架构整合演进**
+>
+> 本仓库由原先独立的两个工程深度整合重构而来：**LuCI 现代前端插件** 与 **Rust 模组通信后端**。现已合流为**单代码仓库、单安装软件包、统一版本号发布**，彻底告别旧版跨项目依赖不一致与接口脱节的痛点。
+
+---
+
+## 🌟 核心特性与架构优势
+
+| 维度 | 架构实现与核心优势 |
+|:---|:---|
+| 🦀 **原生 Rust 守护进程 (`modemd`)** | 基于纯 Rust 开发的独立常驻守护进程，按业务领域高内聚解耦；常驻内存微量，无外部动态库依赖，具备极高的稳定性与并发调度能力。 |
+| ⚡ **自研原生 QMI / MBIM 拨号引擎** | 内置独立自研的纯 Rust 拨号实现，**彻底摆脱厂商历史遗留 C 源码二进制**（如 `quectel-CM`、`fibocom-dial` 等）；原生支持 QMAP 绑定复用与 IPv4/IPv6 单接口双栈承载。 |
+| 🌐 **13 家厂商 92 款型号全覆盖** | 覆盖移远、广和通、美格、芯讯通、华为、百旺、合宙、富士康、高新兴、有方、Sierra、Telit、Thales 等主流厂商全系 5G/4G 模组。 |
+| 💎 **白色毛玻璃视觉规范 (QM Glass)** | 适度透明模糊玻璃质感、轻薄高光微边框、低饱和度状态强调色与规整弹性自适应栅格，带来耳目一新的现代交互体验。 |
+| 📱 **二级单入口 + 优雅横滚 TAB** | 侧边栏收敛为单一入口（`移动网络 → 5G 终端`），杜绝菜单树冗余；页内 TAB 栏支持鼠标滚轮横滚、平滑微调与触控滑动手势。 |
+| 📡 **动态矢量 SVG 信号量程系统** | 5 档天线信号条真实对接 3GPP 国际评级规范；RSRP / SINR / RSRQ / RSSI 4 宫格物理量程 SVG 进度刻度槽实时驱动。 |
+| 🔄 **全生命周期自愈与重拨协调器** | AT 指令与 QMI/MBIM 会话共用意图、状态机、退避与连接代次的单一协调器；插拔、异常闪退、飞行模式与配额断网均可自动平滑回收与自愈重拨。 |
+| 🧪 **794 项自动化用例保驾护航** | 拥有 794 项严格的 Rust 单元测试与回归测试（`cargo test --locked`），将厂商方言解析、端口规则与状态机逻辑逐条钉死。 |
+
+---
+
+## 🎛️ 业务视图与调试工具矩阵
+
+系统采用「8 大核心业务页 + 10 大诊断调试工具箱」的完整矩阵设计：
+
+### 8 大核心业务视图
+
+| 视图模块 | 路由入口 | 核心能力说明 |
+|:---|:---|:---|
+| 📊 **总览概况 (Overview)** | `admin/modem/modemd` | 模组核心元数据大屏、5 档蜂窝天线动态信号计、4 宫格物理射频刻度槽、载波聚合（CA）详情与实时上下行吞吐火花线。 |
+| 🌐 **网络拨号 (Dial)** | TAB: 拨号设置 | QMI / MBIM / NCM 拨号协议切换、APN 参数配置、IPv4/IPv6 双栈策略与会话拨号守护状态。 |
+| 📡 **基站小区 (Cells)** | TAB: 小区信息 | 服务小区 PCI / EARFCN / TAC、频段信息、物理层信号参数与周边邻区基站扫描结果。 |
+| 🔒 **频段锁定 (Lock)** | TAB: 频段锁定 | 支持一键锁定指定 5G NR / LTE 工作频段（Band）、指定频点及基站物理小区 ID（PCI）。 |
+| 🧩 **模组管理 (Modules)** | TAB: 硬件模组 | 模组硬件详细信息、固件版本查询、USB / PCIe 接口拓扑识别与多模组平滑切换。 |
+| 💬 **短消息中心 (SMS)** | TAB: 短信中心 | 现代会话式短信收发、长短信自动拼接重组、收发历史归档与未读标记管理。 |
+| ⚙️ **系统服务 (Service)** | TAB: 服务配置 | 守护进程参数调优、API 端口绑定、事件通知策略与企业微信机器人 Webhook 告警。 |
+| 🧰 **综合工具箱 (Tools)** | TAB: 调试工具 | 集成 10 大专业模组调试工具集，为射频调优与故障排查提供底层支撑。 |
+
+### 10 项内置专业调试工具
+
+1. 💻 **交互式 AT 终端**：常用指令自动补全、历史回溯、执行状态高亮与原语收发调试；
+2. 🔄 **软硬件复位重启**：支持指令级软重启与模组物理拉高重启；
+3. ✈️ **飞行模式切换**：一键关闭/开启射频前端，重置无线注册状态；
+4. 🛰️ **GNSS / GPS 定位**：硬件卫星定位通道启闭、NMEA 语句输出与坐标解析；
+5. 📶 **搜网与接入偏好**：手动搜索周边可用运营商网络、指定 5G/4G 接入优先级；
+6. 📡 **射频特性开关**：NR 载波聚合、DSS 动态频谱共享与 VoNR 高清通话开关；
+7. 🌡️ **芯片温度矩阵**：底层多路传感器结温实时监控；
+8. ⚡ **功耗模式调节**：低功耗睡眠模式与唤醒策略管理；
+9. 📝 **拨号日志追踪**：QMI/MBIM 握手过程与 netifd 协议状态日志实时回显；
+10. 🧹 **出厂配置重置**：一键清除 NVRAM 缓存与射频杂项设定，恢复出厂默认值。
+
+---
+
+## 🚀 设备端快速上手
+
+### 1. 服务启停与状态验证
+
+安装完成后，守护进程自动由 `procd` 注册并接管：
 
 ```sh
-# 安装后
+# 查看守护进程运行状态
 /etc/init.d/modemd status
+
+# 重启模组管理服务
 /etc/init.d/modemd restart
-# LuCI 菜单： Mobile Network（移动网络） -> 5G 终端（二级单入口，支持页内横向左右滑动 TAB 栏）
-# 守护进程 API 监听 :9527（LuCI 同源代理访问；内置 WebUI 已于 1.0.8 退役）
+
+# 观察后台监听与 RPC 接口 (默认监听 127.0.0.1:9527 由 LuCI 同源代理)
+netstat -tulpn | grep modemd
 ```
 
-配置在 `/etc/modemd/config.toml`（conffile，升级不覆盖）；改完 `restart` 生效。
+进入 Web 管理界面：**移动网络 (Mobile Network)** → **5G 终端** 即可直接访问。
 
-### 特色亮点
+### 2. 配置文件说明
 
-- **统一精致的白色毛玻璃视觉规范（White Glassmorphism）**：适度透明模糊卡片、高光轻薄边框、低饱和状态强调色与规整弹性自适应栅格。
-- **二级单入口 + 页内横向滑动 TAB**：收敛侧栏菜单树，杜绝下拉式菜单冗余；页内 TAB 栏支持滚轮水平滚动、左右微调与触控自适应。
-- **原生动态 SVG 信号系统**：5 档蜂窝天线信号计真实联动 3GPP 评级，RSRP/SINR/RSRQ/RSSI 4 宫格物理量程 SVG 进度刻度槽。
-- **8 大核心业务页面与 10 项调试工具箱全功能覆盖**：数据源、参数交互与刷新状态与后端无缝同步。
-- **原生 Rust 守护进程**：内置 QMI / MBIM 拨号协议托管，无需外部厂商 C 二进制。
-- **统一拨号生命周期**：AT 与 QMI/MBIM 共用意图、状态、退避与连接代次的单一协调器，
-  插拔 / 重启 / 飞行模式 / 配额断网均可正确回收与重拨。
-- **794 项自动化测试守护**（`cargo test --locked`）：配方、解析、状态机、端口规则逐条钉住。
+全局核心配置文件位于 `/etc/modemd/config.toml`（声明为 `conffile`，固件升级与包更新均**不会覆盖**用户个性化配置）：
 
-## 从源码构建
+```toml
+[server]
+listen = "127.0.0.1:9527"        # 后台 API 监听地址
+log_level = "info"               # 日志级别: debug / info / warn / error
 
-核心：把本仓库当作 OpenWrt 的 package feed。
-Rust 后端有两条构建路径：默认走 `feeds/packages`（提供 `lang/rust`，需启用）；
-或用宿主 `rustup` 工具链直编（`MODEM_PRO_HOST_RUST=1`，跳过 rust 源码编译）。
+[modem]
+auto_detect = true               # 自动探测系统 USB / PCIe 模组
+default_dial_mode = "qmi"        # 默认拨号方式: qmi / mbim / at
+
+[notify]
+wechat_webhook = ""              # 企业微信机器人告警 Webhook 地址
+```
+
+修改配置后执行 `/etc/init.d/modemd restart` 即可热加载生效。
+
+---
+
+## 🛠️ 从源码构建指南
+
+将本仓库作为 OpenWrt 的一个 package feed 引入编译工程。
+
+### 两种构建路径可选
+
+| 构建方式 | 命令 / 开关 | 特点与适用场景 |
+|:---|:---|:---|
+| **路径 A：宿主 rustup 直编 (强烈推荐)** | `MODEM_PRO_HOST_RUST=1` | 利用宿主现成的 `rustc` 与 `aarch64-unknown-linux-musl` target 直编，**跳过耗时数小时的 host-rust 源码编译**，秒级极速构建。 |
+| **路径 B：标准 feed 编译** | 默认行为 | 依赖 `feeds/packages` 提供的 `lang/rust` 在编译链中完成完整构建。 |
 
 ```sh
+# 1. 引入本地或远程 feed
 echo "src-link modem-pro /path/to/modem-pro-unified" >> feeds.conf.default
+
+# 2. 更新并安装 feed
 ./scripts/feeds update -a && ./scripts/feeds install -a
-make menuconfig   # Network -> Modem Manager -> modem-pro
-make package/modem-pro/compile V=s                    # 默认：feeds 的 lang/rust
-make package/modem-pro/compile V=s MODEM_PRO_HOST_RUST=1   # 宿主 rustup 直编
-# 也可在 menuconfig 勾选「用宿主 rustup 工具链直编 modemd」（即 CONFIG_MODEM_PRO_HOST_RUST=y，等价）
+
+# 3. 菜单勾选
+make menuconfig
+# 进入: Network -> Modem Manager -> modem-pro (勾选)
+# (可选: 勾选「用宿主 rustup 工具链直编 modemd」即 CONFIG_MODEM_PRO_HOST_RUST=y)
+
+# 4. 执行编译
+# 方式 A：宿主 rustup 直编 (秒级)
+make package/modem-pro/compile V=s MODEM_PRO_HOST_RUST=1
+
+# 方式 B：标准 feed 编译
+make package/modem-pro/compile V=s
 ```
 
-## 文档
+---
 
-本仓库不随仓库维护文档（历史上有过一版 `docs/`，因与代码状态脱节已整体移除）。
-当前事实来源：
+## 📱 支持厂商与型号生态 (13 家 92 款)
 
-- 接口全表：`rust/src/http/router.rs` 的 `ROUTES`（每个登记项对应一个 handler）。
-- 配置项：`files/etc/modemd/config.toml` 的逐项注释（每条键都有口径说明）。
-- 变更历史与设计取舍：[CHANGELOG.md](CHANGELOG.md)；
-  发版说明：[RELEASE_NOTES.md](RELEASE_NOTES.md)。
+本系统内置庞大的模组硬件知识底座与方言库，开箱支持以下厂商的主流通信模组：
 
-## 致谢
+- 🔹 **移远通信 (Quectel)**：RM500Q、RM520N、RG500Q、RG520N、RG650V、EC20 等全系模组；
+- 🔹 **广和通 (Fibocom)**：FM350-GL、FM160、FM650、NL668、FG150、FG360 等；
+- 🔹 **美格智能 (MeigLink)**：SRM825N、SLM828、SLM750 等；
+- 🔹 **芯讯通 (SIMCom)**：SIM8200、SIM8202、SIM7600 等；
+- 🔹 **华为 (Huawei)**：ME909s、MH5000 等；
+- 🔹 **鼎桥 (TD Tech)**：MT5700M-CN 系列；
+- 🔹 **合宙 (OpenLuat)** / **百旺 (Baiwang)** / **高新兴 (Gosuncn)** / **有方 (Neoway)**；
+- 🔹 **海外主流模组**：Sierra Wireless、Telit、Thales (Cinterion)、Foxconn 等。
 
-本项目的方向、接口契约与真机调参经验来自以下上游工程，特此致谢：
+---
 
-| 上游仓库 | 内容 |
-| --- | --- |
-| [ouyangzq/modem-pro](https://github.com/ouyangzq/modem-pro) | 模组侧守护进程 `modemd`：多模组管理、厂商指令方言、锁网/小区解析、短信与拨号托管等一整套真机打磨过的实现。本仓库的 HTTP/WS 接口、JSON 字段、AT 解析口径与配置项都以其为对齐基准。 |
-| [ouyangzq/luci-proto-modem-pro](https://github.com/ouyangzq/luci-proto-modem-pro) | `modem_pro` netifd 协议：**一张接口同时承载 IPv4 + IPv6** 的 `mp-client.sh` wrapper 与 LuCI 协议表单，并给出 `accept_ra=2`、QMI 数据面、前缀漂移等实机注意事项。 |
-| [LianXia233/luci-app-fm350](https://github.com/LianXia233/luci-app-fm350) | **350 系列模组**（广和通 FM350 / RW350）的真机参考：模组识别与 AT 方言、锁频/锁小区写法、IMEI 的 MFG 块备份与恢复等口径参考了该工程。 |
-| [LianXia233/luci-app-mt5700](https://github.com/LianXia233/luci-app-mt5700) | **MT5700M-CN**（鼎桥 TD Tech）私有 AT 命令族：`AT^MONSC` / `AT^HCSQ` / `AT^DSFLOWQRY` / `^RSSI` URC 等口径据此补齐鼎桥信号与流量链路。GPL-3.0，**仅参考未拷贝**。 |
-| [FUjr/QModem](https://github.com/FUjr/QModem) | 模组知识底座：`modem_support.json` 型号清单、USB 接口号白名单与端口规则、语音 PCM 接口排除、12 家厂商 AT 方言与拨号脚本。本仓库的发现白名单 / 分组策略、厂商数据通道指令表、发现退避参数均以其源码为基准。许可为 MPL-2.0 并附禁止商用附加条款。 |
-| [6106757-lab/openvohive](https://github.com/6106757-lab/openvohive) | QMI/MBIM 会话边界对照基准：WDS Start/Stop/Runtime、WDA Set Data Format、Bind Mux 的 TLV 编号与流程；据此修正 IPv6 运行时设置缺口。许可为 PolyForm Noncommercial 1.0.0，**仅参考未拷贝**。 |
-| [hchyhchyxh/luci-app-rg501q-eu](https://github.com/hchyhchyxh/luci-app-rg501q-eu) | RG501Q-EU（`2c7c:0800`）的 USB 接口号口径（AT 口 1.2/1.3、QMI 1.4）与不绑 option 驱动的端口规则。Apache-2.0，**仅事实依据未拷贝**。 |
-| [ainuoyan/QDC507-Modem-Support](https://github.com/ainuoyan/QDC507-Modem-Support) | 百旺 QDC507（`2c7c:0125`）识别口径、移远方言 AT 与通用 `CGACT` 拨号配方。GPL-3.0，**仅事实依据未拷贝**。 |
-| [Siriling/5G-Modem-Support](https://github.com/Siriling/5G-Modem-Support) | RMNET / GobiNet / MHI / PCIe 多驱动拨号工具与 LuCI 应用的差异清单（据此补齐 `fibo_mhi` 驱动与 Fibocom MHI 数据网卡名识别）。GPL-3.0，**仅参考未拷贝**。 |
+## 📂 仓库项目架构
 
-本仓库是在这些工程的基础上做「整合为单仓库 + 后端 Rust 重写」的工作，目标是与上述
-接口契约逐字兼容。各上游仓库许可见上表；
-本仓库的 [MIT 许可证](LICENSE) 仅覆盖本仓库自身的代码，整合过程中
-**未拷贝任何上游代码**（GPL / PolyForm 组件仅作事实依据与设计参考）。
+```text
+modem-pro-unified/
+├── rust/                       # Rust 守护进程 modemd 核心源码
+│   ├── src/
+│   │   ├── http/               # REST API 路由与 HTTP 服务
+│   │   ├── modem/              # 13 家模组厂商方言与 AT 控制层
+│   │   │   └── vendor/         # 各厂商专有指令集与解析器 (quectel/fibocom/meig...)
+│   │   ├── runtime/            # 拨号器与状态协调引擎
+│   │   │   └── dialer/         # 纯 Rust 自研 QMI / MBIM 协议实现 (含 native 驱动)
+│   │   ├── ubus/               # OpenWrt ubus 本地 RPC 桥接
+│   │   └── wechat/             # 企业微信告警推送客户端
+│   ├── Cargo.toml
+│   └── Cargo.lock
+├── files/                      # 系统运行期资产
+│   ├── etc/modemd/config.toml  # 守护进程默认配置文件
+│   └── lib/netifd/proto/       # OpenWrt netifd 协议集成脚本 (modem_pro.sh)
+├── luci/                       # LuCI 现代前端
+│   └── app/
+│       ├── htdocs/resources/modemd/ # 前端 UI 资源 (SVG 图标、CSS 样式、API 封装)
+│       └── js/view/modemd/     # 8 大核心视图组件脚本 (overview/dial/cells...)
+├── packaging/                  # procd 启动脚本与安装后脚本
+├── scripts/                    # 开发与敏感信息检查辅助脚本
+├── Makefile                    # 顶层 OpenWrt 编译规则定义
+├── VERSION                     # 统一版本号声明 (1.0.8-1)
+└── README.md                   # 项目说明文档
+```
 
-### 关于厂商拨号器 C 源码
+---
 
-内置 QMI / MBIM 拨号器是**本仓库的独立 Rust 实现**（`rust/src/runtime/dialer/`），
-**不包含、未拷贝任何厂商 C 源码**（quectel-CM / fibocom-dial / meig-cm / simcom-cm 等均未采用），
-因此不列入致谢。开发过程中仅将这些 C 实现作为协议行为的事实基准逐条对照
-（TLV 顺序、常量、流程），取舍记录见 [CHANGELOG.md](CHANGELOG.md) 的 [1.0.3] 条目。
+## 💖 致敬与鸣谢
 
-## 许可证
+本项目在演进过程中，充分汲取并参考了开源社区诸多优秀项目的经验与接口规范：
 
-MIT，见 [LICENSE](LICENSE)。
+| 引用工程 | 主要参考与致谢领域 |
+|:---|:---|
+| [**ouyangzq/modem-pro**](https://github.com/ouyangzq/modem-pro) | 模组守护进程接口契约、厂商方言解析思路、锁频锁网与短信托管等实机打磨经验。 |
+| [**ouyangzq/luci-proto-modem-pro**](https://github.com/ouyangzq/luci-proto-modem-pro) | netifd 协议承载形态、IPv4/IPv6 单接口双栈绑定技巧及 `mp-client.sh` 架构。 |
+| [**LianXia233/luci-app-fm350**](https://github.com/LianXia233/luci-app-fm350) | 广和通 350 系列模组（FM350/RW350）实机识别口径与 AT 方言参考。 |
+| [**LianXia233/luci-app-mt5700**](https://github.com/LianXia233/luci-app-mt5700) | 鼎桥 MT5700M 私有 AT 命令族（`^MONSC`、`^HCSQ`、`^DSFLOWQRY`）的信号与流量换算标准。 |
+| [**FUjr/QModem**](https://github.com/FUjr/QModem) | 模组型号清单知识库、USB 接口白名单与端口映射规则。 |
+| [**6106757-lab/openvohive**](https://github.com/6106757-lab/openvohive) | QMI/MBIM 会话边界与 WDS/WDA 报文处理规范参考。 |
+
+> ⚠️ **关于拨号器源码独立性的重要声明**：  
+> 本项目的内置 QMI / MBIM 拨号引擎为**纯自研的独立 Rust 实现**（位于 `rust/src/runtime/dialer/`），**未包含亦未拷贝任何厂商闭源或历史 C 源码**。
+
+---
+
+> 📜 **开源许可**：本项目基于 [MIT 许可证](LICENSE) 发布。
