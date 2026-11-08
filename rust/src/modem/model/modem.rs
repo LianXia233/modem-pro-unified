@@ -698,7 +698,10 @@ impl Modem {
             // 但结论仍标「未识别」——不因为猜了个名字就当成已确认。
             short_model_name(&raw)
         };
-        *self.vendor.lock().unwrap() = vendor;
+        let prev_vendor = {
+            let mut g = self.vendor.lock().unwrap();
+            std::mem::replace(&mut *g, vendor)
+        };
         *self.model_raw.lock().unwrap() = if raw.is_empty() { None } else { Some(raw) };
         if !model.is_empty() {
             *self.model.lock().unwrap() = Some(model.clone());
@@ -708,6 +711,17 @@ impl Modem {
         *self.lock_dialect_slot.lock().unwrap() = None;
         *self.lock_status_slot.lock().unwrap() = None;
         *self.cells.lock().unwrap() = None;
+        // **取值缓存**也必须一起作废。早先只清了锁网/小区，`params`（15 秒）、
+        // `usbnet`（30 秒）、`mode`（30 秒）里还留着按旧方言解析出来的值：
+        // 模组重新枚举后换了厂商、或用户把命令口指到另一台设备（[`Self::repoint`]），
+        // 页面就会拿旧厂商的档位表解释新固件的应答，表现为「取值对不上、
+        // 档位列表是别人的」。上游 `module/kernel/modem.go` 换方言时同样把
+        // probedCmds / lockProbed / modeEnum 一并清掉。
+        if prev_vendor != vendor {
+            self.params_cache.invalidate();
+            self.usbnet_cache.invalidate();
+            self.mode_cache.invalidate();
+        }
         Ok(())
     }
 
