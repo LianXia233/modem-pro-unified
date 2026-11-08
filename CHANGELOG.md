@@ -11,6 +11,41 @@
 
 ## [未发布]
 
+### 重构：netifd 接口拉起（`mp-client.sh`）迁入 Rust/Tokio
+
+**动机**。接口拉起这条链路一直是纯 shell：`mp-client.sh` 用 sed 生成上报脚本、拉起
+udhcpc/odhcp6c、每 3 秒 `kill -0` 巡检、连续失败 5 次才整体退出。它能跑，但三个问题长期存在：
+① 重试/超时/清理这类状态机写在 shell 里，边界条件只能靠真机踩（2026-10-13 的孤儿雪崩就是）；
+② 与 Rust 侧的拨号/探测逻辑分裂在两套语言里，同一类「等待 + 计数 + 收尾」要写两遍；
+③ shell 侧无法单测，改动只能靠路由器上实拨验证。
+
+**改动**。接口拉起的全部业务逻辑迁进 `rust/src/wanclient/`，用 Tokio `current_thread` 运行时；
+shell 只保留 netifd 契约必需的两层：
+
+- `files/lib/netifd/proto/modem_pro.sh`：保留 `proto_config_add_*`、`MP_UOPTS`/`MP_OOPTS` 拼装、
+  `proto_export`、`proto_run_command`、`teardown`、MTU；删除 `proto_modem_pro_fix_accept_ra`
+  （sysctl 写入移到 Rust），改为把「是否要设」的判定结果通过 `MP_FIX_ACCEPT_RA` 传给子进程。
+- `files/usr/lib/modem-pro/mp-client.sh`：从 180 行缩到 25 行，只做
+  「校验 `/usr/bin/modemd` → `exec /usr/bin/modemd wan-client "$@"`」。
+- 新增 `modemd wan-client` 子命令（`rust/src/wanclient/`：`env` / `script` / `procscan` /
+  `supervisor` / `signals` / `sysctl` / `log`），承接上报脚本生成、进程监管与重试、
+  孤儿清理、accept_ra、退出清理与日志。
+
+**为什么用 CLI 子命令而不是 unix socket**。`proto_run_command` 跟踪的是它 exec 出来的进程 PID，
+协议 down 时 netifd 直接对这个 PID 发 TERM、超时 SIGKILL。若让常驻 daemon 托管真正的客户端，
+shim 被杀后 daemon 仍持有 udhcpc/odhcp6c，netifd 既看不到也收不掉 —— 正是要避免的孤儿场景。
+子命令模式下进程树与旧 shell 完全一致，信号直达、退出码直传，且无新增 socket 与权限面。
+
+**兼容性**：脚本路径、`add_protocol modem_pro`、`proto_export` 变量名与语义、`mp-client.sh`
+路径与启动方式、uci 选项、接口命名全部未变，老配置无需迁移即可工作。唯一新增的是内部变量
+`MP_FIX_ACCEPT_RA`（用户不可见）。日志 tag 与文案保持 `modem-pro: mp-client: …`。
+
+**验证**：`cargo test --lib` 全绿（新增 wanclient 单测覆盖参数切分、sed 等价的行插入、
+失败计数 1→5 与清零、udhcpc/odhcp6c 参数顺序）；两个 shell 脚本 `bash -n` 通过。
+**未验证**（本机无法覆盖）：真机 `.apk` 交叉编译与实拨（udhcpc/odhcp6c 实际起停、连续失败 5 次
+后 netifd 是否按预期重启协议）、`/dev/log` 在目标设备上的 syslog 落盘行为、tokio 引入后的
+二进制体积增量（目标设备闪存余量需实测）。
+
 ### 变更：上游对照（模组识别 / 拨号 / 接口拉起）与八处健壮性修复
 
 **对照基线**（2026-11-08）。四条上游全部克隆到本地、逐文件逐逻辑比对，不以文件名判断：

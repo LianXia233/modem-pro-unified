@@ -174,6 +174,7 @@ modem-pro-unified/
 │   │   ├── runtime/            # 拨号器与状态协调引擎
 │   │   │   └── dialer/         # 纯 Rust 自研 QMI / MBIM 协议实现 (含 native 驱动)
 │   │   ├── ubus/               # OpenWrt ubus 本地 RPC 桥接
+│   │   ├── wanclient/          # netifd 接口拉起子命令（`modemd wan-client`，原 mp-client.sh）
 │   │   └── wechat/             # 企业微信告警推送客户端
 │   ├── Cargo.toml
 │   └── Cargo.lock
@@ -190,6 +191,46 @@ modem-pro-unified/
 ├── VERSION                     # 统一版本号声明 (1.0.8-1)
 └── README.md                   # 项目说明文档
 ```
+
+---
+
+## 🔌 netifd 接口拉起：shim 与 daemon 的边界
+
+2026-11-08 起，原本全在 shell 里的「接口拉起」逻辑（生成上报脚本、拉起 udhcpc/odhcp6c、
+巡检重试、孤儿清理、accept_ra）已迁进 Rust（`rust/src/wanclient/`，Tokio `current_thread`）。
+shell 只剩 netifd 契约所必需的两层：
+
+| 层 | 文件 / 模块 | 职责 | 不含什么 |
+|:---|:---|:---|:---|
+| proto handler | `files/lib/netifd/proto/modem_pro.sh` | `init_config` 声明选项、拼 `MP_UOPTS`/`MP_OOPTS`、`proto_export`、`proto_run_command`、`teardown`、MTU | 不再写 sysctl、不再解析上报脚本 |
+| shim | `files/usr/lib/modem-pro/mp-client.sh` | 校验 `/usr/bin/modemd` 存在 → `exec /usr/bin/modemd wan-client "$@"` | 不解析参数、不探测、不重试、不清理 |
+| daemon 子命令 | `rust/src/wanclient/*` | 上报脚本生成、进程监管、失败计数、信号处理、孤儿清理、accept_ra、日志 | 不含 netifd 协议语义（不 `proto_export`、不上报地址） |
+
+**IPC 为什么选 CLI 子命令而不是 unix socket**：`proto_run_command` 跟踪的是它 exec 出来的那个
+进程的 PID —— 协议 down 时 netifd 对这个 PID 发 TERM、超时 SIGKILL。若把真正的客户端交给常驻
+daemon 托管，shim 被 SIGKILL 后 daemon 仍持有 udhcpc/odhcp6c，netifd 既看不到也收不掉，
+正好复现 2026-10-13 那次「孤儿占着 wwan0 → 雪崩重拨」的事故。走子命令时进程树是
+`netifd → modemd(wan-client) → udhcpc/odhcp6c`，与旧 shell 完全一致，信号直达、退出码直传；
+并发也天然隔离（一个接口一个子进程，上报脚本名里带 `INTERFACE`），且不需要新增 socket 路径与权限面。
+
+**行为对照表**（旧 shell → Rust）：
+
+| 旧 `mp-client.sh` / `modem_pro.sh` | 现实现 |
+|:---|:---|
+| `gen_script`（sed 在 `proto_init_update "*" 0\|1` 后插 `proto_set_keep 1`） | `wanclient/script.rs::inject_keep`（纯函数 + 单测） |
+| `cleanup_stale`（扫 `/proc/*/cmdline` 杀残留客户端） | `wanclient/procscan.rs` |
+| `udhcpc -i … -s … -f -R -p … $MP_UOPTS` | `wanclient/supervisor.rs::udhcpc_argv`（参数顺序逐项一致） |
+| `odhcp6c -s … $MP_OOPTS -P0 $IFACE` | `wanclient/supervisor.rs::odhcp6c_argv` |
+| `sleep 3` + `kill -0` 巡检 | `interval_at(+3s)` + `Child::try_wait`（顺带回收僵尸） |
+| `UFAIL`/`OFAIL` + `MAX_FAILS=5` → `exit 1` | `FailCounter`（单测覆盖 1..5 与清零） |
+| `cleanup`：kill → sleep 1 → kill -9 → cleanup_stale → rm 脚本 | `Supervisor::cleanup`（TERM → 1s → KILL → 扫残留 → 删脚本） |
+| `trap 'cleanup; exit 0' TERM INT HUP` | `wanclient/signals.rs` + `select!` |
+| `proto_modem_pro_fix_accept_ra`（写 `/proc/…/accept_ra=2`） | `wanclient/sysctl.rs`（判定仍在 proto handler，结论走 `MP_FIX_ACCEPT_RA`） |
+| `logger -t modem-pro "…"` | `wanclient/log.rs`（写 `/dev/log`，不可用时退 stderr，tag/文案不变） |
+
+**兼容性**：`modem_pro.sh` 路径、`add_protocol modem_pro`、`proto_export` 变量名与含义、
+`mp-client.sh` 路径与启动方式、uci 选项与接口命名全部未变；老配置无需迁移。
+唯一新增的变量是内部使用的 `MP_FIX_ACCEPT_RA`（用户不可见、也不需要配置）。
 
 ---
 
