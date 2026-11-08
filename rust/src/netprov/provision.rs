@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -47,6 +48,32 @@ pub struct AutoWanReport {
     pub skipped: Vec<String>,
     /// 有没有出错（出错时 `applied` 可能是半套）。
     pub ok: bool,
+}
+
+/// 每张接口最近一次「补 ifup」的时刻（按接口名）。
+///
+/// 为什么要限速：接口拉不起来时 `ifup` 会占满自己的超时（最长 20 秒），
+/// 15 秒一拍的组网线程就会一直在等它 —— 拨号器对账（本轮尾部）也跟着饿死。
+/// 45 秒的间隔给「proto 自己重试」留出时间，又不至于整轮堵死。
+fn ifup_gate() -> &'static Mutex<HashMap<String, Instant>> {
+    static GATE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 这次是否允许对 `name` 补 `ifup`（并记下本次时刻）。
+fn ifup_due(name: &str) -> bool {
+    const MIN_GAP: Duration = Duration::from_secs(45);
+    let Ok(mut g) = ifup_gate().lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    match g.get(name) {
+        Some(t) if now.duration_since(*t) < MIN_GAP => false,
+        _ => {
+            g.insert(name.to_string(), now);
+            true
+        }
+    }
 }
 
 /// 各模组最近一次组网结果（`/api/dial` 读它，循环写它）。
@@ -289,6 +316,42 @@ pub fn provision_modem_with(
             );
             if let Err(e) = uci::reload_network() {
                 log::warn!("自动组网 模组 {}：补 reload 失败: {e}", modem.id);
+            }
+        }
+        // 接口在 netifd 里**存在但 DOWN** ⇒ 幂等补一次 `ifup`。
+        // UCI 符合计划只说明「配置对」，不代表「接口起来了」：开机时模组还没就绪、
+        // proto 首次 up 失败、上一次 reload 失败、用户手动 ifdown，都会留下
+        // 「接口存在却不 up」，而这条短路分支原先只看「加载没加载」，
+        // 于是它永远等不到下一次 UCI 变化（上游 `netprov_wanup.go:567-576`
+        // 同样每轮补 ifup）。间隔 45 秒，避免拉着拉不起来时把每轮都堵住。
+        for i in plan.ifaces.iter() {
+            if uci::interface_down(&i.name) != Some(true) {
+                continue;
+            }
+            if !ifup_due(&i.name) {
+                rep.skipped
+                    .push(format!("{} 处于 DOWN，补 ifup 的间隔未到", i.name));
+                continue;
+            }
+            match uci::ifup(&i.name) {
+                Ok(()) => {
+                    log::info!(
+                        "自动组网 模组 {}：接口 {} 存在但未 up，已补 ifup",
+                        modem.id,
+                        i.name
+                    );
+                    rep.skipped
+                        .push(format!("{} 存在但未 up，已补 ifup", i.name));
+                }
+                Err(e) => {
+                    log::warn!(
+                        "自动组网 模组 {}：接口 {} 存在但未 up，补 ifup 失败: {e}",
+                        modem.id,
+                        i.name
+                    );
+                    rep.skipped
+                        .push(format!("{} 存在但未 up，补 ifup 失败", i.name));
+                }
             }
         }
         // 350 系列运行期再识别 IPv6：接口形态已经配好，但模组拿到 v6 的时刻

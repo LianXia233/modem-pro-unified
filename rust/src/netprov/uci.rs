@@ -174,6 +174,58 @@ pub fn interface_loaded(name: &str) -> bool {
     ok_with_timeout("ifstatus", &[name.trim()], UCI_TIMEOUT)
 }
 
+/// 接口在 netifd 里存在、但当前是 DOWN（`ifstatus` 的 JSON 里 `"up": false`）。
+///
+/// 为什么要单独判：`interface_loaded` 只看 `ifstatus` 跑不跑得通（存在性），
+/// 接口存在但 DOWN 时同样返回 true —— 于是「UCI 已符合计划」的短路分支
+/// 永远不会再拉它，接口就一直躺在那儿。真实触发场景：
+/// 开机时模组还没就绪、proto 首次 up 失败、上一次 reload 半途而废、
+/// 用户手动 `ifdown`、被 `proto_block_restart` 挡住。
+/// 上游 `module/kernel/netprov_wanup.go:567-576` 也是每轮幂等补 `ifup`。
+///
+/// 读不到输出 / 命令失败 ⇒ 返回 `None`（不知道就什么都不做）。
+pub fn interface_down(name: &str) -> Option<bool> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let out = run_with_timeout("ifstatus", &[name], UCI_TIMEOUT).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // `ifstatus` 输出的 `up` 是顶层布尔；只认这个字段，别拿 `"up": false`
+    // 之外的东西猜（`pending` / `autostart` 都在附近，容易误判）。
+    if text.contains("\"up\": true") {
+        Some(false)
+    } else if text.contains("\"up\": false") {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// 幂等地把一张已存在但 DOWN 的接口拉起来（`ifup <name>`）。
+///
+/// 超时给 20 秒：`ifup` 会等 proto 起来，协议是 `dhcp` 时可能要等一次
+/// lease（模组网卡没数据时 udhcpc 会一直重试），给它一个上界，
+/// 超时只当「这次没拉起来」——组网线程不能被一张接口拖死。
+pub fn ifup(name: &str) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(msg("接口名为空，拒绝 ifup"));
+    }
+    let out = run_with_timeout("ifup", &[name], Duration::from_secs(20))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    Err(msg(format!(
+        "ifup {name} 失败: {}",
+        if err.is_empty() { "无 stderr" } else { &err }
+    )))
+}
+
 /// 把 `uci show network` / `uci show firewall` 的文本解析成现状清单。
 ///
 /// 关心的三类行（其它一概忽略）：
