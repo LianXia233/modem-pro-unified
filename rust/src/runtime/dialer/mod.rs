@@ -79,6 +79,9 @@ use crate::netprov::provision::device_for;
 #[cfg(unix)]
 pub mod native;
 
+/// 拨号门禁（跨平台纯逻辑：配置归一化也用它，见 `config::net::normalize`）。
+pub mod gate;
+
 #[cfg(unix)]
 mod mbim;
 #[cfg(unix)]
@@ -389,6 +392,24 @@ pub fn auto_connect_allowed(
     backoff_due
 }
 
+/// 门禁事实的短时缓存（每模组一份）。
+#[cfg(unix)]
+#[derive(Default, Clone, Copy)]
+struct GateCache {
+    /// 飞行模式：(是否开启，None = 固件不支持查询) + 取到的时间。
+    airplane: Option<(Option<bool>, Instant)>,
+    /// 漫游：(是否应停) + 取到的时间。
+    roam: Option<(bool, Instant)>,
+}
+
+/// 门禁事实的有效期。
+///
+/// 太短会把 AT 请求堆到信号采样上；太长会让「关了飞行模式仍被拦」多持续一轮。
+/// 用户动开关会显式清缓存（见 [`DialerSupervisor::reset_backoff`]），
+/// 所以 60 秒只影响外部变化（换运营商、漫游状态恢复）。
+#[cfg(unix)]
+const GATE_TTL: Duration = Duration::from_secs(60);
+
 /// 拨号协调器（一个进程一个，挂在全局 [`supervisor`] 上）。
 #[derive(Default)]
 pub struct DialerSupervisor {
@@ -420,6 +441,12 @@ pub struct DialerSupervisor {
     /// 已经被顶掉。加锁后同一模组同时只有一个建会话流程。
     #[cfg(unix)]
     starting: Mutex<std::collections::HashSet<u32>>,
+    /// 门禁事实的短时缓存（飞行模式 / 漫游都各要发 AT，不能每轮都问）。
+    ///
+    /// 只在 `[net] dial_gate` 打开时才会被填写；默认 `off` 时这张表永远是空的，
+    /// 即「不新增任何 AT 流量」。
+    #[cfg(unix)]
+    gate: Mutex<HashMap<u32, GateCache>>,
     /// `AppState` 的句柄（[`Self::kick`] 用）。
     ///
     /// 为什么不是 kick 的入参：`/api/dial/connect` 这类**同步** handler 只拿得到
@@ -445,7 +472,10 @@ impl DialerSupervisor {
         // 用户主动断开不是「连续失败」：复位台账一并清掉，别让下次重开开关
         // 时因为旧账直接触发一次谁都没准备好的模组重启。
         #[cfg(unix)]
-        self.rescue.lock().unwrap().remove(&modem_id);
+        {
+            self.rescue.lock().unwrap().remove(&modem_id);
+            self.gate.lock().unwrap().remove(&modem_id);
+        }
     }
 
     /// 用户重新打开某个开关（拨号总开关 / 自动拨号 / 关飞行模式）时清退避：
@@ -453,14 +483,21 @@ impl DialerSupervisor {
     pub fn reset_backoff(&self, modem_id: u32) {
         self.retry.clear(modem_id);
         #[cfg(unix)]
-        self.rescue.lock().unwrap().remove(&modem_id);
+        {
+            self.rescue.lock().unwrap().remove(&modem_id);
+            // 门禁事实同样作废：否则「刚关了飞行模式」还要被 60 秒的旧值拦住。
+            self.gate.lock().unwrap().remove(&modem_id);
+        }
     }
 
     /// 同上，全部模组（开关是全局的）。
     pub fn reset_backoff_all(&self) {
         self.retry.clear_all();
         #[cfg(unix)]
-        self.rescue.lock().unwrap().clear();
+        {
+            self.rescue.lock().unwrap().clear();
+            self.gate.lock().unwrap().clear();
+        }
     }
 
     /// 挂上 `AppState`（进程启动时调一次；之后 [`Self::kick`] 才能用）。
@@ -586,38 +623,107 @@ impl DialerSupervisor {
         Some(st.count)
     }
 
-    /// 该不该继续托管这个模组（三个开关 + 用户意图）。
+    /// 该不该继续托管这个模组（开关 + 用户意图 + [`gate`] 里的可配置判据）。
     ///
-    /// 注意 `host_dial` 只关**主机侧拨号器**，不影响 AT 路径 —— 两个开关
-    /// 管的是两件事，别合并判。
-    fn stop_reason(
+    /// `host_dial` 只关**主机侧拨号器**，不影响 AT 路径 —— 两个开关管的是两件事，
+    /// 所以 AT 路径调用时把 `host_dial` 按「不拦」传入（`at_path = true`）。
+    #[cfg(unix)]
+    fn gate_stop(
         &self,
         state: &AppState,
+        modem: &Modem,
         st: &crate::modem::model::DialState,
-    ) -> Option<&'static str> {
-        if !state.cfg.net.host_dial {
-            Some("host_dial 关闭")
-        } else if !state.dial_enabled() {
-            Some("拨号总开关关闭")
-        } else if st.manual_stop {
-            Some("用户手动断开")
-        } else {
-            None
+        at_path: bool,
+    ) -> Option<gate::Stop> {
+        let level = gate::GateLevel::parse(&state.cfg.net.dial_gate);
+        let facts = gate::Facts {
+            host_dial: at_path || state.cfg.net.host_dial,
+            dial_enabled: state.dial_enabled(),
+            manual_stop: st.manual_stop,
+            // 三档以外的判据**不查**：默认 off 时这里全是 None，连一条 AT 都不多发。
+            airplane_on: if level.checks_extras() {
+                self.airplane_fact(modem)
+            } else {
+                None
+            },
+            quota_blocked: if level.checks_extras() {
+                Some(state.quota.get(modem.id).blocked)
+            } else {
+                None
+            },
+            roam_blocked: if level.checks_roam() {
+                self.roam_fact(state, modem)
+            } else {
+                None
+            },
+        };
+        gate::evaluate(level, &facts)
+    }
+
+    /// 飞行模式事实（60 秒缓存）。固件不支持查询时返回 `None`（不拦）。
+    ///
+    /// 锁只包住查表与写回，**AT 查询在锁外** —— `AT+CFUN?` 可能要一两秒，
+    /// 拿着锁会让其它模组的门禁判定排队。
+    #[cfg(unix)]
+    fn airplane_fact(&self, modem: &Modem) -> Option<bool> {
+        {
+            let g = self.gate.lock().unwrap();
+            if let Some(e) = g.get(&modem.id) {
+                if let Some((v, at)) = e.airplane {
+                    if at.elapsed() < GATE_TTL {
+                        return v;
+                    }
+                }
+            }
         }
+        let a = modem.airplane();
+        let v = if a.supported { Some(a.enabled) } else { None };
+        self.gate
+            .lock()
+            .unwrap()
+            .entry(modem.id)
+            .or_default()
+            .airplane = Some((v, Instant::now()));
+        v
+    }
+
+    /// 漫游事实（60 秒缓存）。判据不齐全（`applies=false`）时返回「不拦」。
+    ///
+    /// 复用 [`Modem::roam_view`] 而不是另写一套报文：界面上的「数据漫游」开关
+    /// 与这里判定必须同源，否则会出现「页面说会被停、拨号器照拨」的分裂。
+    #[cfg(unix)]
+    fn roam_fact(&self, state: &AppState, modem: &Modem) -> Option<bool> {
+        {
+            let g = self.gate.lock().unwrap();
+            if let Some(e) = g.get(&modem.id) {
+                if let Some((b, at)) = e.roam {
+                    if at.elapsed() < GATE_TTL {
+                        return Some(b);
+                    }
+                }
+            }
+        }
+        let v = modem.roam_view(state.cfg.net.allow_roaming);
+        // `effective = false` ⇔ 国际漫游且未授权（`applies=false` 时为 true）。
+        let blocked = !v.effective;
+        self.gate.lock().unwrap().entry(modem.id).or_default().roam =
+            Some((blocked, Instant::now()));
+        Some(blocked)
     }
 
     /// 原生后端（QMI/MBIM）的一轮对账。
     fn reconcile_native_one(&self, state: &AppState, modem: &std::sync::Arc<Modem>) {
         let id = modem.id;
         let st = modem.dial_status();
-        if let Some(why) = self.stop_reason(state, &st) {
+        if let Some(stop) = self.gate_stop(state, modem, &st, false) {
             if self.native.lock().unwrap().contains_key(&id) {
-                log::info!("原生拨号：模组 {id} 停（{why}）");
+                log::info!("原生拨号：模组 {id} 停（{} / {}）", stop.code, stop.text);
                 self.stop_session(id);
-                // manual_stop 由 hangup 收尾（已经是 idle）；另外两种是策略停用，
-                // 状态必须落到 disconnected，不能继续显示「已连接」。
-                if !st.manual_stop {
-                    modem.note_stopped(why);
+                // manual_stop 由 hangup 收尾（已经是 idle）；策略停用必须落
+                // disconnected，不能继续显示「已连接」。门禁命中时即便
+                // manual_stop 也成立，也要把**更根本**的原因写进去（便于排障）。
+                if !st.manual_stop || stop.code != "manual_stop" {
+                    modem.note_stopped(stop.code, &stop.text);
                 }
             }
             return;
@@ -722,6 +828,24 @@ impl DialerSupervisor {
                         // 拿到地址即清零。QMI/MBIM 的会话状态可能停在已连接而承载早就
                         // 废了（实测：模组重新枚举后 raw_ip 被复位，地址永远不来）。
                         _ => {
+                            // 同参数下重复点「拨号」时，`dial_inner` 会先把状态写成
+                            // dialing（并 bump 代次），但会话其实还在跑、计划也没变。
+                            // 这条路径原先只做「掉线自愈」，没有第二个人把状态写回
+                            // connected —— 页面于是永久停在「拨号中」，直到会话真的
+                            // 掉了才有下一轮写入。这里按当前代次重新确认一次。
+                            // 只在「状态不是 connected」时写，避免每轮往 steps 里堆条目。
+                            if st.state != DIAL_CONNECTED {
+                                let note = "会话仍在运行（连接参数未变），沿用现有数据呼叫";
+                                if modem.note_native_up(
+                                    modem.dial_epoch(),
+                                    &format!("native-{kind}"),
+                                    note,
+                                ) {
+                                    log::info!(
+                                        "原生拨号：模组 {id} 会话仍在运行，状态回写为已连接（重复拨号请求）"
+                                    );
+                                }
+                            }
                             match self.heal_due(id, s.started, link_ok) {
                                 None => return,
                                 Some(count) => {
@@ -900,6 +1024,26 @@ impl DialerSupervisor {
         let id = modem.id;
         let st = modem.dial_status();
         let busy = modem.dial_in_progress() || self.in_flight.lock().unwrap().contains(&id);
+        // 门禁只拦「**新发起**」的 AT 拨号（`at_path = true` 表示不受 host_dial 管）。
+        //
+        // 已连接的 AT 会话不在这里拆：AT 路径没有会话句柄，唯一的拆法是
+        // `hangup`，而 hangup 会置 `manual_stop`（等于替用户做了「断开」的决定）。
+        // 已连接时命中的配额 / 飞行模式 / 漫游仍由各自既有处置负责
+        // （配额循环关射频、飞行模式切 CFUN、漫游由界面开关），本模块只负责
+        // 「别再发起新的空拨」并把原因写进状态。
+        //
+        // `dial_gate = off`（默认）时**整段跳过**：旧版 AT 路径对「开关关 / 手动断开」
+        // 只是静默不拨（由下面的 `auto_connect_allowed` 拦住），不写状态。保持这条
+        // 路径不变，才是「未启用时行为与现在一致」。
+        let gate_on = gate::GateLevel::parse(&state.cfg.net.dial_gate) != gate::GateLevel::Off;
+        if gate_on && st.state != DIAL_CONNECTED {
+            if let Some(stop) = self.gate_stop(state, modem, &st, true) {
+                if stop.code != "manual_stop" {
+                    modem.note_stopped(stop.code, &stop.text);
+                }
+                return;
+            }
+        }
         if !auto_connect_allowed(
             &st,
             state.dial_enabled(),

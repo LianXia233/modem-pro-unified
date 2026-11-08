@@ -51,8 +51,17 @@ pub const CMD_SET: u32 = 1;
 pub const ACTIVATE: u32 = 1;
 pub const DEACTIVATE: u32 = 0;
 
-/// 激活状态：`2` = activated。
-pub const ACTIVATION_ACTIVATED: u32 = 2;
+/// 激活状态（MBIM 规范 / libmbim `MBIMActivationState`）：
+/// `0` = unknown、`1` = activated、`2` = activating、`3` = deactivated、`4` = deactivating。
+///
+/// ⚠️ 早先这里写成 `2` 是错的：`2` 是「正在激活」。把 `2` 当成功会让
+/// 「设备回了 activating」被当成已建立，而真正 `activated`（`1`）反而被判失败
+/// —— 探活于是永久 false，MBIM 会话反复重拨。依据：libmbim 的
+/// `MBIM_ACTIVATION_STATE_ACTIVATED = 1`，以及上游 quectel-cm `mbim-cm.c`、
+/// `6106757-lab/openvohive` 的 `pkg/mbim/connect.go` 都按 `1` 判激活。
+pub const ACTIVATION_ACTIVATED: u32 = 1;
+/// `2` = 正在激活：设备收到 `CONNECT` 后可能先回这个、随后才转 `1`。
+pub const ACTIVATION_ACTIVATING: u32 = 2;
 
 /// 上下文 IP 类型。
 pub const IP_TYPE_DEFAULT: u32 = 0;
@@ -419,7 +428,7 @@ mod tests {
     fn command_done_status_and_info() {
         let mut body = le32(0).to_vec(); // status = success
         body.extend_from_slice(&le32(3)); // info len
-        body.extend_from_slice(&[2, 0, 0]); // activation_state = 2
+        body.extend_from_slice(&[1, 0, 0]); // activation_state = 1(activated)
         let mut frame = le32(MSG_COMMAND_DONE).to_vec();
         let total = COMMAND_DONE_HEADER_LEN + body.len();
         frame.extend_from_slice(&le32(total as u32));
@@ -435,7 +444,7 @@ mod tests {
         assert_eq!(m.kind, MSG_COMMAND_DONE);
         assert_eq!(m.transaction, 5);
         assert_eq!(command_status(&m.body), Some(0));
-        assert_eq!(command_info(&m.body), &[2, 0, 0]);
+        assert_eq!(command_info(&m.body), &[1, 0, 0]);
         // info 里第 4..8 字节是 activation_state（这里只有 3 字节，取不到）
         assert_eq!(connect_state(command_info(&m.body)), None);
     }
@@ -485,12 +494,12 @@ mod tests {
         frame.extend_from_slice(&le32(0)); // status
         frame.extend_from_slice(&le32(8)); // info len
         frame.extend_from_slice(&le32(0)); // session id
-        frame.extend_from_slice(&le32(2)); // activation_state = 2
+        frame.extend_from_slice(&le32(1)); // activation_state = 1(activated)
         let mut buf = frame;
         let m = take(&mut buf).expect("完整帧");
         assert_eq!(m.body.len(), 16, "status(4) + len(4) + info(8)");
         assert_eq!(command_status(&m.body), Some(0));
-        assert_eq!(connect_state(command_info(&m.body)), Some(2));
+        assert_eq!(connect_state(command_info(&m.body)), Some(1));
     }
 
     #[test]

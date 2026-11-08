@@ -698,16 +698,45 @@ impl Modem {
             // 但结论仍标「未识别」——不因为猜了个名字就当成已确认。
             short_model_name(&raw)
         };
-        *self.vendor.lock().unwrap() = vendor;
+        let prev_vendor = {
+            let mut g = self.vendor.lock().unwrap();
+            std::mem::replace(&mut *g, vendor)
+        };
         *self.model_raw.lock().unwrap() = if raw.is_empty() { None } else { Some(raw) };
-        if !model.is_empty() {
-            *self.model.lock().unwrap() = Some(model.clone());
+        // 识别不出型号时**清空**，不再沿用上一轮的旧型号。
+        //
+        // 旧实现在这里写 `if !model.is_empty()`，做过一次识别后型号就再也降不下来：
+        // 换了另一台不在清单里的模组、或命令口被 `repoint` 指到别的设备时，页面
+        // 会一直显示上一台的名字，厂商方言也跟着按旧型号解释。结论的可信度本来
+        // 就只有两档（已确认 / 未识别），旧值混进来等于伪造第三档。
+        // 未识别的标记另由 `ident.matched_by = NoMatch` 承担（界面显示「未识别」）。
+        let next_model = if model.is_empty() {
+            None
+        } else {
+            Some(model.clone())
+        };
+        let prev_model = std::mem::replace(&mut *self.model.lock().unwrap(), next_model.clone());
+        if prev_model.is_some() && next_model.is_none() {
+            log::warn!("模组 {} 本轮识别不出型号，已清空型号并标记未识别", self.id);
         }
         *self.ident.lock().unwrap() = Some(ident);
         // 厂商/型号可能变了：厂商方言相关的缓存全部作废重探
         *self.lock_dialect_slot.lock().unwrap() = None;
         *self.lock_status_slot.lock().unwrap() = None;
         *self.cells.lock().unwrap() = None;
+        // **取值缓存**也必须一起作废。早先只清了锁网/小区，`params`（15 秒）、
+        // `usbnet`（30 秒）、`mode`（30 秒）里还留着按旧方言解析出来的值：
+        // 模组重新枚举后换了厂商、或用户把命令口指到另一台设备（[`Self::repoint`]），
+        // 页面就会拿旧厂商的档位表解释新固件的应答，表现为「取值对不上、
+        // 档位列表是别人的」。上游 `module/kernel/modem.go` 换方言时同样把
+        // probedCmds / lockProbed / modeEnum 一并清掉。
+        // 型号变化同样要作废：`atplan::for_model` 按型号挑指令集，`modem::bands`
+        // 按型号给频段表，参数/档位缓存里留着的都是旧型号的结论。
+        if prev_vendor != vendor || prev_model != next_model {
+            self.params_cache.invalidate();
+            self.usbnet_cache.invalidate();
+            self.mode_cache.invalidate();
+        }
         Ok(())
     }
 

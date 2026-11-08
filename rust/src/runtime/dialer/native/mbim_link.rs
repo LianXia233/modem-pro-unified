@@ -160,7 +160,15 @@ impl MbimLink {
         let out = self.command(CID_CONNECT, mbim::CMD_SET, &info, CONNECT_TIMEOUT)?;
         let state = mbim::connect_state(&out).unwrap_or(0);
         let nw = mbim::connect_nw_error(&out).unwrap_or(0);
-        if activate && state != mbim::ACTIVATION_ACTIVATED {
+        // 设备收到 `CONNECT` 后可能先回 activating(2)、随后才转 activated(1)。
+        // 两者都算「命令被接受」：真正的地址由随后的 IP_CONFIGURATION 与
+        // netifd 取址确认；只有 unknown/deactivated/deactivating 才是失败。
+        if activate
+            && !matches!(
+                state,
+                mbim::ACTIVATION_ACTIVATED | mbim::ACTIVATION_ACTIVATING
+            )
+        {
             return Err(format!(
                 "会话没有激活（activation_state={state}, nw_error={nw:#x}）"
             ));
@@ -187,7 +195,13 @@ impl MbimLink {
             &session.to_le_bytes(),
             OP_TIMEOUT,
         )?;
-        Ok(mbim::connect_state(&info) == Some(mbim::ACTIVATION_ACTIVATED))
+        // activating 也算活着：设备正在把会话拉起来，这时判 false 会让调度层
+        // 立刻拆掉一个正在建立的会话（地址还没下发就被重拨，表现为抖动）。
+        // 真正的「没有数据」由调度层的地址 / 载波检查兜底。
+        Ok(matches!(
+            mbim::connect_state(&info),
+            Some(mbim::ACTIVATION_ACTIVATED) | Some(mbim::ACTIVATION_ACTIVATING)
+        ))
     }
 
     /// 关连接（重复调用安全；失败只记日志）。

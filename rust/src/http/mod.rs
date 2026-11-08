@@ -76,6 +76,11 @@ pub struct AppState {
     pub(crate) net_wan_mode: Mutex<Option<String>>,
     /// 各模组最近一次自动组网的结果（见 netprov/provision.rs，`/api/dial` 读它）
     pub(crate) netprov: crate::netprov::provision::ReportStore,
+    /// 本程序生成过的 WAN 接口记录（netprov_ifaces.json，见 netprov/cleanup.rs）
+    ///
+    /// 拔卡后要不要删残留的 `modem<id>` / `modem<id>_6`，靠它比对「生成时写了什么」
+    /// 与「UCI 现在是什么」—— 没有记录 / 记录对不上（用户改过）就保留不删。
+    pub(crate) iface_ledger: Arc<crate::netprov::cleanup::IfaceLedger>,
     /// 企业微信推送客户端（见 wechat/，`/api/wechat/*` 与 `+CMTI` 路径共用）
     pub(crate) wechat: crate::wechat::client::WeChatClient,
     /// 只读状态缓存：页面首屏用「旧值 + 年龄」，不再每条都发 AT（见 http/cache.rs）
@@ -214,6 +219,9 @@ pub fn serve(
         net_wan_ipv6: Mutex::new(None),
         net_wan_mode: Mutex::new(None),
         netprov: crate::netprov::provision::ReportStore::new(),
+        iface_ledger: Arc::new(crate::netprov::cleanup::IfaceLedger::new(
+            crate::netprov::cleanup::ledger_path(config_path),
+        )),
         wechat,
         cache: Arc::new(cache::StateCache::new()),
         tasks: Arc::new(tasks::Registry::new()),
@@ -221,6 +229,7 @@ pub fn serve(
         ifstat: Arc::new(crate::runtime::ifstat::IfStat::new()),
     });
     log::info!("流量配额台账：{}", state.quota.path());
+    log::info!("WAN 接口生成记录：{}", state.iface_ledger.path());
     log::info!("IMEI 备份台账：{}", state.imei.path());
     log::info!("AT 命令口指定：{}", state.atport.path());
     log::info!("AT 命令口绑定（VID:PID）：{}", state.atport_bind.path());

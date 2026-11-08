@@ -55,6 +55,21 @@ pub struct NetConfig {
     pub reset_before_dial: bool,
     /// 两次自愈复位之间至少隔多少秒（默认 300；实际使用钳在 60~3600）。
     pub reset_before_dial_cooldown: i64,
+    /// 拨号门禁等级（**默认 `off`，与旧版行为一字不差**）。
+    ///
+    /// 上游 `hostDialStopReason` 在拨号前按「漫游 / 飞行模式 / 配额」逐项判定
+    /// 并给出停止原因；本仓库这三项此前只在界面上做提示，不参与拨号决策。
+    /// 为了让排查有唯一的「为什么没拨」入口，这里把它做成显式等级：
+    ///
+    /// | 取值 | 生效的额外判据 | 对现有用户的影响 |
+    /// | --- | --- | --- |
+    /// | `off`（默认） | 无（只保留开关与手动断开两条既有判据） | 无 |
+    /// | `roam` | 再加「国际漫游且未授权」 | 只有真正在境外漫游的链路会被停 |
+    /// | `all` | 再加上飞行模式与流量配额 | 达到配额 / 开飞行模式时不再反复空拨 |
+    ///
+    /// 无论哪一档，命中的原因都会写进 `DialState.stop_reason`（供前端与 ubus
+    /// 读取）并记一条日志 —— 没命中的链路依旧照旧连接。
+    pub dial_gate: String,
 }
 
 impl Default for NetConfig {
@@ -76,6 +91,7 @@ impl Default for NetConfig {
             allow_roaming: true,
             reset_before_dial: false,
             reset_before_dial_cooldown: 300,
+            dial_gate: "off".to_string(),
         }
     }
 }
@@ -112,5 +128,10 @@ impl NetConfig {
         if self.reset_before_dial_cooldown <= 0 {
             self.reset_before_dial_cooldown = 300;
         }
+        // 拨号门禁：空值/拼错一律归一到 off。**写错不能变成更严的门禁** ——
+        // 用户把一个本意是「关掉」的配置写错，不该让链路突然拨不出去。
+        self.dial_gate = crate::runtime::dialer::gate::GateLevel::parse(&self.dial_gate)
+            .as_str()
+            .to_string();
     }
 }

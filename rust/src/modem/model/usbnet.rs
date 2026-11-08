@@ -99,11 +99,19 @@ impl Modem {
     }
 
     fn read_usbnet(&self) -> UsbNetMode {
-        let vendor = self.vendor();
         let resp = self
             .with_at_prio(Prio::Bulk, |p| p.command(QCFG, self.cmd_timeout))
             .unwrap_or_default();
-        let parsed = is_ok(&resp).then(|| parse_usbnet(&resp)).flatten();
+        self.usbnet_from_resp(&resp)
+    }
+
+    /// 由一次 `AT+QCFG="usbnet"` 的原始应答构造对外结构（含档位表与写策略）。
+    ///
+    /// 抽出来是为了让 [`Self::set_usbnet`] 把「写」与「回读」放进**同一张调度票**
+    /// 之后仍复用同一套解析 —— 两份解析迟早会走偏，而这份结构要同时喂给页面。
+    fn usbnet_from_resp(&self, resp: &str) -> UsbNetMode {
+        let vendor = self.vendor();
+        let parsed = is_ok(resp).then(|| parse_usbnet(resp)).flatten();
 
         // 档位与写策略**与读成功与否无关**：读不到也要让页面知道有哪些档、
         // 哪些档在这台机器上不能动（否则下拉是空的，用户以为功能坏了）。
@@ -172,12 +180,29 @@ impl Modem {
             UsbnetWrite::Deny(why) => return Err(msg(why)),
         }
         let cmd = format!("AT+QCFG=\"usbnet\",{value}");
-        let resp = self.with_at_prio(Prio::Bulk, |p| p.command(&cmd, Duration::from_secs(5)))?;
-        if !is_ok(&resp) {
-            return Err(msg(format!("下发失败：{}", resp.trim())));
+        // 写与回读必须在**同一张调度票**里：两条命令之间若被别的流程插队
+        // （页面连点刷新、信号采样、短信轮询），回读可能读到被切断的应答，
+        // 于是误报「回读不符」并让用户以为切换失败。票内连发也顺带避免了
+        // 「另一个写者在我写完、读之前又改一次」的次序错乱。
+        let (wrote, readback) = self.with_at_prio(Prio::Bulk, |p| {
+            let w = p.command(&cmd, Duration::from_secs(5))?;
+            if !is_ok(&w) {
+                return Ok((w, String::new()));
+            }
+            let r = p.command(QCFG, self.cmd_timeout)?;
+            Ok((w, r))
+        })?;
+        if !is_ok(&wrote) {
+            return Err(msg(format!("下发失败：{}", wrote.trim())));
         }
-        // 回读必须实时：走缓存会读到写之前的值，然后误报「回读不符」
-        let st = self.usbnet_refresh();
+        // 回读必须是同一票里拿到的那条应答：走缓存会读到写之前的值，
+        // 然后误报「回读不符」。
+        let st = self.usbnet_from_resp(&readback);
+        // 缓存**先**同步成回读值：回读是设备的真实状态，与目标不符时同样要落缓存。
+        // 否则写成功但回读不符的分支会在下面的 `return Err` 里直接返回，缓存里
+        // 30 秒内仍是写之前的旧值 —— `GET /api/usbnet` 反而报出一个模组已经不
+        // 再使用的档位（Codex review on PR #1 指出，确为本实现遗漏）。
+        self.usbnet_cache.set(st.clone());
         if st.value != value.to_string() {
             return Err(msg(format!(
                 "已下发但回读为 {}{}（目标 {value}）",
