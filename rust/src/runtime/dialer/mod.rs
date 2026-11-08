@@ -722,6 +722,24 @@ impl DialerSupervisor {
                         // 拿到地址即清零。QMI/MBIM 的会话状态可能停在已连接而承载早就
                         // 废了（实测：模组重新枚举后 raw_ip 被复位，地址永远不来）。
                         _ => {
+                            // 同参数下重复点「拨号」时，`dial_inner` 会先把状态写成
+                            // dialing（并 bump 代次），但会话其实还在跑、计划也没变。
+                            // 这条路径原先只做「掉线自愈」，没有第二个人把状态写回
+                            // connected —— 页面于是永久停在「拨号中」，直到会话真的
+                            // 掉了才有下一轮写入。这里按当前代次重新确认一次。
+                            // 只在「状态不是 connected」时写，避免每轮往 steps 里堆条目。
+                            if st.state != DIAL_CONNECTED {
+                                let note = "会话仍在运行（连接参数未变），沿用现有数据呼叫";
+                                if modem.note_native_up(
+                                    modem.dial_epoch(),
+                                    &format!("native-{kind}"),
+                                    note,
+                                ) {
+                                    log::info!(
+                                        "原生拨号：模组 {id} 会话仍在运行，状态回写为已连接（重复拨号请求）"
+                                    );
+                                }
+                            }
                             match self.heal_due(id, s.started, link_ok) {
                                 None => return,
                                 Some(count) => {
