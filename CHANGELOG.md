@@ -68,18 +68,61 @@ up 失败、上次 reload 半途而废、用户手动 `ifdown` 都会留下这�
 写完、读之前又改一次」的次序错乱。现在票内连发，回读解析走与 `read_usbnet` 同一套
 `usbnet_from_resp`，并把缓存同步成回读值。
 
-**未采纳（需改变既有用户可见行为，留待决策）**：
+**修复 9（模组识别，Codex 评审）：回读不符时也先落缓存**。修复 8 把缓存写入放在
+「回读校验通过之后」，于是「写成功、回读不符」这条分支在 `return Err` 里直接返回，
+缓存 30 秒内仍是写之前的旧值 —— `GET /api/usbnet` 会报出一个模组已经不再使用的档位。
+现在缓存紧跟回读解析、早于校验：回读值就是设备真实状态，与目标不符时同样要落缓存。
+（PR #1 行内评论 `discussion_r4504716083`，核实成立。）
 
-- 拔卡后删除残留的 `modem<id>` / `modem<id>_6` 接口（上游 `netprov_sync.go` 会删）。
-  删除会丢掉用户在这些接口上的自定义选项，且 USB 抖动一次就重建会打断链路；
-  当前只在模组仍存在时对账。
-- 拨号门禁补「漫游 / 配额 / 飞行模式」硬拦截（上游 `hostDialStopReason`）。本仓库这三项
-  已在别处处置（配额走飞行开关），改成拨号器硬拒绝会改变现有用户的拨号时机。
-- 无法识别时清空型号（界面会从「旧型号」变成「未识别」）。属界面可见变化。
+**已采纳并落地（原「未采纳」三项，2026-11-08）**：
 
-**未验证**：以上改动只做了 `cargo test --lib`（764 项全绿）与编译检查；
+**1. 拔卡后清理残留接口（`modem<id>` / `modem<id>_6`）**。上游 `netprov_sync.go` 是
+「模组不在 + 设备不在 ⇒ 无条件 `uci -q delete network.<name>`」；本实现保留这两道保险，
+再加三道闸（`rust/src/netprov/cleanup.rs`）：
+
+- **生成记录比对**：`netprov_ifaces.json` 只记本程序写过的那些键（`MANAGED_KEYS`：
+  proto / device / metric / auto / force_link / mp_no_v6 / ipaddr 一组 / dns /
+  extendprefix / ip6addr）。UCI 现状多出的键（`mtu` / `ip6ifaceid` 等）、被改过的值、
+  被删掉的键，任一出现即判「用户动过」⇒ **保留接口**并记 info 日志（列出具体键）。
+  没有生成记录的老接口一律保留 —— 没有基线就判不出用户动没动。
+- **删除前留档**：完整选项追加到 `netprov_cleanup.json`（保留最近 20 条），同时把
+  **可直接粘贴执行的** `uci set network.<name>=interface` + 逐项 `uci set` + `uci commit`
+  片段打到 warn 日志 —— 两处都能回滚。
+- **抖动稳定判据**：连续 ≥ 4 轮（组网循环 ≤15s 一轮）**且**距第一次确认 ≥ 90 秒才删。
+  USB 复位 / 驱动重载 / 拨号器自愈重建会话都会让网卡短暂消失（上游注释记录 40~90 秒），
+  一轮就删会把正在恢复的接口拆掉。设备回来、模组回来、用户改过都会清零计数。
+- 防火墙 zone 的 `network` 列表同轮摘除；只对 `auto_wan` 打开且 `uci` 可用的环境生效。
+
+**2. 拨号门禁按停止原因细分（`[net] dial_gate`，默认 `off`）**。新增
+`rust/src/runtime/dialer/gate.rs`：有序判据对齐上游 `hostDialStopReason`
+（host_dial 关闭 → 拨号总开关关闭 → 漫游 → 飞行模式 → 手动断开 → 配额），
+结果写成稳定代码进 `DialState.stop_reason`（`host_dial_off` / `dial_disabled` /
+`roaming` / `airplane` / `manual_stop` / `quota`），前端与 ubus 按代码判断、
+不再靠匹配中文短句。三档 `off` / `roam` / `all`，**默认 `off` 与旧版行为一字不差**：
+
+- `off`：AT 路径整段跳过门禁（旧版只是静默不拨），原生路径仍走原有两条判据；
+- `roam`：加「国际漫游且 `allow_roaming=false`」（与界面「数据漫游」开关同源，
+  复用 `Modem::roam_view`，不会出现「页面说会被停、拨号器照拨」的分裂）；
+- `all`：再加飞行模式与流量配额（`AT+CFUN?` 与配额台账）。
+- 配置写错 / 空值一律归 `off` —— **写错不能变成更严的门禁**。
+- 事实查询带 60 秒缓存（只在对应档位才查，默认档一条 AT 都不多发）；
+  用户动开关（`reset_backoff` / `reset_backoff_all`）显式清缓存，避免「刚关飞行模式
+  仍被旧值拦」。查询失败（固件不支持）按「不拦」处理，只认确定命中。
+- AT 路径已连接的会话不在门禁里拆（拆会置 `manual_stop`，等于替用户做断开决定）；
+  门禁只拦「新发起的空拨」。
+
+**3. 识别不到型号时清空型号**。旧实现 `if !model.is_empty() { ... }` 让型号只升不降：
+换了另一台不在清单里的模组、或命令口被 `repoint` 指到别的设备后，页面一直显示上一台
+的名字，厂商方言也按旧型号解释。现在识别不出即写 `None`、记一条 warn，并**同时作废**
+`params` / `usbnet` / `mode` 缓存（`atplan::for_model` 与频段表都按型号取）。
+未识别标记沿用既有 `ident.matched_by = NoMatch`。**界面可见变化**：型号为空时
+LuCI 各处按 `m.model || '-'` / `|| 'MODEM'` 显示「未识别」占位，已核对为空值安全
+（`modules.js` 的 `m.model === selectedModel` 与 `loadPlan(m.model, …)` 同样不会因空值报错）。
+
+**未验证**：以上改动只做了 `cargo test --lib`（785 项全绿）与编译检查；
 未做镜像构建、未上真机跑 MBIM / QMI / 350 系列实拨，`force_link` 与补 `ifup`
-在 netifd 上的实际效果未回归。
+在 netifd 上的实际效果未回归；拔卡清理只在单测里验证了判定 / 留档 / 抖动窗口，
+**没有在真机上跑过 `uci delete` + `reload_network` 全流程**（本项误删代价高，需上机确认后再放宽）。
 
 ### 变更：移除 docs/ 文档集，仓库内不再维护文档
 
