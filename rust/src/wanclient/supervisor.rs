@@ -94,6 +94,15 @@ pub fn odhcp6c_argv(p: &Params) -> Vec<String> {
 }
 
 pub async fn run(params: Params) -> i32 {
+    // 0) 注册退出信号
+    //
+    // **必须先于任何子进程拉起**：netifd 只对它跟踪的那个 PID 发 TERM，进程若还没装着
+    // 信号处理，TERM 会按默认动作直接终止 modemd，`Supervisor::cleanup` 不会执行，
+    // udhcpc/odhcp6c 就成了占着网卡的孤儿（旧 shim 的 `trap` 也是挂在拉起客户端之前）。
+    // 注册之后即使 TERM 落在 `sleep(1s)` 之类未 poll 的窗口里，tokio 也会把它排队，
+    // 回到 `select!` 时立刻走清理路径。
+    let mut sig = super::signals::Signals::new();
+
     // 1) accept_ra 前置：必须在 odhcp6c 发第一个 RS 之前完成
     if params.fix_accept_ra {
         super::sysctl::fix_accept_ra(&params.iface);
@@ -143,8 +152,7 @@ pub async fn run(params: Params) -> i32 {
         sup.start_odhcp6c();
     }
 
-    // 5) 巡检 + 退出信号
-    let mut sig = super::signals::Signals::new();
+    // 5) 巡检 + 退出信号（信号已在步骤 0 注册）
     let mut ticker = interval_at(
         Instant::now() + Duration::from_secs(POLL_SECS),
         Duration::from_secs(POLL_SECS),
