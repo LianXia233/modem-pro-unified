@@ -11,6 +11,76 @@
 
 ## [未发布]
 
+### 变更：上游对照（模组识别 / 拨号 / 接口拉起）与八处健壮性修复
+
+**对照基线**（2026-11-08）。四条上游全部克隆到本地、逐文件逐逻辑比对，不以文件名判断：
+
+| 上游 | 本次比对的落点 |
+|:---|:---|
+| `ouyangzq/modem-pro`（Go 原版） | `module/kernel/hostdial*.go`、`data_write.go`、`netprov_wanup.go`、`netprov_sync.go`、`netprov_hoststatic.go`、`module/kernel/modem.go`、`usbids/usbids.go`、`netdev/ports.go` |
+| `ouyangzq/luci-proto-modem-pro` | `root/lib/netifd/proto/modem_pro.sh`、`root/usr/lib/modem-pro/mp-client.sh`（与本仓库 `files/` 逐行 diff） |
+| `FUjr/QModem`（shell） | `usr/share/qmodem/modem_dial.sh` 的 `check_dial_prepare` / 组网段、`qmodem_runtime.sh`、`etc/hotplug.d/usb/*` |
+| `6106757-lab/openvohive` | `pkg/mbim/connect.go`（MBIM 激活态语义） |
+
+**差异分类**（完整清单见 PR 描述）：
+
+- 本仓库**缺失**的上游处理：宿主拨号接口未下发 `force_link=1`（netifd 见「link is down」会把接口连网卡一起拆掉，网卡 down 后驱动不再上报 `link_state`，拨号器重拨成功也永远等不到载波；上游 `netprov_wanup.go:497-516` 有 FM160-CN 真机记录）；接口在 netifd 里**存在但 DOWN** 时没有幂等 `ifup`（上游 `:567-576`）；MBIM 激活态常量取错；换厂商时只清锁网/小区缓存、未清按方言解析出来的取值缓存。
+- 本仓库**自改偏差**：非 350 的 `wan_mode=both` 会建 v6 兄弟接口却仍让主接口跑 `odhcp6c`（同一条链路上两份 DHCPv6 客户端抢同一份 IA_NA）；同参数重复点「拨号」会让状态永久停在「拨号中」；断开命令失败时不再清理残留地址/路由；`AT+QCFG="usbnet"` 的写与回读分属两张调度票。
+- 本仓库**领先**上游：连接代次（epoch）+ RAII 三重护栏（`Starting` / `InFlight` / `Rescuing`）、v6 起不来时降级而不拖垮 v4、APN 四级回退、QMI client id 每条失败路径都释放、全部外部命令带超时、「零写入就不 reload」。
+
+**修复 1（拨号）：MBIM 激活态按 MBIM 规范判定**。`ACTIVATION_ACTIVATED` 早先写成
+`2` —— 那是 `activating`，`activated` 是 `1`（libmbim `MBIM_ACTIVATION_STATE_ACTIVATED = 1`；
+quectel-cm `mbim-cm.c`、`openvohive pkg/mbim/connect.go` 同样按 `1` 判激活）。后果是两个方向
+都错：设备回 `activating` 被当成「已建立」，真正 `activated` 反被判失败 —— 探活恒为 false，
+MBIM 会话反复重拨。现在 `CONNECT` 接受 `activated` 与 `activating`（设备常先回后者），
+探活把两者都算「活着」（真正的「没数据」由调度层的地址/载波检查兜底）。
+
+**修复 2（拨号）：重复拨号不再卡在「拨号中」**。`dial_inner` 在原生路径会先把状态写成
+`dialing` 并 bump 代次，然后交给协调器；协调器遇到「计划未变且会话仍活着」只走「掉线自愈」
+分支，没有第二个人把状态写回 `connected`，页面于是永久停在「拨号中」。现在该分支按当前
+代次补一次 `note_native_up`，且只在状态不是 `connected` 时写（避免每轮往 steps 里堆条目）。
+
+**修复 3（拨号）：断开失败也要清理残留**。`AT+CGACT=0` 报错时往往是「半拆」——承载没了、
+地址还挂在网卡上，流量继续往没有承载的网卡发（黑洞）。清理逻辑原在 `Ok` 分支内，失败分支
+一次都不执行；现在提到 `match` 之前，成功/失败都清，且只清这台模组自己的数据网卡。
+
+**修复 4（接口拉起）：宿主拨号接口写 `force_link=1`**。只对 QMI/MBIM（且 `[net] host_dial`
+开）的模组写，主接口与 v6 兄弟接口都写（兄弟接口绑 `@modem<id>`，主接口被拆时会跟着掉）。
+「需要就写 `1`，不需要时不清」——`force_link` 是 netifd 通用接口选项，用户可能自己加过。
+
+**修复 5（接口拉起）：主接口让出 `odhcp6c` 的判据与「是否建兄弟接口」同源**。
+`mp_no_v6` 原要求 `v6.dedicated`，而非 350 的 `both` 模式靠 `wants_dhcpv6_sibling()` 也会建
+dhcpv6 兄弟接口 —— 于是主接口照旧跑 `odhcp6c`，同一条链路上两份 DHCPv6 客户端抢地址。
+现在两者共用同一个 `has_sibling` 判据。
+
+**修复 6（接口拉起）：接口存在但 DOWN 时幂等补 `ifup`**。原逻辑只判断「UCI 是否已符合计划」，
+符合就整轮跳过 —— 接口存在却 `down=false` 时永远不会再被拉起（开机模组未就绪、proto 首次
+up 失败、上次 reload 半途而废、用户手动 `ifdown` 都会留下这种状态）。现在每轮对 `ifstatus`
+里 `"up": false` 的接口补一次 `ifup`（20 秒超时、同一接口 45 秒限速），避免把组网线程堵死。
+
+**修复 7（模组识别）：换厂商时作废取值缓存**。`params`（15s）/`usbnet`（30s）/`mode`（30s）
+是按厂商方言解析出来的，模组重新枚举换了厂商（或命令口被指到另一台设备）后仍会残留，
+页面表现为「取值对不上、档位列表是别人的」。上游 `module/kernel/modem.go` 换方言时同样把
+`probedCmds` / `lockProbed` / `modeEnum` 一并清掉。
+
+**修复 8（模组识别）：`usbnet` 的写与回读放进同一张调度票**。两条命令之间被页面查询、
+信号采样插队时，回读可能读到被切断的应答，误报「回读不符」；也可能出现「另一个写者在我
+写完、读之前又改一次」的次序错乱。现在票内连发，回读解析走与 `read_usbnet` 同一套
+`usbnet_from_resp`，并把缓存同步成回读值。
+
+**未采纳（需改变既有用户可见行为，留待决策）**：
+
+- 拔卡后删除残留的 `modem<id>` / `modem<id>_6` 接口（上游 `netprov_sync.go` 会删）。
+  删除会丢掉用户在这些接口上的自定义选项，且 USB 抖动一次就重建会打断链路；
+  当前只在模组仍存在时对账。
+- 拨号门禁补「漫游 / 配额 / 飞行模式」硬拦截（上游 `hostDialStopReason`）。本仓库这三项
+  已在别处处置（配额走飞行开关），改成拨号器硬拒绝会改变现有用户的拨号时机。
+- 无法识别时清空型号（界面会从「旧型号」变成「未识别」）。属界面可见变化。
+
+**未验证**：以上改动只做了 `cargo test --lib`（764 项全绿）与编译检查；
+未做镜像构建、未上真机跑 MBIM / QMI / 350 系列实拨，`force_link` 与补 `ifup`
+在 netifd 上的实际效果未回归。
+
 ### 变更：移除 docs/ 文档集，仓库内不再维护文档
 
 **原因**：文档与代码状态脱节（WebUI 退役、拨号器多次演进后，`docs/` 里的
