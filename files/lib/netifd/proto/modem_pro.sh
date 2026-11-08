@@ -4,7 +4,8 @@
 # 【为什么要这么写】
 # netifd 的 proto_run_command 对同一个接口是「设一条、覆盖前一条」，所以一个 proto
 # 只能跟踪一条常驻命令。官方因此把 IPv4 和 IPv6 拆成两张接口（dhcp + dhcpv6）。
-# 这里换一个思路：只起一个 wrapper（mp-client.sh），由它同时拉起
+# 这里换一个思路：只起一个 wrapper（mp-client.sh，实际逻辑在 Rust 的
+# `modemd wan-client`），由它同时拉起
 #     · udhcpc  -> 向模组内置的 DHCP 服务器取 IPv4 地址 / 默认路由 / DNS
 #     · odhcp6c -> 收模组的 RA / DHCPv6，取 IPv6 地址、默认路由与前缀
 # 两个客户端各自调用各自的上报脚本（mp-dhcp.script / mp-dhcpv6.script），
@@ -53,23 +54,11 @@ proto_modem_pro_init_config() {
 # 本机是转发设备（net.ipv6.conf.*.forwarding=1），这种情况下内核**忽略** accept_ra=1，
 # 结果就是永远只有 link-local —— 实测这台 Fibocom FM160-CN 的 IPv6 全靠 RA(SLAAC)，
 # 不开这个什么都拿不到。odhcp6c 会主动发 RS，所以这里是「发 RS 之前」设好即可。
-proto_modem_pro_fix_accept_ra() {
-	local dev="$1"
-	local f="/proc/sys/net/ipv6/conf/$dev/accept_ra"
-
-	[ -e "$f" ] || {
-		logger -t modem-pro "警告：$f 不存在（设备 $dev 还没起来？），跳过 accept_ra 设置"
-		return 0
-	}
-
-	[ "$(cat "$f" 2>/dev/null)" = "2" ] && return 0
-
-	if echo 2 > "$f" 2>/dev/null; then
-		logger -t modem-pro "已把 $dev 的 accept_ra 设为 2"
-	else
-		logger -t modem-pro "警告：$dev 的 accept_ra 设置失败，IPv6 可能只有 link-local"
-	fi
-}
+#
+# 具体写入已迁到 Rust（modemd wan-client 启动时、拉起 odhcp6c 之前）：
+#   rust/src/wanclient/sysctl.rs
+# 本脚本只负责**判定**要不要设，判定结果通过 MP_FIX_ACCEPT_RA 传下去 ——
+# proto handler 保持不含 sysctl 写入逻辑。
 
 # json_for_each_item 的回调（$1=值 $3=输出变量名）
 proto_modem_pro_add_prefix() {
@@ -82,7 +71,7 @@ proto_modem_pro_setup() {
 
 	local hostname clientid vendorid broadcast reqopts
 	local reqaddress reqprefix ip6prefix ip6prefixes ip6ifaceid soltimeout accept_ra extendprefix
-	local metric mtu zone opt mp_no_v6
+	local metric mtu zone opt mp_no_v6 fix_ra
 
 	json_get_vars hostname clientid vendorid broadcast reqopts
 	json_get_vars reqaddress reqprefix ip6prefix ip6ifaceid soltimeout accept_ra extendprefix
@@ -103,10 +92,11 @@ proto_modem_pro_setup() {
 	# 此时**不能**把 accept_ra 打开 —— 否则内核会在主网卡上自行 SLAAC 一份地址，
 	# 和兄弟接口的 odhcp6c 抢同一条链路，v6 接口反而可能一直空着。
 	NO_V6="${mp_no_v6:-0}"
+	fix_ra=""
 	if [ "$NO_V6" = "1" ]; then
 		logger -t modem-pro "接口 $interface 只跑 IPv4（mp_no_v6=1，IPv6 走独立 v6 接口）"
 	else
-		[ "$accept_ra" = "0" ] || proto_modem_pro_fix_accept_ra "$iface"
+		[ "$accept_ra" = "0" ] || fix_ra="1"
 	fi
 
 	local oopts=""
@@ -143,6 +133,7 @@ proto_modem_pro_setup() {
 	proto_export "MP_UOPTS=$uopts"
 	proto_export "MP_OOPTS=$oopts"
 	proto_export "MP_NO_V6=$NO_V6"
+	proto_export "MP_FIX_ACCEPT_RA=$fix_ra"
 	[ -n "$ip6prefixes" ] && proto_export "USERPREFIX=$ip6prefixes"
 	[ -n "$zone" ] && proto_export "ZONE=$zone"
 
