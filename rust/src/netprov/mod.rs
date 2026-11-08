@@ -215,6 +215,15 @@ pub struct PlannedIface {
     /// 只有 350 系列在「IPv6 交给 modem<id>_6」时会写：主接口继续用 modem_pro
     /// 取 v4，但 v6 必须由兄弟接口单独跑，避免两个 DHCPv6 客户端抢同一条链路。
     pub mp_no_v6: bool,
+    /// 给 netifd 写 `force_link=1`：链路抖动时不把接口连网卡一起拆掉。
+    ///
+    /// 只对**主机侧拨号**的模组（QMI / MBIM，且 `[net] host_dial` 开）由
+    /// provision 层置位。原因：这类网卡在拨号器建好数据呼叫之前没有载波，
+    /// netifd 见「link is down」会把接口（以及网卡）拉下来；网卡一 down，
+    /// 驱动就不再上报 link_state，于是拨号器重拨成功也永远等不到载波回来。
+    /// 上游 `module/kernel/netprov_wanup.go:497-516` 有 FM160-CN 的真机记录。
+    /// 模组自己跑 DHCP 的 ECM/RNDIS/NCM 不置位 —— 它们的载波是真的。
+    pub force_link: bool,
     /// 强制下发的 DNS（空格分隔；空 = 不写 `dns` 项）。
     ///
     /// 只对主接口有意义 —— DNS 跟着默认路由走，v6 兄弟接口不配 v4 DNS。
@@ -343,28 +352,35 @@ pub fn plan_wan(
         gateway = derive_gateway(&ipaddr).unwrap_or_default();
     }
     let name = iface_name(modem_id);
+    // 「要不要建 v6 兄弟接口」的唯一判据 —— 主接口让出 odhcp6c 的条件必须与它
+    // 同源，否则会出现「兄弟接口建了、主接口仍在跑 odhcp6c」的双客户端。
+    let has_sibling = v6.mode.wants_sibling()
+        && (v6.dedicated || mode.wants_dhcpv6_sibling() || proto == PROTO_STATIC);
     let mut ifaces = vec![PlannedIface {
         name: name.clone(),
         proto,
         device: device.trim().to_string(),
         metric,
         auto: true,
+        force_link: false,
         ipaddr,
         netmask,
         gateway,
         extendprefix: false,
         ip6addr: String::new(),
-        // 让出 odhcp6c 的前提是**真的有兄弟接口接手**：`wan_ipv6=off` 时不建兄弟接口，
-        // 主接口也不该留下一个没人接手的 mp_no_v6=1。
-        mp_no_v6: v6.dedicated && v6.mode.wants_sibling() && proto == PROTO_MODEM_PRO,
+        // 让出 odhcp6c 的前提是**真的有兄弟接口接手**（`has_sibling`，与下面
+        // 建兄弟接口的判据同源）：`wan_ipv6=off` 不建兄弟接口时，主接口也不该
+        // 留下一个没人接手的 mp_no_v6=1。
+        // 非 350 的 `wan_mode=both` 同样会建 dhcpv6 兄弟接口 —— 此时主接口若继续
+        // 跑 odhcp6c，就有两个 DHCPv6 客户端在同一条链路上抢地址（同一个 IA_NA
+        // 被两份客户端各要一次，轻则地址漂移、重则互相 release）。
+        mp_no_v6: proto == PROTO_MODEM_PRO && has_sibling,
         dns: String::new(),
     }];
     // 350 系列（`v6.dedicated`）必须建独立 v6 接口 —— **不再等 IPv4 地址**：
     // 主接口还是 modem_pro（模组还没上报 v4）时也建，v6 才不会因为「判断得太早」
     // 而永远缺席。此时主接口写 `mp_no_v6=1`，把 odhcp6c 让给兄弟接口。
-    if v6.mode.wants_sibling()
-        && (v6.dedicated || mode.wants_dhcpv6_sibling() || proto == PROTO_STATIC)
-    {
+    if has_sibling {
         let mut v6_mode = v6.mode;
         let mut ip6addr = String::new();
         // `static` 模式没有可用地址时退回 dhcpv6：写个没有地址的 static 接口
@@ -386,6 +402,7 @@ pub fn plan_wan(
             device: format!("@{name}"),
             metric,
             auto: true,
+            force_link: false,
             ipaddr: String::new(),
             netmask: String::new(),
             gateway: String::new(),
@@ -500,6 +517,8 @@ pub struct ExistingIface {
     pub ip6addr: String,
     /// 主接口的 `mp_no_v6`（`"1"` / 空）：350 系列把 v6 交给兄弟接口时写。
     pub mp_no_v6: String,
+    /// 已下发的 `force_link`（`"1"` / 空）。
+    pub force_link: String,
     /// 已下发的 DNS（空格分隔；用于 diff 对齐，避免每轮重复写）。
     pub dns: String,
     /// 已经在哪些防火墙 zone 里（zone 名，如 `wan`）。
@@ -580,6 +599,9 @@ pub fn diff_plan(
                     push_if_set(&mut ops, &p.name, "metric", &p.metric.to_string());
                 }
                 push_if_set(&mut ops, &p.name, "auto", if p.auto { "1" } else { "0" });
+                if p.force_link {
+                    push_if_set(&mut ops, &p.name, "force_link", "1");
+                }
                 if p.mp_no_v6 {
                     push_if_set(&mut ops, &p.name, "mp_no_v6", "1");
                 }
@@ -613,6 +635,12 @@ pub fn diff_plan(
                 let want_auto = if p.auto { "1" } else { "0" };
                 if e.auto != want_auto {
                     push_if_set(&mut ops, &p.name, "auto", want_auto);
+                }
+                // `force_link`：需要就写 `1`；不需要时**不清**。这个键是 netifd 的
+                // 通用接口选项，用户可能自己加过，本程序无权把它改回去（上游同样
+                // 只写不删）。清掉反而会在「主机侧拨号 + 载波未就绪」时把接口拆了。
+                if p.force_link && e.force_link != "1" {
+                    push_if_set(&mut ops, &p.name, "force_link", "1");
                 }
                 // `mp_no_v6`：350 系列把 v6 交给兄弟接口时必须写；不再需要时清掉，
                 // 否则主接口会一直少跑一个 odhcp6c（换了非 350 模组就会丢 v6）。
@@ -814,6 +842,67 @@ mod tests {
     }
 
     // ---------- 计划 ----------
+
+    #[test]
+    fn force_link_is_opt_in_and_never_unset() {
+        // 计划里要 force_link ⇒ 新建时写 1（QMI/MBIM 的网卡在拨号前没有载波，
+        // 不写这个 netifd 会把接口拆掉，之后再也不会自己起来）。
+        let mut plan = plan_wan(
+            2,
+            "qmi",
+            WanMode::ModemPro,
+            "wwan0",
+            V6Plan::off(),
+            20,
+            true,
+            "",
+        );
+        plan.ifaces[0].force_link = true;
+        let ops = diff_plan(&[], &plan, "wan", "firewall.wan");
+        assert_set(&ops, "modem2", "force_link", "1");
+
+        // 现状已经写着 ⇒ 不重复写（「零写入就不 reload」的前提）。
+        let existing = vec![ExistingIface {
+            name: "modem2".into(),
+            proto: PROTO_MODEM_PRO.into(),
+            device: "wwan0".into(),
+            metric: "20".into(),
+            auto: "1".into(),
+            force_link: "1".into(),
+            zones: vec!["wan".into()],
+            ..Default::default()
+        }];
+        let ops = diff_plan(&existing, &plan, "wan", "firewall.wan");
+        assert_no_set(&ops, "force_link");
+
+        // 计划不需要、现状还留着 ⇒ 也不清（通用接口选项，可能是用户自己加的）。
+        plan.ifaces[0].force_link = false;
+        let ops = diff_plan(&existing, &plan, "wan", "firewall.wan");
+        assert!(
+            !ops.iter()
+                .any(|o| matches!(o, UciOp::Unset { key, .. } if key == "force_link")),
+            "不应清掉用户自己的 force_link"
+        );
+    }
+
+    #[test]
+    fn mp_no_v6_yields_to_sibling_in_both_mode() {
+        // 非 350 的 `both` 模式也会建 v6 兄弟接口（dhcpv6）—— 主接口必须让出
+        // odhcp6c，否则两个 DHCPv6 客户端会在同一条链路上抢同一份 IA_NA。
+        let plan = plan_wan(
+            3,
+            "qmi",
+            WanMode::Both,
+            "wwan0",
+            V6Plan::of(V6Mode::Dhcpv6, "", true),
+            20,
+            true,
+            "",
+        );
+        assert_eq!(plan.ifaces.len(), 2, "both 模式应建 v6 兄弟接口");
+        assert!(plan.ifaces[0].mp_no_v6, "主接口应让出 odhcp6c");
+        assert!(!plan.ifaces[1].mp_no_v6);
+    }
 
     #[test]
     fn plan_modem_pro_is_single_iface() {
@@ -1447,10 +1536,7 @@ mod tests {
             },
         ];
         let ops = diff_plan(&cur, &dedicated, FIREWALL_ZONE, "firewall.wan");
-        assert!(
-            ops.is_empty(),
-            "形态已符合计划必须是零写入，实际: {ops:?}"
-        );
+        assert!(ops.is_empty(), "形态已符合计划必须是零写入，实际: {ops:?}");
 
         // 换回普通 modem_pro（不再 dedicated）：残留的 mp_no_v6 必须清掉，
         // 否则这个接口会永远少跑一个 odhcp6c，IPv6 直接消失。

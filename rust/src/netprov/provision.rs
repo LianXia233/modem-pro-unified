@@ -238,6 +238,20 @@ pub fn provision_modem_with(
         state.cfg.net.host_dial,
         &static_ipv4,
     );
+    // `force_link=1`：QMI/MBIM 的数据网卡要等主机侧拨号器建好数据呼叫才有载波，
+    // 而 netifd 一看到「link is down」就把接口连同网卡一起拉下来；网卡 down 后
+    // 驱动不再上报 link_state，于是永远等不到载波回来（上游
+    // `module/kernel/netprov_wanup.go:497-516` 的 FM160-CN 真机记录：接口卡在
+    // down，日志只剩 `link is down`）。上游做法是给这类接口写 `force_link=1`，
+    // 链路抖动时不拆接口，拨号器重拨上来后 netifd 立刻能重新取址。
+    // 只对主机侧拨号的模组写；ECM/RNDIS/NCM 由模组自己跑 DHCP，载波语义是真的。
+    // 主接口与 v6 兄弟接口都写 —— 兄弟接口绑的是主接口的设备（`@modem<id>`），
+    // 主接口被拆时它也会跟着掉。
+    if state.cfg.net.host_dial && crate::modem::model::dial::wan_host_dial_by_daemon(&usb.kind) {
+        for i in plan.ifaces.iter_mut() {
+            i.force_link = true;
+        }
+    }
     // 强制下发 DNS（`[net] wan_dns`，默认 `119.29.29.29 223.5.5.5 2402:4e00:: 2400:3200::1`）：
     // 只注入主接口，v6 兄弟接口不配 v4 DNS。蜂窝链路 DHCP 常拿不到 DNS（FM350 尤其如此），
     // 写进 network.modem<id>.dns 后 netifd 拉起接口即下发到 resolv.conf.auto。
@@ -286,7 +300,8 @@ pub fn provision_modem_with(
             let v6_iface = iface_name_v6(modem.id);
             if let Some(live) = v6::iface_live(&v6_iface) {
                 if v6::maybe_rekick(&v6_iface, v6_mode, live) {
-                    rep.skipped.push(format!("{v6_iface} 无全局 IPv6，已重新拉起"));
+                    rep.skipped
+                        .push(format!("{v6_iface} 无全局 IPv6，已重新拉起"));
                 }
             }
         }
