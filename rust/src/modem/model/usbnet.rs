@@ -198,6 +198,11 @@ impl Modem {
         // 回读必须是同一票里拿到的那条应答：走缓存会读到写之前的值，
         // 然后误报「回读不符」。
         let st = self.usbnet_from_resp(&readback);
+        // 缓存**先**同步成回读值：回读是设备的真实状态，与目标不符时同样要落缓存。
+        // 否则写成功但回读不符的分支会在下面的 `return Err` 里直接返回，缓存里
+        // 30 秒内仍是写之前的旧值 —— `GET /api/usbnet` 反而报出一个模组已经不
+        // 再使用的档位（Codex review on PR #1 指出，确为本实现遗漏）。
+        self.usbnet_cache.set(st.clone());
         if st.value != value.to_string() {
             return Err(msg(format!(
                 "已下发但回读为 {}{}（目标 {value}）",
@@ -209,9 +214,6 @@ impl Modem {
                 }
             )));
         }
-        // 缓存同步成回读值：否则接下来 30 秒内页面读到的还是写之前的旧值，
-        // 用户会以为「点了没生效」。
-        self.usbnet_cache.set(st.clone());
         Ok(st)
     }
 }
