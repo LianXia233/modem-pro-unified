@@ -47,6 +47,7 @@
 //! （路由器上装没装 `luci-proto-modem-pro`），本仓库没有这个开关 ——
 //! 协议脚本 `files/lib/netifd/proto/modem_pro.sh` 随本包一起安装，视为恒真。
 
+pub mod cleanup;
 pub mod provision;
 pub mod route;
 pub mod uci;

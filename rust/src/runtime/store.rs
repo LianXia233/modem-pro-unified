@@ -587,6 +587,19 @@ pub fn schedule_file(config_path: &str) -> String {
     sibling_file(config_path, "schedule.json")
 }
 
+/// 由配置文件路径推出 `netprov_ifaces.json`（本程序生成过的 WAN 接口记录）。
+///
+/// 用途见 [`crate::netprov::cleanup`]：拔卡后判断「残留的 `modem<id>` 是不是
+/// 本程序生成、用户有没有改过」，没记录就不删。
+pub fn netprov_ifaces_file(config_path: &str) -> String {
+    sibling_file(config_path, "netprov_ifaces.json")
+}
+
+/// 由配置文件路径推出 `netprov_cleanup.json`（被删接口的留档，可回滚）。
+pub fn netprov_cleanup_file(config_path: &str) -> String {
+    sibling_file(config_path, "netprov_cleanup.json")
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct SchedFile {
     version: i64,

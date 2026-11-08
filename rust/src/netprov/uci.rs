@@ -14,7 +14,7 @@
 //!
 //! | 调用 | 会动什么 |
 //! | --- | --- |
-//! | [`read_existing`] / [`parse_existing`] | **只读**，fork 两条 `uci show` |
+//! | [`read_now`] / [`parse_existing`] | **只读**，fork 两条 `uci show` |
 //! | [`interface_loaded`] | **只读**，fork 一条 `ifstatus` |
 //! | [`apply`] | **写** `/etc/config/network` 与 `/etc/config/firewall`（set × N + commit × 2） |
 //! | [`reload_network`] | **重建接口**，可能触发 DHCP、短暂断网 |
@@ -144,22 +144,37 @@ fn run(args: &[&str]) -> Result<String> {
     )))
 }
 
-/// 读 `network` + `firewall` 的现状（**只读**，fork 两条 `uci show`）。
+/// 读一次现状得到的完整结果（见 [`read_now`]）。
 ///
-/// 第二个返回值是**zone 名 → section 路径**（如 `wan` → `firewall.@zone[1]`）。
+/// 为什么要带上 `net_text` 原文：清理残留接口（`netprov::cleanup`）需要
+/// **全量选项**（用户自己加的 `mtu` / `ip6ifaceid` 也要看到），而
+/// [`ExistingIface`] 只保留本程序关心的已知键。同一份输出解析两遍，
+/// 比再 fork 一条 `uci show network` 便宜。
+pub struct NetworkNow {
+    /// 本程序关心的已知键（组网 diff 用）。
+    pub existing: Vec<ExistingIface>,
+    /// zone 名 → 真实 section 路径（`wan` → `firewall.@zone[1]`）。
+    pub zone_sections: std::collections::HashMap<String, String>,
+    /// `uci show network` 原文（清理判定用，见 `cleanup::parse_sections`）。
+    pub net_text: String,
+}
+
+/// 读一次现状（两条 `uci show`）。
 ///
 /// ⚠️ 不能假设 section 名就等于 zone 名：实机（ImmortalWrt 默认配置）的 wan zone 是
 /// **匿名 section** `firewall.@zone[1]`，`name='wan'` 只是它的一个选项 ——
 /// 拿 `firewall.wan.network` 去 `add_list` 会报 `Invalid argument`（实测踩过）。
 /// 上游同样要处理这个（依据 QModem `modem_dial.sh:690-708`：数字形式的 zone 名
 /// 要还原成 `firewall.@zone[N]` 才能写）。
-pub fn read_existing() -> Result<(
-    Vec<ExistingIface>,
-    std::collections::HashMap<String, String>,
-)> {
+pub fn read_now() -> Result<NetworkNow> {
     let net = run(&["show", "network"])?;
     let fw = run(&["show", "firewall"])?;
-    Ok(parse_existing(&net, &fw))
+    let (existing, zone_sections) = parse_existing(&net, &fw);
+    Ok(NetworkNow {
+        existing,
+        zone_sections,
+        net_text: net,
+    })
 }
 
 /// netifd 里到底有没有这个接口（`ifstatus <name>` 退出码为 0）。

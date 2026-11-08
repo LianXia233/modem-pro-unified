@@ -100,7 +100,7 @@ impl ReportStore {
 
 /// 给一个模组做组网（有改动才落盘）。
 pub fn provision_modem(state: &AppState, modem: &Modem) -> AutoWanReport {
-    let Ok((existing, zone_sections)) = uci::read_existing() else {
+    let Ok(now) = uci::read_now() else {
         // 读不到现状就没法 diff；这一层不做「猜着建」这种事
         let mut rep = AutoWanReport {
             at: crate::logging::rfc3339(crate::logging::unix_now()),
@@ -111,7 +111,8 @@ pub fn provision_modem(state: &AppState, modem: &Modem) -> AutoWanReport {
         rep.skipped.push("读 UCI 失败".into());
         return rep;
     };
-    provision_modem_with(state, modem, &existing, &zone_sections)
+    let sections = super::cleanup::parse_sections(&now.net_text);
+    provision_modem_with(state, modem, &now.existing, &now.zone_sections, &sections)
 }
 
 /// 同上，但 `existing` 由调用方提供（一轮里多个模组共用一次 `uci show`）。
@@ -123,6 +124,7 @@ pub fn provision_modem_with(
     modem: &Modem,
     existing: &[ExistingIface],
     zone_sections: &std::collections::HashMap<String, String>,
+    sections: &[super::cleanup::RawSection],
 ) -> AutoWanReport {
     let mut rep = AutoWanReport {
         at: crate::logging::rfc3339(crate::logging::unix_now()),
@@ -377,6 +379,10 @@ pub fn provision_modem_with(
             V6Mode::Ra => v6::maybe_resolicit(v6_mode, &device),
             _ => {}
         }
+        // 现状已与计划一致 ⇒ 这仍是「我们生成的那份」：把生成记录刷新成计划口径。
+        // 记录只含本程序会写的键（见 `cleanup::MANAGED_KEYS`），用户自己加的
+        // `mtu` / `ip6ifaceid` 永远进不去 —— 它们是拔卡后「用户改过，别删」的依据。
+        remember_generated(state, modem.id, &plan, &[], existing, sections);
         rep.skipped.push("UCI 已符合计划，无改动".into());
         return rep;
     }
@@ -394,6 +400,8 @@ pub fn provision_modem_with(
     );
     match uci::apply(&ops) {
         Ok(_) => {
+            // 写成功才更新生成记录：失败时保留旧记录，下一轮还会重试。
+            remember_generated(state, modem.id, &plan, &ops, existing, sections);
             // 改完 UCI 要 reload 才生效；失败不影响已写入的配置
             if let Err(e) = uci::reload_network() {
                 log::warn!(
@@ -413,6 +421,43 @@ pub fn provision_modem_with(
         }
     }
     rep
+}
+
+/// 刷新「生成记录」：本程序写过哪些接口、每个接口当时写了什么。
+///
+/// 拔卡后要不要清残留接口，全靠这份记录（见 [`super::cleanup`]）。只记**归我们**的接口：
+///
+/// - 已存在 ⇒ 必须 [`super::is_ours`] 成立（用户手起的 `modem1`（pppoe）绝不能被认领，
+///   否则拔卡时会被当成「本程序生成的」删掉）；
+/// - 不存在 ⇒ 必须本轮有 `Create` 操作（diff 没建就没得记）。
+fn remember_generated(
+    state: &AppState,
+    modem_id: u32,
+    plan: &super::WanPlan,
+    ops: &[UciOp],
+    existing: &[ExistingIface],
+    sections: &[super::cleanup::RawSection],
+) {
+    let by_name: std::collections::HashMap<&str, &super::cleanup::RawSection> =
+        sections.iter().map(|s| (s.name.as_str(), s)).collect();
+    for i in &plan.ifaces {
+        let current = by_name.get(i.name.as_str()).map(|s| &s.options);
+        let ours = match current {
+            Some(_) => existing
+                .iter()
+                .find(|e| e.name == i.name)
+                .map(super::is_ours)
+                .unwrap_or(false),
+            None => ops
+                .iter()
+                .any(|o| matches!(o, UciOp::Create { section } if section == &i.name)),
+        };
+        if !ours {
+            continue;
+        }
+        let rec = super::cleanup::record_from(current, i, modem_id);
+        state.iface_ledger.put(&i.name, rec);
+    }
 }
 
 /// 各模组最近一次计划里选中的**数据网卡**（模组 id → 网卡名）。
@@ -549,13 +594,24 @@ pub(crate) fn qmap_mode(name: &str) -> i64 {
 /// 接口用户自己建，拨号器还是 modemd 托管）。
 pub fn run_once(state: &AppState) {
     if state.cfg.net.auto_wan && uci::available() {
-        match uci::read_existing() {
-            Ok((existing, zone_sections)) => {
-                for modem in state.mgr.all() {
+        match uci::read_now() {
+            Ok(now) => {
+                let sections = super::cleanup::parse_sections(&now.net_text);
+                let modems = state.mgr.all();
+                // 「模组还在」的判据用「管理器里存在」，不看 `is_running`：
+                // 模组在但没人查过 AT 时接口仍然属于它，删了会误伤。
+                let live: std::collections::HashSet<u32> = modems.iter().map(|m| m.id).collect();
+                for modem in &modems {
                     if !modem.is_running() {
                         continue;
                     }
-                    let rep = provision_modem_with(state, &modem, &existing, &zone_sections);
+                    let rep = provision_modem_with(
+                        state,
+                        modem,
+                        &now.existing,
+                        &now.zone_sections,
+                        &sections,
+                    );
                     if !rep.skipped.is_empty() && rep.applied.is_empty() {
                         // 什么都没做：debug 就够（已配好 是常态）
                         log::debug!(
@@ -566,6 +622,9 @@ pub fn run_once(state: &AppState) {
                     }
                     state.netprov.put(rep);
                 }
+                // 拔卡后的残留接口清理：只清「有生成记录 + 设备确实不在 + 用户没改过」的，
+                // 判据与留档见 `netprov/cleanup.rs`（上游对应 `netprov_sync.go` 的 sweep）。
+                super::cleanup::sweep(state, &live, &now.existing, &sections, &now.zone_sections);
             }
             Err(e) => {
                 log::warn!("自动组网：读不到 UCI 现状（network / firewall），本轮跳过: {e}")
