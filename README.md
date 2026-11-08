@@ -4,7 +4,7 @@
 
 **适用于 OpenWrt 的新一代 5G/LTE 蜂窝模组一体化管控中心 · 原生 Rust 守护进程 · 覆盖 13 家厂商 92 款型号**
 
-[![Version](https://img.shields.io/badge/Version-v1.0.8--1-blue?style=flat-square&logo=git&logoColor=white)](VERSION)
+[![Version](https://img.shields.io/badge/Version-v1.1.0--1-blue?style=flat-square&logo=git&logoColor=white)](VERSION)
 [![Daemon](https://img.shields.io/badge/Daemon-Rust%20modemd-DEA584?style=flat-square&logo=rust&logoColor=white)](rust/)
 [![Dialer](https://img.shields.io/badge/Dialer-Built--in%20QMI%20%7C%20MBIM-orange?style=flat-square)](#-自研原生-qmimbim-拨号器)
 [![Vendors](https://img.shields.io/badge/Vendors-13%20Brands%20%7C%2092%20Models-success?style=flat-square)](#-支持厂商与型号生态)
@@ -38,7 +38,7 @@
 | 📱 **二级单入口 + 优雅横滚 TAB** | 侧边栏收敛为单一入口（`移动网络 → 5G 终端`），杜绝菜单树冗余；页内 TAB 栏支持鼠标滚轮横滚、平滑微调与触控滑动手势。 |
 | 📡 **动态矢量 SVG 信号量程系统** | 5 档天线信号条真实对接 3GPP 国际评级规范；RSRP / SINR / RSRQ / RSSI 4 宫格物理量程 SVG 进度刻度槽实时驱动。 |
 | 🔄 **全生命周期自愈与重拨协调器** | AT 指令与 QMI/MBIM 会话共用意图、状态机、退避与连接代次的单一协调器；插拔、异常闪退、飞行模式与配额断网均可自动平滑回收与自愈重拨。 |
-| 🧪 **794 项自动化用例保驾护航** | 拥有 794 项严格的 Rust 单元测试与回归测试（`cargo test --locked`），将厂商方言解析、端口规则与状态机逻辑逐条钉死。 |
+| 🧪 **808 项自动化用例保驾护航** | 拥有 808 项严格的 Rust 单元测试与回归测试（`cargo test --locked`），将厂商方言解析、端口规则与状态机逻辑逐条钉死。 |
 
 ---
 
@@ -188,7 +188,7 @@ modem-pro-unified/
 ├── packaging/                  # procd 启动脚本与安装后脚本
 ├── scripts/                    # 开发与敏感信息检查辅助脚本
 ├── Makefile                    # 顶层 OpenWrt 编译规则定义
-├── VERSION                     # 统一版本号声明 (1.0.8-1)
+├── VERSION                     # 统一版本号声明 (1.1.0-1)
 └── README.md                   # 项目说明文档
 ```
 
