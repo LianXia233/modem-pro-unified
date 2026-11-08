@@ -98,7 +98,7 @@ endif
 #   · netifd：modem_pro 协议脚本（files/lib/netifd/proto/modem_pro.sh）的宿主
 #   · wwan / usbutils：拨号与 USB 设备枚举（/api/usb、AT 口探测）
 #   · kmod-*：QMI / MBIM / RNDIS / ECM 数据面与 USB 串口（AT 口）驱动
-#   · odhcp6c：mp-client.sh 里的 DHCPv6 客户端（IPv6 前缀获取）
+#   · odhcp6c：`modemd wan-client` 里的 DHCPv6 客户端（IPv6 前缀获取）
 define Package/modem-pro
   SECTION:=net
   CATEGORY:=Network
