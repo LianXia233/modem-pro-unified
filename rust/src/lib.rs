@@ -11,6 +11,7 @@
 //!   · `http`     —— 服务器 / 路由 / 请求 / 响应 / 鉴权 / handlers
 //!   · `runtime`  —— PID / 信号 / 拨号器回收 / 后台巡检
 //!   · `wechat`   —— 企业微信推送（纯逻辑 + curl 传输 + 运行期状态）
+//!   · `wanclient` —— netifd 接口拉起的子命令（原 `mp-client.sh`，Tokio 监管 udhcpc/odhcp6c）
 
 pub mod cli;
 pub mod config;
@@ -22,6 +23,7 @@ pub mod netprov;
 pub mod runtime;
 pub mod ubus;
 pub mod version;
+pub mod wanclient;
 pub mod wechat;
 
 use std::sync::Arc;

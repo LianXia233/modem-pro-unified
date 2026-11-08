@@ -9,6 +9,9 @@
 #   · log           —— 日志门面（简单落盘实现见 src/logging.rs）
 #   · ctrlc         —— SIGTERM/SIGINT：退出前收干净主机侧拨号器
 #   · sha1/base64   —— WebSocket 握手（同端口推送 /ws、/display/ws）
+#   · tokio         —— 仅用于 `modemd wan-client` 子命令（netifd 接口拉起的进程监管），
+#                      用 current_thread 运行时，**不改造**上面同步的 HTTP 主循环
+#   · libc          —— wan-client 在 unix 上做 kill()/SIGTERM；Windows 不引入
 #
 # ⚠️ 版本号不在本文件里维护：发布版本以仓库根目录 VERSION 为唯一来源，
 #    打包时由顶层 Makefile 以环境变量 MODEMD_VERSION 注入（见 src/version.rs）。
@@ -45,3 +48,14 @@ ctrlc = "3"
 sha1 = "0.10"
 base64 = "0.22"
 qrcode = { version = "0.14", default-features = false }
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "time",
+    "process",
+    "signal",
+    "macros",
+    "sync",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
