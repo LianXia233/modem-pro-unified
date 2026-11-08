@@ -249,6 +249,14 @@ pub struct DialState {
     /// 若 `kind=qmi` 而 `backend` 为空，说明会话还没建（或不由本程序管）。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub backend: String,
+    /// 这一轮为什么没拨 / 为什么被停（稳定代码，见 [`crate::runtime::dialer::gate`]）：
+    /// `host_dial_off` / `dial_disabled` / `roaming` / `airplane` / `manual_stop` / `quota`。
+    ///
+    /// 与 `last_error` 的分工：`last_error` 是短信式的说明（含文本），本字段是给
+    /// 前端与 ubus 做**判断**用的 —— 例如只有 `manual_stop` 才该阻止自动重拨，
+    /// 不能靠匹配中文短句。空 = 没有被策略停过（正常连接/重试中）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stop_reason: String,
 }
 
 impl DialState {
@@ -2136,6 +2144,7 @@ impl Modem {
             s.last_error = String::new();
             s.backend = backend.to_string();
             s.manual_stop = false; // 后端在跑会话 = 用户没在断开
+            s.stop_reason.clear(); // 跑起来了：上一次「为什么没拨」的结论已失效
             s.steps.push(DialStep {
                 name: "主机侧数据呼叫已建立".into(),
                 ok: true,
@@ -2169,24 +2178,33 @@ impl Modem {
         true
     }
 
-    /// 会话被**策略**停掉（拨号总开关关闭 / host_dial 关闭）：状态落到 disconnected。
+    /// 会话被**策略**停掉（拨号总开关关闭 / host_dial 关闭 / 门禁命中）：状态落到 disconnected。
     ///
     /// 与 [`Self::note_external_break`] 的区别：那个是「马上会重拨」（dialing），
     /// 这个是「按你的要求不再拨」，所以停在 disconnected，且**不置** manual_stop
     /// （开关关着本来就由 `auto_connect_allowed` 拦住，无需伪装成用户断开）。
-    pub(crate) fn note_stopped(&self, why: &str) {
+    ///
+    /// `code` 是稳定原因代码（见 `runtime::dialer::gate`），`why` 是给人看的说明。
+    /// 原因没变且已经是 disconnected 时**不重复写**：协调器每 15 秒一轮，重复写
+    /// 会把 `steps` 撑成几百条同文条目，页面日志没法看。
+    pub(crate) fn note_stopped(&self, code: &str, why: &str) {
         self.dial_update(|s| {
+            let unchanged = s.stop_reason == code && s.state == DIAL_DISCONNECTED;
             if s.state == DIAL_CONNECTED || s.state == DIAL_DIALING {
                 s.state = DIAL_DISCONNECTED.to_string();
                 s.state_text = dial_state_text(DIAL_DISCONNECTED);
                 s.connected_at = String::new();
                 s.backend = String::new();
             }
+            if unchanged {
+                return;
+            }
+            s.stop_reason = code.to_string();
             s.last_error = why.to_string();
             s.steps.push(DialStep {
                 name: "连接已停止".into(),
                 ok: true,
-                info: why.to_string(),
+                info: format!("{why}（{code}）"),
                 at: rfc3339(unix_now()),
             });
         });
@@ -2427,6 +2445,7 @@ impl Modem {
             s.last_error = String::new();
             s.steps = Vec::new();
             s.manual_stop = false; // 手动/自动拨号都会走到这里：用户以前的「断开」到此作废
+            s.stop_reason.clear(); // 新的一轮：上一次门禁结论不再适用
         });
 
         // ① 写入 APN（可选：留空表示沿用模组里已有的配置）
@@ -2809,6 +2828,7 @@ impl Modem {
                 s.connected_at = String::new();
                 s.last_error = String::new();
                 s.manual_stop = true; // 尊重「人」的断开
+                s.stop_reason = "manual_stop".to_string(); // 门禁判据同口径：用户断开
                 s.backend = String::new();
                 s.steps = vec![DialStep {
                     name: "断开数据连接（停止主机侧拨号器）".into(),
@@ -2868,6 +2888,7 @@ impl Modem {
                     s.connected_at = String::new();
                     s.last_error = String::new();
                     s.manual_stop = true; // 尊重「人」的断开
+                    s.stop_reason = "manual_stop".to_string();
                     s.backend = String::new();
                     s.steps = vec![DialStep {
                         name: "断开数据连接（模组自持会话）".into(),
@@ -2914,6 +2935,7 @@ impl Modem {
             s.connected_at = String::new();
             s.last_error = String::new();
             s.manual_stop = true; // 是「人」断的：自动组网不要再替他把链路上拉
+            s.stop_reason = "manual_stop".to_string();
             s.backend = String::new();
             s.steps = vec![DialStep {
                 name: format!("断开数据连接（{last_ok}）"),

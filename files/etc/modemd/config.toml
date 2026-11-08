@@ -80,6 +80,21 @@ dial_enabled = true
 # ⚠️ 保持 true 意味着国际漫游时照常走流量，请按资费情况设置。
 allow_roaming = true
 
+# 拨号门禁等级（2026-11-08 新增）。对照上游 hostdial 的 `hostDialStopReason`
+# —— 上游在拨号前用一组**有序判据**决定「这一轮为什么不该拨」，并把原因回写状态。
+# 本项决定启用其中几档，**默认 off，与旧版行为一字不差**：
+#   "off"  —— 只保留原有两条判据（拨号总开关关闭、用户手动断开）；
+#   "roam" —— 在上面的基础上再加「国际漫游且 allow_roaming=false」；
+#   "all"  —— 再加「飞行模式开启」与「流量配额已用尽」。
+#   （也认 roaming / full / strict 等别名；认不出的值一律按 off —— 配置写错
+#     只会让门禁更宽松，绝不会变成更严的门禁把用户的网拦掉。）
+# 判定结果写进拨号状态的 `stop_reason`（稳定代码，供前端与 ubus 判断，
+# 不要靠匹配中文短句）：host_dial_off / dial_disabled / roaming / airplane /
+# manual_stop / quota。空 = 没被策略停过。
+# ⚠️ 不改变拨号时机的前提是保持 off；改成 roam / all 会真的拦住已经通过
+#    原有判据的拨号（这正是本项存在的意义，但请先确认资费与场景）。
+dial_gate = "off"
+
 # 连续拨号失败后的自愈复位（**默认关**，对照上游 hostdial 的 reset_before_dial）。
 # 内置拨号器对同一模组**连续** `reset_after_fails` 次失败（固定 5 次，指 QMI/MBIM
 # 原生路径）后，发 `AT+CFUN=1,1` 把模组重启一次 —— 典型场景：QMI 会话被强拆后
