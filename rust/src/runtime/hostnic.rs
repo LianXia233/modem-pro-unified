@@ -195,6 +195,11 @@ pub fn normalize_plan(p: &HostNicPlan) -> HostNicPlan {
 /// 真正的网段/网关只有模组那份配置知道，所以这份值在页面上**可改**。
 pub fn suggest_plan(modem_ip: &str) -> Option<HostNicPlan> {
     let o = parse_v4(modem_ip)?;
+    // 语义说明（C-21）：本函数面向「模组当网关」的场景（RNDIS/ECM，模组自己持有
+    // 上报地址、主机旁挂一个同网段地址），所以主机取 .2、网关取模组地址。
+    // 自动组网（netprov）走的是另一条路径：FM350/QMI raw_ip 的点对点 static 把
+    // **模组上报地址直接配在主机网卡上**，网关由地址派生（.1/.254）。
+    // 两条路径不应对同一张网卡先后套用；页面也按场景分开给出建议。
     // 同网段里最后一个字节取 2：避开 .0 / .1（网络号与常见网关）
     let mut last: u8 = 2;
     if o[3] == 2 {
