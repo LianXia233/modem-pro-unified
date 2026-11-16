@@ -9,7 +9,13 @@
 > `SUPPORT_MATRIX.md` / `DIAL_STATE_MACHINE.md`）**均只是历史记录**，
 > 不得作为当前设计依据；当前事实以源码、`config.toml` 注释与 git 历史为准。
 
-## [未发布]
+## [1.2.0] - 2026-11-17
+
+本版是 **v1.1.0 之后的全量审查修复版**：按「模块识别 → 拨号 → 接口拉起 → IPv4/IPv6 取址 → APN
+自动拨号」逐链路审查并对照六个上游（QModem、ouyangzq/modem-pro、luci-proto-modem-pro、
+luci-app-fm350、luci-app-mt5700、openvohive），修复 91 条审计问题（2 P0 / 26 P1 / 63 P2），
+再补一轮并发/进程健壮性与 PR 审查发现。前端契约（ROUTES、`{code,msg,data}` 信封、WS 帧格式、
+`X-Real-IP` 鉴权模型）零改动；未做 Tokio 迁移（属架构改动，单独 PR）。逐条细节见下方各条目。
 
 ### 全量审查修复：模块识别 / 拨号 / 接口拉起 / V4·V6 取址 / APN 自动拨号 + 并发健壮性 (2026-11-16)
 

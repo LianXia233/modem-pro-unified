@@ -188,7 +188,7 @@ modem-pro-unified/
 ├── packaging/                  # procd 启动脚本与安装后脚本
 ├── scripts/                    # 开发与敏感信息检查辅助脚本
 ├── Makefile                    # 顶层 OpenWrt 编译规则定义
-├── VERSION                     # 统一版本号声明 (1.1.0-1)
+├── VERSION                     # 统一版本号声明 (1.2.0-1)
 └── README.md                   # 项目说明文档
 ```
 
