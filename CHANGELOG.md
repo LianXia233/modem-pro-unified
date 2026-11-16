@@ -11,6 +11,20 @@
 
 ## [未发布]
 
+### 修复：LuCI 调试工具「预设 AT 命令」下拉为空 (2026-11-17)
+
+- `luci/app/js/view/modemd/tools.js`：AT 调试台的「常用指令预设」下拉此前把
+  `presets.map(...)`（数组）作为外层 children 数组的**一个元素**传给 `E()`，形成嵌套数组。
+  LuCI 的 `E()` 即 `L.dom.create()`，其 `append()` 只展开一层 children：元素若还是数组，
+  会被当成文本节点 `createTextNode(\`${child}\`)`（渲染成 `[object Object],…`）而非 `<option>`，
+  于是下拉只剩占位项，表现为「预设 AT 命令不显示」。改为 `[ 占位项 ].concat(presets.map(...))`
+  展平成单层数组后，预设指令正常渲染为选项。
+- 全仓复核：这是唯一一处把 `.map()` 结果嵌套进外层 children 数组的写法；其余 20 处
+  `.map(function …)` 均作为 `E()` 的第三个直接参数（单层数组），不受影响。后端
+  `/api/at/presets` handler 与 `presets_for()` 的厂商合并逻辑本身正常，前后端 API 路径
+  差集为空，未改动后端。
+- 仅改前端渲染 + 本日志；`VERSION`、`config.toml` 与 Rust 源码均未改动。
+
 ### 构建流水线：GitHub Actions 统一升级至 Node 24 运行时 (2026-11-12)
 
 - `.github/workflows/build.yml`：「检出仓库（读产物日志）」的 `actions/checkout@v4` 升级到 `v7`；

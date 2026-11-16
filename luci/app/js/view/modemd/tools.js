@@ -295,12 +295,17 @@ return view.extend({
 							'change': function (ev) {
 								if (ev.target.value) document.getElementById('at-cmd-in').value = ev.target.value;
 							}
-						}, [
-							E('option', { 'value': '' }, '— 选择厂商与标准预设指令 —'),
+						}, [ E('option', { 'value': '' }, '— 选择厂商与标准预设指令 —') ].concat(
+							/* ⚠️ LuCI 的 E() = L.dom.create()，其 append() 只展开**一层** children
+							   数组：数组里的元素若还是数组，会被当成文本节点
+							   createTextNode(`${child}`)，渲染成 "[object Object],..." 而不是 <option>。
+							   所以这里必须用 concat 把预设项**展平成单层**数组再传给 E()，
+							   不能把 presets.map(...) 作为外层数组的一个元素嵌进去 —— 否则下拉
+							   只剩占位项，用户看到的就是「预设 AT 命令不显示」。 */
 							presets.map(function (p) {
 								return E('option', { 'value': p.cmd || p }, (p.group ? '[' + p.group + '] ' : '') + (p.desc || p.label || p.cmd || p) + ' (' + (p.cmd || p) + ')');
 							})
-						])
+						))
 					]),
 					/* 指令输入栏 */
 					E('div', { 'style': 'display:flex;gap:8px;margin-bottom:12px' }, [
