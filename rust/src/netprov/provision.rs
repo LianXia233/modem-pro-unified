@@ -358,6 +358,17 @@ pub fn provision_modem_with(
         .cloned()
         .unwrap_or_else(|| format!("firewall.{zone}"));
     let ops: Vec<UciOp> = diff_plan(existing, &plan, &zone, &zone_section);
+    // B-P2-7 的另一面：用户点过「断开」后，会话已拆，QMI raw_ip / 350 的会话
+    // 地址取不到 ⇒ `static_ipv4` 为空 ⇒ `plan_wan` 把主接口翻回 dhcp/modem_pro，
+    // diff 于是非空。若照常 apply + reload，等于把用户刚断开的连接重新拉起来
+    // （接口 auto=1 + force_link=1，reload 改 proto 即重拉）。此时**任何 UCI 改动
+    // 都不下发**：保持现状，等用户再点「拨号」恢复后下一轮自然套上 —— 配置类
+    // 改动（DNS/MTU/模式）只被推迟，不会丢。
+    if !ops.is_empty() && modem.manual_stopped() {
+        rep.skipped
+            .push("用户已断开（manual_stop），不下发 UCI 改动，保持现状".into());
+        return rep;
+    }
     // v6 的「落地动作」（RA / static 默认路由 / 重新要地址）必须以**计划里真的
     // 有 v6 接口**为前提：默认 modem_pro 模式下没有兄弟接口时，地址无处落地，
     // 再跑这些副作用只会制造 netifd 之外的路由和双份 RA 处理。
@@ -365,7 +376,11 @@ pub fn provision_modem_with(
     if ops.is_empty() {
         // 已配好：一条都不出。但 **netifd 里可能还没加载**（上一次 reload 失败、
         // 进程重启后配置还在但运行时丢了）—— 这时补一次 reload，否则接口永远 DOWN。
-        if plan.ifaces.iter().any(|i| !uci::interface_loaded(&i.name)) {
+        // 用户点过「断开」时不补：reload 会把未加载的接口连 auto=1 一起拉起来，
+        // 同样违背断开意图（与下面补 ifup 的门前同口径）。
+        if !modem.manual_stopped()
+            && plan.ifaces.iter().any(|i| !uci::interface_loaded(&i.name))
+        {
             log::info!(
                 "自动组网 模组 {}：UCI 已符合计划但 netifd 未加载 {}，补一次 reload",
                 modem.id,

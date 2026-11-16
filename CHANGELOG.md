@@ -69,7 +69,13 @@ openvohive 六个上游），修复了全部 P0/P1 与可安全落地的 P2；�
 - `-P0` 仅在用户未显式给 `-P<n>` 时追加，`reqprefix` 的 PD 请求不再被覆盖（C-09）。
 - `is_usable_global_v6` 收紧到 2000::/3；归档恢复片段按 shell 规则转义单引号；cleanup 缺席轮数
   按模组去重；`set_apn` 的 `pdp_type` 走白名单校验、回读比较忽略大小写（C-14/15/13、C-07、C-18）。
-- 幂等补 `ifup` 尊重 `manual_stop`：用户断开后不再每 45 秒把接口拉回来（B-P2-7）。
+- 幂等补 `ifup` 尊重 `manual_stop`：用户断开后不再每 45 秒把接口拉回来（B-P2-7）；
+  「补 reload」与「diff 非空的 apply」同样尊重 `manual_stop` —— 用户断开后会话地址取不到，
+  `plan_wan` 翻回 dhcp/modem_pro 的那套 UCI 改动不再下发、reload 不再把接口拉起来
+  （PR #3 Codex 审查发现）。
+- 注册状态解析标记「明确性」：`+CREG?`/`+CGREG?` 回 ERROR 或超时时 `stat=0` 只是占位值
+  （序列化时无 `known` 字段），自动拨号门禁只认真实解析出的注册态，查询失败的残影不再
+  误判 `no_service` 拦住拨号（PR #3 Codex 审查发现）。
 - `interface_down` 改为解析 `ifstatus` 顶层 JSON `up`，嵌套字段不再掩盖真实 down（C-28）。
 
 **并发 / 进程健壮性**
@@ -83,7 +89,7 @@ openvohive 六个上游），修复了全部 P0/P1 与可安全落地的 P2；�
 - 退出钩子先删 PID，再限时 5 秒执行清理，超时直接退出，procd 重启不再被卡住的清理挡住；
   台账落盘：QuotaStore 改原子写，SchedStore 锁内快照、锁外写（C-13、D-C-10/11）。
 
-**测试**：`cargo test --locked` 全绿（891 项），新增/扩充覆盖上述修复点的单测。
+**测试**：`cargo test --locked` 全绿（893 项），新增/扩充覆盖上述修复点的单测。
 
 **保留项（未随本次改动，原因见审计报告）**
 - B-P2-13：`qmap_size` sysfs 路径、qmi 4096 读缓冲、`write_frame` 部分写需真机核对，仅在注释标注。

@@ -19,6 +19,13 @@ pub struct RegState {
     pub registered: bool,
     /// stat == 5
     pub roaming: bool,
+    /// `stat` 是**真实解析出来**的（应答里有可解析的数字），而不是失败后的占位值。
+    ///
+    /// 指令回 ERROR、超时、或应答里没有数字时为 `false` —— 此时 `stat=0` 只是
+    /// 占位，不代表模组真的「未注册」。消费方（自动拨号门禁的周期缓存）据此
+    /// 区分「明确未注册」与「查询失败」，后者不能用来拦拨号。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub known: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lac: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -41,10 +48,14 @@ pub fn parse(resp: &str, prefix: &str) -> RegState {
         return state;
     };
     let parts = super::super::at::csv(&field);
-    state.stat = parts
+    let parsed_stat = parts
         .get(1)
         .and_then(|s| s.parse::<i32>().ok())
-        .unwrap_or(0);
+        .map(|v| (v, true));
+    if let Some((v, known)) = parsed_stat {
+        state.stat = v;
+        state.known = known;
+    }
     state.lac = parts.get(2).filter(|s| !s.is_empty()).cloned();
     state.cell_id = parts.get(3).filter(|s| !s.is_empty()).cloned();
     state.act = parts.get(4).and_then(|s| s.parse::<i32>().ok());
@@ -95,5 +106,27 @@ mod tests {
         let s = parse("+CREG: ERROR\r\n", "+CREG");
         assert_eq!(s.stat, 0);
         assert!(!s.registered);
+        // ERROR 应答 → stat 是占位值，不算「明确未注册」（门禁据此不拦拨号）
+        assert!(!s.known);
+    }
+
+    #[test]
+    fn parsed_stat_is_known() {
+        let s = parse("+CREG: 0,0\r\n", "+CREG");
+        assert_eq!(s.stat, 0);
+        assert!(!s.registered);
+        // 应答里真的有数字（哪怕 stat=0）→ 明确
+        assert!(s.known);
+    }
+
+    #[test]
+    fn unknown_stat_is_not_serialized() {
+        // 序列化后没有 `known` 字段：门禁缓存里查不到 `known` 即视为不明确
+        let s = parse("+CEREG: ERROR\r\n", "+CEREG");
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(v.get("known").is_none());
+        let s = parse("+CREG: 0,2\r\n", "+CREG");
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v.get("known"), Some(&serde_json::json!(true)));
     }
 }

@@ -364,6 +364,8 @@ fn native_link_ok(dev: &str) -> bool {
 ///
 /// 只认**新鲜且明确**的证据：缓存缺失（没人看过页面）、格式不认识、
 /// 或网络正在搜索（stat=2）一律不拦 —— 门禁不能凭猜测阻止拨号。
+/// 同理，注册查询失败（ERROR/超时）留下的**占位 stat=0**（缓存里没有 `known`
+/// 标记，见 [`crate::modem::model::regstate::RegState`]）也不算「明确未注册」。
 fn service_stop_from_facts(
     sim: Option<&serde_json::Value>,
     net: Option<&serde_json::Value>,
@@ -380,11 +382,15 @@ fn service_stop_from_facts(
     let v = net?;
     let mut stats = Vec::new();
     for key in ["cs_reg", "ps_reg", "reg_5g", "reg_eps"] {
-        if let Some(stat) = v
-            .get(key)
-            .and_then(|r| r.get("stat"))
-            .and_then(|s| s.as_i64())
-        {
+        let Some(r) = v.get(key) else {
+            continue;
+        };
+        // `known` 缺失 = 该域的 stat 是查询失败后的占位值（旧缓存或 `RegState::default()`），
+        // 不是模组亲口说的「未注册」—— 不能拿占位值拦拨号。
+        if r.get("known").and_then(|x| x.as_bool()) != Some(true) {
+            continue;
+        }
+        if let Some(stat) = r.get("stat").and_then(|s| s.as_i64()) {
             stats.push(stat);
         }
     }
@@ -1462,12 +1468,16 @@ mod tests {
         let sim_absent = serde_json::json!({"sim_present": false});
         let sim_ok = serde_json::json!({"sim_present": true});
         let net_unreg = serde_json::json!({
-            "cs_reg": {"stat": 0}, "ps_reg": {"stat": 0}
+            "cs_reg": {"stat": 0, "known": true}, "ps_reg": {"stat": 0, "known": true}
         });
         let net_searching = serde_json::json!({
-            "cs_reg": {"stat": 0}, "ps_reg": {"stat": 2}
+            "cs_reg": {"stat": 0, "known": true}, "ps_reg": {"stat": 2, "known": true}
         });
-        let net_roam = serde_json::json!({"ps_reg": {"stat": 5}});
+        let net_roam = serde_json::json!({"ps_reg": {"stat": 5, "known": true}});
+        // 查询失败留下的占位 stat=0（无 `known` 字段）不算「明确未注册」
+        let net_placeholder = serde_json::json!({
+            "cs_reg": {"stat": 0}, "ps_reg": {"stat": 0}
+        });
 
         // 没卡 → sim_missing（即使网络缓存说已注册也不该有这种东西）
         assert_eq!(
@@ -1476,13 +1486,15 @@ mod tests {
                 .code,
             "sim_missing"
         );
-        // 明确未注册（0/0）→ no_service
+        // 明确未注册（0/0，真实解析出）→ no_service
         assert_eq!(
             service_stop_from_facts(Some(&sim_ok), Some(&net_unreg))
                 .unwrap()
                 .code,
             "no_service"
         );
+        // 占位 stat=0（CREG?/CGREG? 回 ERROR 或超时的残影）→ 不拦
+        assert!(service_stop_from_facts(Some(&sim_ok), Some(&net_placeholder)).is_none());
         // 正在搜索 / 已注册 / 漫游注册 → 不拦
         assert!(service_stop_from_facts(Some(&sim_ok), Some(&net_searching)).is_none());
         assert!(service_stop_from_facts(Some(&sim_ok), Some(&net_roam)).is_none());
