@@ -1,5 +1,6 @@
 //! 运行期台账落盘（全部与配置文件同目录）：
-//! `quota.json` / `imei.json` / `atport.json` / `atport_bind.json` / `schedule.json`。
+//! `quota.json` / `imei.json` / `atport.json` / `atport_bind.json` / `schedule.json` /
+//! `dial_intent.json`。
 //!
 //! ## 为什么要单独落盘
 //!
@@ -20,11 +21,10 @@
 //!
 //! ## 原子性（现状如此，不是目标态）
 //!
-//! `SchedStore` 与 `HostNicStore`（`runtime/hostnic.rs`）走 `.tmp` + `rename`；
-//! `quota` / `imei` / `atport` / `atport_bind` 是**直接覆盖写** —— 写一半掉电会留下
-//! 损坏文件，靠上面的「损坏按空台账」兜住（代价是丢一次账，不是起不来服务）。
-//! 统一成原子写属实机写盘行为变更，未做。
-
+//! `SchedStore`、`HostNicStore`（`runtime/hostnic.rs`）与 `DialIntentStore` 走
+//! `.tmp` + `rename`；`quota` / `imei` / `atport` / `atport_bind` 是**直接覆盖写**
+//! —— 写一半掉电会留下损坏文件，靠上面的「损坏按空台账」兜住（代价是丢一次账，
+//! 不是起不来服务）。统一成原子写属实机写盘行为变更，未做。
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -166,10 +166,9 @@ impl QuotaStore {
             modems.insert(id.to_string(), rec.clone());
         }
         match serde_json::to_string_pretty(&QuotaFile { modems }) {
+            // 原子写：写一半掉电只会留下 `.tmp`，正式文件始终完整（D-C-11）
             Ok(text) => {
-                if let Err(e) = std::fs::write(&self.path, text) {
-                    log::warn!("写 {path} 失败: {e}", path = self.path);
-                }
+                write_json_atomic(&self.path, &text);
             }
             Err(e) => log::warn!("序列化配额台账失败: {e}"),
         }
@@ -553,6 +552,126 @@ impl AtPortBindStore {
     }
 }
 
+/// 由配置文件路径推出 `dial_intent.json`（拨号意图台账，见 [`DialIntentStore`]）。
+pub fn dial_intent_file(config_path: &str) -> String {
+    sibling_file(config_path, "dial_intent.json")
+}
+
+/// 一个模组的拨号意图（需要跨重启保留的那部分）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DialIntentRecord {
+    /// 用户点过「断开」且还没重新拨号：true = 自动组网不要替他把链路拉起来。
+    pub manual_stop: bool,
+    /// 稳定原因代码（目前只有 `manual_stop`，留给以后扩展）。
+    #[serde(default)]
+    pub stop_reason: String,
+    /// 最后一次写入时刻（Unix 秒），只用于排障。
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct DialIntentFile {
+    #[serde(default)]
+    modems: HashMap<String, DialIntentRecord>,
+}
+
+/// 拨号意图台账（`dial_intent.json`，**原子写**）。
+///
+/// 解决「用户点了断开，重启 modemd 后又自己拨回来」：`manual_stop` 原本只在
+/// 内存里，重启即失，`dial.rs`「用户说断就断」的承诺形同虚设。
+///
+/// 键用**设备身份**（`usb:<vid>:<pid>@<bus_path>`，取不到时退回 `port:<端口>`）
+/// 而不是模组 id —— id 是发现顺序，重启后可能变；键由调用方（拨号协调器）拼。
+pub struct DialIntentStore {
+    path: String,
+    inner: Mutex<HashMap<String, DialIntentRecord>>,
+}
+
+impl DialIntentStore {
+    /// 打开并载入（文件不存在 / 损坏都按空台账起步；损坏记 warn）。
+    pub fn new(path: String) -> Self {
+        let inner = if path.trim().is_empty() {
+            HashMap::new()
+        } else {
+            load_json::<DialIntentFile>(&path)
+                .map(|f| f.modems)
+                .unwrap_or_default()
+        };
+        Self {
+            path,
+            inner: Mutex::new(inner),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn get(&self, key: &str) -> Option<DialIntentRecord> {
+        let key = key.trim();
+        if key.is_empty() {
+            return None;
+        }
+        self.inner.lock().unwrap().get(key).cloned()
+    }
+
+    /// 写入 / 覆盖一条记录（内容没变就不落盘）。返回是否落盘。
+    pub fn set(&self, key: &str, rec: DialIntentRecord) -> bool {
+        let key = key.trim();
+        if key.is_empty() {
+            return false;
+        }
+        let changed = {
+            let mut g = self.inner.lock().unwrap();
+            match g.get(key) {
+                Some(old)
+                    if old.manual_stop == rec.manual_stop
+                        && old.stop_reason == rec.stop_reason =>
+                {
+                    false
+                }
+                _ => {
+                    g.insert(key.to_string(), rec);
+                    true
+                }
+            }
+        };
+        if changed {
+            self.flush();
+        }
+        changed
+    }
+
+    /// 清掉一条记录（用户重新拨号 = 旧的「断开」意图作废）。返回是否删了。
+    pub fn clear(&self, key: &str) -> bool {
+        let key = key.trim();
+        if key.is_empty() {
+            return false;
+        }
+        let removed = self.inner.lock().unwrap().remove(key).is_some();
+        if removed {
+            self.flush();
+        }
+        removed
+    }
+
+    fn flush(&self) {
+        if self.path.trim().is_empty() {
+            return;
+        }
+        let modems = self.inner.lock().unwrap().clone();
+        match serde_json::to_string_pretty(&DialIntentFile { modems }) {
+            // 锁外写盘：IO 慢，不能把读路径一起堵住（模块头的并发约定）
+            Ok(text) => {
+                write_json_atomic(&self.path, &text);
+            }
+            Err(e) => log::warn!("序列化拨号意图台账失败: {e}"),
+        }
+    }
+}
+
 /// 退出前要落盘的台账（信号处理里统一调）。
 ///
 /// 大部分台账是「写一次就原子落盘」，只有定时任务台账按 5 秒节流合并写；
@@ -771,29 +890,39 @@ impl SchedStore {
 
     /// 强制落盘（进程退出前 / 状态变化后调用）。
     ///
-    /// 锁内写盘。写失败不丢脏标记，
-    /// 下一次 flush 会重试（宁可可重入，也别静默丢账）。
+    /// **锁内只拷贝快照，锁外做 IO**（模块头的并发约定）：写盘期间新到的
+    /// 修改会把 `dirty` 重新置 true，下一次 flush 再写一遍，不会丢账。
+    /// 写失败回置脏标记（D-C-10）。
     pub fn flush(&self) {
-        let mut guard = self.inner.lock().unwrap();
-        if !guard.dirty {
-            return;
-        }
         if self.path.trim().is_empty() {
             return;
         }
-        let payload = SchedFile {
-            version: 1,
-            saved_at: crate::logging::timestamp(),
-            tasks: guard.tasks.clone(),
-        };
-        let Ok(text) = serde_json::to_string_pretty(&payload) else {
-            log::warn!("序列化定时任务台账失败");
-            return;
-        };
-        // 原子写：rename 没成才保留脏标记，下一次 flush 重试
-        if write_json_atomic(&self.path, &text) {
+        let payload = {
+            let mut guard = self.inner.lock().unwrap();
+            if !guard.dirty {
+                return;
+            }
+            // 先清脏：写盘期间的新改动会重新置脏，写完就不再回清
             guard.dirty = false;
-            guard.saved_at = crate::logging::unix_now();
+            SchedFile {
+                version: 1,
+                saved_at: crate::logging::timestamp(),
+                tasks: guard.tasks.clone(),
+            }
+        };
+        let text = match serde_json::to_string_pretty(&payload) {
+            Ok(t) => t,
+            Err(_) => {
+                log::warn!("序列化定时任务台账失败");
+                self.inner.lock().unwrap().dirty = true;
+                return;
+            }
+        };
+        // 原子写：rename 没成才回置脏标记，下一次 flush 重试
+        if write_json_atomic(&self.path, &text) {
+            self.inner.lock().unwrap().saved_at = crate::logging::unix_now();
+        } else {
+            self.inner.lock().unwrap().dirty = true;
         }
     }
 }
@@ -801,9 +930,10 @@ impl SchedStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        at_port_bind_key, at_port_bind_key_scoped, atport_bind_file, atport_file, imei_file,
-        quota_file, schedule_file, AtPortBindStore, AtPortStore, ImeiBackup, ImeiStore,
-        QuotaRecord, QuotaStore, SchedStore,
+        at_port_bind_key, at_port_bind_key_scoped, atport_bind_file, atport_file,
+        dial_intent_file, imei_file, quota_file, schedule_file, AtPortBindStore, AtPortStore,
+        DialIntentRecord, DialIntentStore, ImeiBackup, ImeiStore, QuotaRecord, QuotaStore,
+        SchedStore,
     };
     use crate::modem::model::schedule::{Action, Run, Task, KIND_BAND_LOCK};
 
@@ -818,6 +948,10 @@ mod tests {
         assert_eq!(
             atport_bind_file(&cfg),
             dir.join("atport_bind.json").to_string_lossy()
+        );
+        assert_eq!(
+            dial_intent_file(&cfg),
+            dir.join("dial_intent.json").to_string_lossy()
         );
         assert_eq!(quota_file("config.toml"), "quota.json");
     }
@@ -859,6 +993,50 @@ mod tests {
             "路径里有穿越字符必须拒绝"
         );
         assert!(at_port_bind_key_scoped("bad", "0801", "1-1").is_none());
+    }
+
+    #[test]
+    fn dial_intent_store_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("modemd-dialintent-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("dial_intent.json").to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let store = DialIntentStore::new(path.clone());
+        assert!(store.get("usb:2cb7:0001@1-1").is_none());
+
+        assert!(store.set(
+            "usb:2cb7:0001@1-1",
+            DialIntentRecord {
+                manual_stop: true,
+                stop_reason: "manual_stop".into(),
+                updated_at: 1,
+            },
+        ));
+        // 内容相同不重复落盘
+        assert!(!store.set(
+            "usb:2cb7:0001@1-1",
+            DialIntentRecord {
+                manual_stop: true,
+                stop_reason: "manual_stop".into(),
+                updated_at: 2,
+            },
+        ));
+        // 重建后仍在（跨重启语义）
+        let reloaded = DialIntentStore::new(path.clone());
+        let rec = reloaded.get("usb:2cb7:0001@1-1").expect("记录应已落盘");
+        assert!(rec.manual_stop);
+        assert_eq!(rec.stop_reason, "manual_stop");
+
+        // 用户重新拨号 ⇒ 清掉
+        assert!(reloaded.clear("usb:2cb7:0001@1-1"));
+        assert!(!reloaded.clear("usb:2cb7:0001@1-1"));
+        assert!(DialIntentStore::new(path.clone())
+            .get("usb:2cb7:0001@1-1")
+            .is_none());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

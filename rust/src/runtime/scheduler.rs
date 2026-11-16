@@ -11,7 +11,7 @@ pub fn spawn_scan(mgr: Arc<ModemManager>, interval_secs: i64) {
         log::warn!("scan_interval<=0：不启用后台巡检，仅启动时发现一次模组");
         return;
     }
-    std::thread::spawn(move || loop {
+    crate::runtime::supervise("scan", move || loop {
         std::thread::sleep(Duration::from_secs(interval_secs as u64));
         let added = mgr.discover(false);
         if added > 0 {
@@ -30,7 +30,7 @@ pub fn spawn_schedule(interval_secs: i64, tick: impl Fn() + Send + Sync + 'stati
         log::warn!("schedule_interval<=0：不启动定时任务循环，到点动作不会执行");
         return;
     }
-    std::thread::spawn(move || {
+    crate::runtime::supervise("schedule", move || {
         tick();
         loop {
             std::thread::sleep(Duration::from_secs(interval_secs as u64));

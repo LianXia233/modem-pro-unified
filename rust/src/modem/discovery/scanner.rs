@@ -12,11 +12,14 @@ use crate::modem::at::AtPort;
 use super::plan;
 use super::ports;
 
-/// 探活失败的口：下次可再试的时刻 + 已失败次数。
-#[derive(Debug, Clone, Copy)]
+/// 探活失败的口：下次可再试的时刻 + 已失败次数 + 失败时的设备指纹。
+#[derive(Debug, Clone)]
 struct Negative {
     next: Instant,
     tries: u32,
+    /// 失败时该口的 USB 身份（`vid:pid@bus/iface`）。同名路径换了设备时
+    /// 指纹必然不同 ⇒ 立即作废旧退避（A-P1-2）。
+    fp: String,
 }
 
 /// 否定缓存（进程级）。
@@ -33,10 +36,24 @@ fn negative() -> &'static Mutex<std::collections::BTreeMap<String, Negative>> {
     CELL.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
 }
 
-fn probe_allowed(path: &str) -> bool {
-    let g = negative().lock().unwrap_or_else(|e| e.into_inner());
+/// 设备的身份指纹：`vid:pid@bus/iface`。
+///
+/// USB 口重插另一块模组（或同型号复位重枚举）时，同名 `/dev/ttyUSB*` 的
+/// vid/pid/bus 往往不同；用它作废否定缓存，避免新设备被旧退避压住 5 分钟。
+fn fingerprint(p: &super::plan::PortInfo) -> String {
+    format!("{}:{}@{}/{}", p.vid, p.pid, p.usb_dev, p.iface)
+}
+
+/// 是否允许探测：退避期未到则跳过。但若路径还在、设备指纹已变，
+/// 说明是「换了设备的新模组」，旧退避立即作废（A-P1-2）。
+fn probe_allowed(path: &str, fp: &str) -> bool {
+    let mut g = negative().lock().unwrap_or_else(|e| e.into_inner());
     match g.get(path) {
         None => true,
+        Some(n) if n.fp != fp => {
+            g.remove(path);
+            true
+        }
         Some(n) => Instant::now() >= n.next,
     }
 }
@@ -56,12 +73,13 @@ fn backoff_secs(tries: u32, young: bool) -> u64 {
 /// 预热窗口（秒）：上游 Go 版 `probe_warmup` 默认 90s。
 const PROBE_WARMUP_SECS: u64 = 90;
 
-fn note_probe_failed(path: &str, young: bool) {
+fn note_probe_failed(path: &str, young: bool, fp: &str) {
     let mut g = negative().lock().unwrap_or_else(|e| e.into_inner());
     // 预热期内每次失败都算「第一次」（上游 Go 版 `nonATNextProbe` 同口径：
     // 年轻期清零 tries，出预热期从退避基值重新数）。不然刚插上的慢启动模组
     // 会把 90 秒里攒下的高 tries 带出预热期，成年后第一次失败就直接 240s。
-    let tries = if young {
+    // 指纹变了也按第一次算：换的是另一台设备，旧账不继承。
+    let tries = if young || g.get(path).map(|n| n.fp != fp).unwrap_or(false) {
         1
     } else {
         g.get(path).map(|n| n.tries + 1).unwrap_or(1)
@@ -72,6 +90,7 @@ fn note_probe_failed(path: &str, young: bool) {
         Negative {
             next: Instant::now() + backoff,
             tries,
+            fp: fp.to_string(),
         },
     );
 }
@@ -106,6 +125,21 @@ pub struct Discovered {
     pub fallback_index: usize,
 }
 
+/// 展示用的 tty 列表：选定的口排第一，其余回退口按序补上并去重。
+///
+/// 探测选中的若是**回退口**（idx > 0），它本来就在 `fallbacks` 里，
+/// 直接 `extend` 会让同一个 tty 出现两次（A-P2-1）。
+fn tty_list(primary: &str, fallbacks: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(fallbacks.len() + 1);
+    out.push(primary.to_string());
+    for f in fallbacks {
+        if f != primary && !out.contains(f) {
+            out.push(f.clone());
+        }
+    }
+    out
+}
+
 /// 返回「已知之外、且身份探活成功」的设备（每台物理设备最多一个）。
 pub fn discover_new(
     known: &BTreeSet<String>,
@@ -114,6 +148,10 @@ pub fn discover_new(
 ) -> Vec<Discovered> {
     let snapshot = ports::snapshot();
     let alive: BTreeSet<String> = snapshot.iter().map(|p| p.path.clone()).collect();
+    let fps: std::collections::BTreeMap<String, String> = snapshot
+        .iter()
+        .map(|p| (p.path.clone(), fingerprint(p)))
+        .collect();
     prune_negative(&alive);
     let groups = plan::plan(&snapshot);
     let mut out = Vec::new();
@@ -121,7 +159,12 @@ pub fn discover_new(
         // 这台物理设备已经有登记（无论登记的是首选口还是回退口）⇒ 整组跳过。
         // 判据用「任一候选已登记」而不是「首选已登记」：手动切口后
         // `Modem::port()` 可能落在回退口上，只看首选会把同一台设备再登记一次。
-        if known.contains(&g.primary) || g.fallbacks.iter().any(|p| known.contains(p)) {
+        // 组键（`usb:1-1`）再挡一层：手工绑到白名单外的 tty 时，端口不在候选里，
+        // 只有组键能认出「还是同一台设备」（A-P2-19）。
+        if known.contains(&g.key)
+            || known.contains(&g.primary)
+            || g.fallbacks.iter().any(|p| known.contains(p))
+        {
             continue;
         }
         let mut candidates: Vec<&String> = Vec::with_capacity(g.fallbacks.len() + 1);
@@ -132,21 +175,20 @@ pub fn discover_new(
             if known.contains(*cand) {
                 continue;
             }
-            // 退避期内不重探：这台口上次连身份都拿不到
-            if !probe_allowed(cand) {
+            // 退避期内不重探：这台口上次连身份都拿不到（换了设备则立即放行）
+            let fp = fps.get(cand.as_str()).cloned().unwrap_or_default();
+            if !probe_allowed(cand, &fp) {
                 continue;
             }
             let young = ports::device_age_secs(cand)
                 .map(|age| age < PROBE_WARMUP_SECS)
                 .unwrap_or(false);
             let Some(evidence) = AtPort::probe_identity(cand, baud, probe_timeout) else {
-                note_probe_failed(cand, young);
+                note_probe_failed(cand, young, &fp);
                 continue;
             };
             note_probe_ok(cand);
-            let mut ttys: Vec<String> = Vec::with_capacity(g.fallbacks.len() + 1);
-            ttys.push((*cand).clone());
-            ttys.extend(g.fallbacks.iter().cloned());
+            let ttys = tty_list(cand, &g.fallbacks);
             out.push(Discovered {
                 path: (*cand).clone(),
                 group: g.key.clone(),
@@ -178,6 +220,7 @@ mod tests {
                 driver: "option".into(),
                 vid: "2c7c".into(),
                 pid: "0801".into(),
+                ..PortInfo::default()
             },
             PortInfo {
                 path: "/dev/ttyUSB2".into(),
@@ -186,6 +229,7 @@ mod tests {
                 driver: "option".into(),
                 vid: "2c7c".into(),
                 pid: "0801".into(),
+                ..PortInfo::default()
             },
         ];
         let groups = plan::plan(&ports);
@@ -195,9 +239,28 @@ mod tests {
         assert_eq!(groups[0].skipped.len(), 1);
     }
 
+    /// 选中的是回退口时，展示列表不得把同一个 tty 出现两次（A-P2-1）。
     #[test]
-    fn backoff_grows_then_caps() {
-        assert_eq!(backoff_secs(1, false), 15);
+    fn tty_list_dedupes_selected_fallback() {
+        let fbs = vec![
+            "/dev/ttyUSB2".to_string(),
+            "/dev/ttyUSB3".to_string(),
+        ];
+        assert_eq!(
+            tty_list("/dev/ttyUSB3", &fbs),
+            ["/dev/ttyUSB3", "/dev/ttyUSB2"]
+        );
+        assert_eq!(
+            tty_list("/dev/ttyUSB0", &fbs),
+            ["/dev/ttyUSB0", "/dev/ttyUSB2", "/dev/ttyUSB3"]
+        );
+        // 重复回退项也只保留一份
+        let dup = vec!["/dev/ttyUSB2".to_string(), "/dev/ttyUSB2".to_string()];
+        assert_eq!(tty_list("/dev/ttyUSB2", &dup), ["/dev/ttyUSB2"]);
+    }
+
+    #[test]
+    fn backoff_grows_then_caps() {        assert_eq!(backoff_secs(1, false), 15);
         assert_eq!(backoff_secs(2, false), 30);
         assert_eq!(backoff_secs(3, false), 60);
         assert_eq!(backoff_secs(4, false), 120);
@@ -219,17 +282,17 @@ mod tests {
     #[test]
     fn young_failures_do_not_leak_into_adult_backoff() {
         let path = "/dev/ttyTEST_young";
-        note_probe_failed(path, true);
-        note_probe_failed(path, true);
-        note_probe_failed(path, true);
-        note_probe_failed(path, true);
+        note_probe_failed(path, true, "1a0e:0001@1-1/1.2");
+        note_probe_failed(path, true, "1a0e:0001@1-1/1.2");
+        note_probe_failed(path, true, "1a0e:0001@1-1/1.2");
+        note_probe_failed(path, true, "1a0e:0001@1-1/1.2");
         {
             let g = negative().lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(g[path].tries, 1, "年轻期每次失败都算第一次");
         }
         // 出预热期后第一次失败：tries 1→2，退避 30s（基值 15 的翻倍），
         // 而不是被年轻期攒下的 4 次直接打到 120s。
-        note_probe_failed(path, false);
+        note_probe_failed(path, false, "1a0e:0001@1-1/1.2");
         {
             let g = negative().lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(g[path].tries, 2);
@@ -237,10 +300,32 @@ mod tests {
         prune_negative(&BTreeSet::new());
     }
 
+    /// 同名路径换了设备（vid/pid 变）⇒ 旧退避立即作废（A-P1-2）。
+    #[test]
+    fn changed_fingerprint_invalidates_backoff() {
+        let path = "/dev/ttyTEST_fp";
+        let a = PortInfo {
+            path: path.into(),
+            usb_dev: "1-1".into(),
+            iface: "1.2".into(),
+            driver: "option".into(),
+            vid: "1a0e".into(),
+            pid: "0001".into(),
+            ..PortInfo::default()
+        };
+        let fa = fingerprint(&a);
+        note_probe_failed(path, false, &fa);
+        assert!(!probe_allowed(path, &fa), "同一设备仍在退避期");
+        let mut b = a.clone();
+        b.vid = "2c7c".into();
+        let fb = fingerprint(&b);
+        assert!(probe_allowed(path, &fb), "换了设备应立刻放行");
+        prune_negative(&BTreeSet::new());
+    }
+
     /// `discover_new` 在没有串口的机器上必须返回空（CI/开发机）。
     #[test]
-    fn empty_machine_yields_nothing() {
-        let known: BTreeSet<String> = BTreeSet::new();
+    fn empty_machine_yields_nothing() {        let known: BTreeSet<String> = BTreeSet::new();
         // 只要不 panic 即可：真机有串口时结果取决于硬件
         let got = discover_new(&known, 115200, Duration::from_millis(50));
         assert!(got.len() <= 64);

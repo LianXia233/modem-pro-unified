@@ -324,6 +324,12 @@ pub struct QmiSession {
     link: QmiLink,
     client4: u8,
     handle4: u32,
+    /// v4 WDS 呼叫是否真的 Start 成功过。
+    ///
+    /// 不能用 `handle4 != 0` 当闸门：QMI 的 packet data handle 是模组返回的
+    /// 32 位值，**0 是合法句柄**。用 handle 判断会让这类固件跳过 Stop +
+    /// client 释放，模组侧残留呼叫使下次 Start 被拒（QMUXError 0xe，B-P2-1）。
+    v4_started: bool,
     client6: Option<u8>,
     handle6: Option<u32>,
     /// QMAP 的 WDA client（非 QMAP 模组为 `None`），退出时要还回去。
@@ -529,6 +535,7 @@ impl QmiSession {
                 link,
                 client4,
                 handle4,
+                v4_started: true,
                 client6,
                 handle6,
                 wda_client,
@@ -548,25 +555,26 @@ impl QmiSession {
     pub fn stop(&mut self) {
         if let (Some(c), Some(h)) = (self.client6.take(), self.handle6.take()) {
             if let Err(e) = self.link.stop(qmi::SVC_WDS_IPV6, c, h) {
-                log::debug!("原生 QMI：停 v6 失败: {e}");
+                log::warn!("原生 QMI：停 v6 失败: {e}");
             }
-            if let Err(e) = self.link.release_client_id(qmi::SVC_WDS_IPV6, c) {
-                log::debug!("原生 QMI：释放 v6 client 失败: {e}");
-            }
+            retry_release(&mut self.link, qmi::SVC_WDS_IPV6, c, "v6");
         }
-        if self.handle4 != 0 {
-            let h = std::mem::take(&mut self.handle4);
+        // 闸门看「Start 是否成功」，不看 handle 数值：0 也可能是合法句柄（B-P2-1）。
+        if self.v4_started {
+            self.v4_started = false;
+            let h = self.handle4;
             if let Err(e) = self.link.stop(qmi::SVC_WDS, self.client4, h) {
-                log::debug!("原生 QMI：停 v4 失败: {e}");
+                log::warn!("原生 QMI：停 v4 失败: {e}（重试一次）");
+                if let Err(e2) = self.link.stop(qmi::SVC_WDS, self.client4, h) {
+                    log::warn!("原生 QMI：停 v4 重试仍失败: {e2}（模组侧可能残留呼叫）");
+                }
             }
-            if let Err(e) = self.link.release_client_id(qmi::SVC_WDS, self.client4) {
-                log::debug!("原生 QMI：释放 v4 client 失败: {e}");
-            }
+            retry_release(&mut self.link, qmi::SVC_WDS, self.client4, "v4");
         }
         // WDA client 最后还：数据格式是设备级状态，不需要「撤销」
         if let Some(w) = self.wda_client.take() {
             if let Err(e) = self.link.release_client_id(qmi::SVC_WDA, w) {
-                log::debug!("原生 QMI：释放 WDA client 失败: {e}");
+                log::warn!("原生 QMI：释放 WDA client 失败: {e}");
             }
         }
     }
@@ -579,6 +587,9 @@ impl QmiSession {
             "mtu": self.settings.mtu,
             "modem_ipv4": self.settings.ipv4.map(|ip| ip.to_string()),
             "gateway": self.settings.gateway.map(|ip| ip.to_string()),
+            // 子网掩码来自 Get Runtime Settings TLV 0x21：raw_ip 网卡要靠它
+            // 配 static（硬编码 /24 在 /30、/32 的点对点地址上会写出错路由，C-11）。
+            "netmask": self.settings.subnet.map(|m| m.to_string()),
             "dns": self.settings.dns.iter().map(|ip| ip.to_string()).collect::<Vec<_>>(),
             "modem_ipv6": self.settings.ipv6.map(|(ip, p)| format!("{ip}/{p}")),
             "qmap": self.qmap.map(|q| serde_json::json!({
@@ -594,6 +605,19 @@ impl QmiSession {
 impl Drop for QmiSession {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// 释放 QMI client id，失败重试一次。
+///
+/// 会话此时已从 map 删除（[`QmiSession::stop`] 的调用方不再持有它），
+/// 释放不掉就是模组侧永久少一个 client 槽位，后续拨号可能找不到可用 client。
+fn retry_release(link: &mut QmiLink, service: u8, client: u8, what: &str) {
+    if let Err(e) = link.release_client_id(service, client) {
+        log::warn!("原生 QMI：释放 {what} client 失败: {e}（重试一次）");
+        if let Err(e2) = link.release_client_id(service, client) {
+            log::warn!("原生 QMI：释放 {what} client 重试仍失败: {e2}");
+        }
     }
 }
 

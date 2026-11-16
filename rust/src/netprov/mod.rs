@@ -196,6 +196,13 @@ pub struct PlannedIface {
     pub device: String,
     /// metric；`<= 0` 表示不设这一项。
     pub metric: i64,
+    /// 模组会话建议的 MTU（`0` = 不写）。
+    ///
+    /// 蜂窝链路的 MTU 常是 1400~1430，主机默认 1500 会依赖 ICMP frag-needed；
+    /// 隧道/防火墙拦 ICMP 时大包静默丢。主机侧拨号（QMI/MBIM）会话里已经拿到
+    /// 这个值（`QmiSession::status().mtu`），不落 UCI 就永远用不上。
+    /// 只**补写空值**：用户手工设过的不覆盖（见 `diff_plan`）。
+    pub mtu: i64,
     /// 是否随开机启动。
     pub auto: bool,
     /// static 模式要写的地址（空 = 不设这一项；`dhcp` / `modem_pro` 都留空）。
@@ -362,6 +369,7 @@ pub fn plan_wan(
         proto,
         device: device.trim().to_string(),
         metric,
+        mtu: 0,
         auto: true,
         force_link: false,
         ipaddr,
@@ -402,6 +410,7 @@ pub fn plan_wan(
             //   `@<主接口>`）；本仓库只写 `device`（新版 netifd 的键名）。
             device: format!("@{name}"),
             metric,
+            mtu: 0,
             auto: true,
             force_link: false,
             ipaddr: String::new(),
@@ -431,11 +440,22 @@ pub fn derive_gateway(ipv4: &str) -> Option<String> {
     if parts.len() != 4 {
         return None;
     }
-    let last: u32 = parts[3].parse().ok()?;
-    let gw_last = if last == 1 { 254 } else { 1 };
+    // 八位组逐个校验：固件残值里出现过 `256` / `abc` / 空段，
+    // 原样拼进 UCI 会写出 netifd 拒绝的 gateway（接口直接起不来）。
+    let octets: Option<Vec<u8>> = parts
+        .iter()
+        .map(|p| {
+            if p.is_empty() || p.len() > 3 {
+                return None;
+            }
+            p.parse::<u16>().ok().filter(|v| *v <= 255).map(|v| v as u8)
+        })
+        .collect();
+    let octets = octets?;
+    let gw_last = if octets[3] == 1 { 254 } else { 1 };
     Some(format!(
         "{}.{}.{}.{}",
-        parts[0], parts[1], parts[2], gw_last
+        octets[0], octets[1], octets[2], gw_last
     ))
 }
 
@@ -520,8 +540,10 @@ pub struct ExistingIface {
     pub mp_no_v6: String,
     /// 已下发的 `force_link`（`"1"` / 空）。
     pub force_link: String,
-    /// 已下发的 DNS（空格分隔；用于 diff 对齐，避免每轮重复写）。
+    /// 已下发的 DNS（空格分隔；UCI list 的每个成员一行解析后拼起来）。
     pub dns: String,
+    /// 已下发的 MTU（空 = 没设过；只用来判断「要不要补」）。
+    pub mtu: String,
     /// 已经在哪些防火墙 zone 里（zone 名，如 `wan`）。
     pub zones: Vec<String>,
 }
@@ -599,6 +621,10 @@ pub fn diff_plan(
                 if p.metric > 0 {
                     push_if_set(&mut ops, &p.name, "metric", &p.metric.to_string());
                 }
+                // 新生 section 直接补会话 MTU（没有历史值可言）。
+                if p.mtu > 0 {
+                    push_if_set(&mut ops, &p.name, "mtu", &p.mtu.to_string());
+                }
                 push_if_set(&mut ops, &p.name, "auto", if p.auto { "1" } else { "0" });
                 if p.force_link {
                     push_if_set(&mut ops, &p.name, "force_link", "1");
@@ -609,7 +635,10 @@ pub fn diff_plan(
                 push_if_set(&mut ops, &p.name, "ipaddr", &p.ipaddr);
                 push_if_set(&mut ops, &p.name, "netmask", &p.netmask);
                 push_if_set(&mut ops, &p.name, "gateway", &p.gateway);
-                push_if_set(&mut ops, &p.name, "dns", &p.dns);
+                // DNS 是 list 型（见 push_dns_list）；新建 section 没有旧值可清。
+                if !p.dns.trim().is_empty() {
+                    push_dns_list(&mut ops, &p.name, &p.dns);
+                }
                 if p.extendprefix {
                     push_if_set(&mut ops, &p.name, "extendprefix", "1");
                 }
@@ -706,11 +735,21 @@ pub fn diff_plan(
                         key: "ip6addr".into(),
                     });
                 }
-                // DNS 强制下发（见 PlannedIface.dns）：计划有就补齐/更新；
-                // 计划没有而现状有 ⇒ 清掉（切到 carrier 模式不残留旧 DNS）。
-                if !p.dns.is_empty() {
-                    if e.dns != p.dns {
-                        push_if_set(&mut ops, &p.name, "dns", &p.dns);
+                // MTU：只补空值。用户（或别的工具）手工设过的值不覆盖 ——
+                // 组网循环的职责是「把缺的补上」，不是争夺同一个键的所有权。
+                if p.mtu > 0 && e.mtu.trim().is_empty() {
+                    push_if_set(&mut ops, &p.name, "mtu", &p.mtu.to_string());
+                }
+                // DNS 强制下发（见 PlannedIface.dns）：按 list 语义比较；
+                // 计划有就整体重建（delete + add_list），计划没有而现状有 ⇒ 清掉
+                // （切到 carrier 模式不残留旧 DNS）。
+                if !p.dns.trim().is_empty() {
+                    if !dns_lists_equal(&e.dns, &p.dns) {
+                        ops.push(UciOp::Unset {
+                            section: p.name.clone(),
+                            key: "dns".into(),
+                        });
+                        push_dns_list(&mut ops, &p.name, &p.dns);
                     }
                 } else if !e.dns.is_empty() {
                     ops.push(UciOp::Unset {
@@ -769,6 +808,29 @@ fn push_if_set(ops: &mut Vec<UciOp>, section: &str, key: &str, value: &str) {
         key: key.to_string(),
         value: value.to_string(),
     });
+}
+
+/// 两组 DNS 是否等价（按无序集合比较，空白/顺序不同不算变化）。
+fn dns_lists_equal(a: &str, b: &str) -> bool {
+    let mut x: Vec<&str> = a.split_whitespace().collect();
+    let mut y: Vec<&str> = b.split_whitespace().collect();
+    x.sort_unstable();
+    y.sort_unstable();
+    x == y
+}
+
+/// 把 DNS 写成 UCI **list**（`add_list`），而不是一条空格分隔的 `option`。
+///
+/// netifd 的 `dns` 是 list 型；写成 option 字符串时类型不匹配，netifd 会
+/// **整串静默丢弃** —— 表现就是「配置里明明有 DNS，resolv.conf.auto 里没有」。
+fn push_dns_list(ops: &mut Vec<UciOp>, section: &str, dns: &str) {
+    for addr in dns.split_whitespace() {
+        ops.push(UciOp::AddList {
+            section: section.to_string(),
+            key: "dns".into(),
+            value: addr.to_string(),
+        });
+    }
 }
 
 #[cfg(test)]
@@ -1985,11 +2047,26 @@ mod tests {
         );
         p.ifaces[0].dns = DEFAULT_DNS.to_string();
 
-        // 1) 新建接口：应写 dns
+        // 1) 新建接口：DNS 必须以 **list** 写入（add_list 每条一个），
+        //    写成 `option dns 'a b c'` 会被 netifd 按类型不匹配整串丢弃。
         let ops = diff_plan(&[], &p, FIREWALL_ZONE, "firewall.wan");
-        assert_set(&ops, "modem0", "dns", DEFAULT_DNS);
+        for addr in DEFAULT_DNS.split_whitespace() {
+            assert!(ops.contains(&UciOp::AddList {
+                section: "modem0".into(),
+                key: "dns".into(),
+                value: addr.to_string(),
+            }));
+        }
+        assert!(
+            !ops.iter().any(|o| matches!(
+                o,
+                UciOp::Set { key, .. } if key == "dns"
+            )),
+            "DNS 不能再写成 option 字符串"
+        );
 
-        // 2) 已配好同值：零写入（每轮组网循环不重复动手）
+        // 2) 已配好同值：零写入（每轮组网循环不重复动手）。
+        //    注意 UCI list 读回来是「空格拼接」的形态，顺序不同也算等价。
         let cur = vec![ExistingIface {
             name: "modem0".into(),
             proto: PROTO_STATIC.into(),
@@ -2004,12 +2081,26 @@ mod tests {
             ..Default::default()
         }];
         assert!(diff_plan(&cur, &p, FIREWALL_ZONE, "firewall.wan").is_empty());
+        // 顺序不同不算变化
+        let mut cur_reordered = cur.clone();
+        cur_reordered[0].dns = "2400:3200::1 223.5.5.5 119.29.29.29 2402:4e00::".into();
+        assert!(diff_plan(&cur_reordered, &p, FIREWALL_ZONE, "firewall.wan").is_empty());
 
-        // 3) 值变了：更新
+        // 3) 值变了：先 delete 整列，再按 list 重建
         let mut cur2 = cur.clone();
         cur2[0].dns = "203.0.113.53".into();
         let ops = diff_plan(&cur2, &p, FIREWALL_ZONE, "firewall.wan");
-        assert_set(&ops, "modem0", "dns", DEFAULT_DNS);
+        assert!(ops.contains(&UciOp::Unset {
+            section: "modem0".into(),
+            key: "dns".into()
+        }));
+        for addr in DEFAULT_DNS.split_whitespace() {
+            assert!(ops.contains(&UciOp::AddList {
+                section: "modem0".into(),
+                key: "dns".into(),
+                value: addr.to_string(),
+            }));
+        }
 
         // 4) 计划不强制（carrier 模式）：清掉现状里的 dns
         let mut p_off = plan_wan(

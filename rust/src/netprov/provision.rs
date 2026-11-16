@@ -192,27 +192,62 @@ pub fn provision_modem_with(
     // DHCP 服务器实测长期无响应（broadcast discover 无 offer）——
     // 不转换的话 modem_pro 模式在 350 系列上永远拿不到 v4 地址。
     let is_350 = crate::runtime::hostnic::quirk(&modem.model().unwrap_or_default()).0;
+    // 主线 `qmi_wwan` 的 raw_ip 模式：数据网卡没有以太网头（ARPHRD_RAWIP），
+    // udhcpc 的 AF_PACKET 收发根本不通 ⇒ 永远等不到租约。此时模组已经把
+    // IP/网关/DNS/MTU 通过 WDS Get Runtime Settings 报给了守护进程，
+    // 必须由主机侧直接配 static —— 否则「已连接但永远没有地址」，
+    // native_link_ok 恒 false，heal 每 60 秒拆建会话死循环。
+    // 厂商驱动（qmi_wwan_q/f、GobiNet）没有 raw_ip 属性且自带 802.3 + DHCP，
+    // 不受影响（qmi_raw_ip() 自然返回 false）。
+    let qmi_raw = !is_350
+        && state.cfg.net.host_dial
+        && matches!(mode, WanMode::Dhcp | WanMode::ModemPro)
+        && usb.kind.trim().eq_ignore_ascii_case("qmi")
+        && qmi_raw_ip(&device);
+    // 会话设置只在真正主机侧拨号且后端是 QMI/MBIM 时才有意义。
+    let session = if state.cfg.net.host_dial
+        && crate::modem::model::dial::wan_host_dial_by_daemon(&usb.kind)
+    {
+        session_net(modem.id)
+    } else {
+        None
+    };
     let static_ipv4 = if matches!(
         mode,
         crate::config::WanMode::Dhcp | crate::config::WanMode::ModemPro
-    ) && is_350
+    ) && (is_350 || qmi_raw)
     {
-        // **实时查询优先**：拨号状态/缓存里的地址可能是上一条会话的
-        // （重拨后地址会变，实测踩过），拿到新会话地址才算数；查不到
-        // 再退回状态缓存（离线排障时至少有迹可循）。
-        let ip = match modem.query_own_ipv4() {
-            Ok(v) if !v.trim().is_empty() => v,
-            _ => modem.dial_state_ipv4(),
-        };
-        ip
+        if qmi_raw {
+            // raw_ip：只信会话上报值。没有会话/没有地址 ⇒ 本轮不转换，
+            // 下一轮（会话建立后）自然补上。
+            session
+                .as_ref()
+                .map(|s| s.ipv4.clone())
+                .unwrap_or_default()
+        } else {
+            // 350 系列：**实时查询优先**：拨号状态/缓存里的地址可能是上一条会话的
+            // （重拨后地址会变，实测踩过），拿到新会话地址才算数；查不到
+            // 再退回状态缓存（离线排障时至少有迹可循）。
+            match modem.query_own_ipv4() {
+                Ok(v) if !v.trim().is_empty() => v,
+                _ => modem.dial_state_ipv4(),
+            }
+        }
     } else {
         String::new()
     };
     if !static_ipv4.is_empty() {
-        log::info!(
-            "自动组网 模组 {}：350 系列不走 DHCP，按模组上报地址配 static（{static_ipv4}）",
-            modem.id
-        );
+        if qmi_raw {
+            log::info!(
+                "自动组网 模组 {}：QMI raw_ip 网卡不收 DHCP，按会话上报地址配 static（{static_ipv4}）",
+                modem.id
+            );
+        } else {
+            log::info!(
+                "自动组网 模组 {}：350 系列不走 DHCP，按模组上报地址配 static（{static_ipv4}）",
+                modem.id
+            );
+        }
     }
 
     // IPv6 取址方式（`[net] wan_ipv6_mode`；口径对齐 `luci-app-fm350` 的 v6.rs）：
@@ -281,6 +316,26 @@ pub fn provision_modem_with(
             i.force_link = true;
         }
     }
+    // 主机侧拨号会话上报的网关/MTU：
+    //   · 网关覆写 plan_wan 的「同网段 .1」猜测 —— 蜂窝点对点网关经常与模组
+    //     地址不同网段（如 10.64.64.64/32 网关 10.64.64.65），猜出来的网关
+    //     会让 netifd 装一条不通的默认路由；
+    //   · MTU 只有会话给了才写（QMI/MBIM 都会报），DHCP 拿不到时这是唯一来源。
+    if let Some(s) = session.as_ref() {
+        if let Some(main) = plan.ifaces.first_mut() {
+            if is_ipv4_literal(&s.gateway) {
+                main.gateway = s.gateway.clone();
+            }
+            // 会话给了真实掩码就用它：QMI raw_ip 常见 /30、/32 的点对点地址，
+            // 写死 /24 会让 netifd 装出一条覆盖整个网段的错路由（C-11）。
+            if !s.netmask.is_empty() {
+                main.netmask = s.netmask.clone();
+            }
+            if s.mtu > 0 {
+                main.mtu = s.mtu;
+            }
+        }
+    }
     // 强制下发 DNS（`[net] wan_dns`，默认 `119.29.29.29 223.5.5.5 2402:4e00:: 2400:3200::1`）：
     // 只注入主接口，v6 兄弟接口不配 v4 DNS。蜂窝链路 DHCP 常拿不到 DNS（FM350 尤其如此），
     // 写进 network.modem<id>.dns 后 netifd 拉起接口即下发到 resolv.conf.auto。
@@ -303,6 +358,10 @@ pub fn provision_modem_with(
         .cloned()
         .unwrap_or_else(|| format!("firewall.{zone}"));
     let ops: Vec<UciOp> = diff_plan(existing, &plan, &zone, &zone_section);
+    // v6 的「落地动作」（RA / static 默认路由 / 重新要地址）必须以**计划里真的
+    // 有 v6 接口**为前提：默认 modem_pro 模式下没有兄弟接口时，地址无处落地，
+    // 再跑这些副作用只会制造 netifd 之外的路由和双份 RA 处理。
+    let v6_live = plan.ifaces.len() > 1;
     if ops.is_empty() {
         // 已配好：一条都不出。但 **netifd 里可能还没加载**（上一次 reload 失败、
         // 进程重启后配置还在但运行时丢了）—— 这时补一次 reload，否则接口永远 DOWN。
@@ -328,6 +387,14 @@ pub fn provision_modem_with(
         // 同样每轮补 ifup）。间隔 45 秒，避免拉着拉不起来时把每轮都堵住。
         for i in plan.ifaces.iter() {
             if uci::interface_down(&i.name) != Some(true) {
+                continue;
+            }
+            // 用户点过「断开」就别补：proto 起着会每 45 秒重拨一轮，udhcpc
+            // 空转、日志刷屏，还等于把用户刚断开的连接拉回来（B-P2-7）。
+            // 页面再点「拨号」会清掉 manual_stop，下一轮自然恢复。
+            if modem.manual_stopped() {
+                rep.skipped
+                    .push(format!("{} 用户已断开（manual_stop），不补 ifup", i.name));
                 continue;
             }
             if !ifup_due(&i.name) {
@@ -374,10 +441,12 @@ pub fn provision_modem_with(
         //   · RA：周期性 RA 可能几百秒才来一轮，主动再要一次（内部 60 秒节流）；
         //   · static：地址是 netifd 异步加的，第一轮 reload 时可能还没上内核，
         //     这里每轮确认一次「有地址就补默认路由」，否则那条路由永远补不上。
-        match v6_mode {
-            V6Mode::Static => v6::after_reload(v6_mode, &device, state.cfg.net.wan_metric),
-            V6Mode::Ra => v6::maybe_resolicit(v6_mode, &device),
-            _ => {}
+        if v6_live {
+            match v6_mode {
+                V6Mode::Static => v6::after_reload(v6_mode, &device, state.cfg.net.wan_metric),
+                V6Mode::Ra => v6::maybe_resolicit(v6_mode, &device),
+                _ => {}
+            }
         }
         // 现状已与计划一致 ⇒ 这仍是「我们生成的那份」：把生成记录刷新成计划口径。
         // 记录只含本程序会写的键（见 `cleanup::MANAGED_KEYS`），用户自己加的
@@ -412,7 +481,10 @@ pub fn provision_modem_with(
             // IPv6 的落地动作（dhcpv6 什么都不做，交给 odhcp6c）：
             //   ra —— 打开 accept_ra=2 并主动发 RS；
             //   static —— 补一条 default dev 路由（没有 RA 就没有默认路由）。
-            v6::after_reload(v6_mode, &device, state.cfg.net.wan_metric);
+            // 只有计划里真的有 v6 接口才做（见 v6_live）。
+            if v6_live {
+                v6::after_reload(v6_mode, &device, state.cfg.net.wan_metric);
+            }
         }
         Err(e) => {
             rep.ok = false;
@@ -639,6 +711,86 @@ pub fn run_once(state: &AppState) {
 /// 跑一轮拨号器托管（给 `run_once` 调；`OnceLock` 里的全局实例）。
 pub(crate) fn reconcile_global(state: &AppState) {
     crate::runtime::dialer::supervisor().reconcile(state);
+}
+
+// ---------- QMI raw_ip / 会话设置 ----------
+
+/// 主线 `qmi_wwan` 的 raw_ip 开关是否打开（`/sys/class/net/<dev>/qmi/raw_ip`）。
+///
+/// 只有主线驱动有这个属性；厂商驱动（qmi_wwan_q/f、GobiNet）没有 ⇒ 返回 false，
+/// 它们跑 802.3 仿真 + 模组内 DHCP，取址路径不受影响。
+fn qmi_raw_ip(device: &str) -> bool {
+    let dev = device.trim();
+    if dev.is_empty() {
+        return false;
+    }
+    std::fs::read_to_string(format!("/sys/class/net/{dev}/qmi/raw_ip"))
+        .map(|s| s.trim().eq_ignore_ascii_case("Y"))
+        .unwrap_or(false)
+}
+
+/// 主机侧拨号会话上报的网络参数（`QmiSession::status()` 的字段）。
+#[derive(Debug, Clone, Default)]
+struct SessionNet {
+    ipv4: String,
+    gateway: String,
+    /// QMI runtime settings 的 IPv4 子网掩码（缺省为空，调用方保留计划里的 /24）。
+    netmask: String,
+    mtu: i64,
+}
+
+/// 从拨号器托管器取当前会话的 runtime settings。
+///
+/// 没有会话 / 会话还没拿到地址 ⇒ `None`（调用方按「本轮不转换」处理，
+/// 下一轮再试，绝不写空地址或上个会话的残留值）。
+fn session_net(modem_id: u32) -> Option<SessionNet> {
+    let v = crate::runtime::dialer::supervisor().describe(modem_id);
+    if !v.is_object() {
+        return None;
+    }
+    let text = |key: &str| {
+        v.get(key)
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let ipv4 = text("modem_ipv4");
+    if !is_ipv4_literal(&ipv4) {
+        return None;
+    }
+    let gateway = text("gateway");
+    let netmask = text("netmask");
+    let mtu = v
+        .get("mtu")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0)
+        // 0 / 异常大的值一律不落 UCI（0 表示未知；>9000 不是蜂窝链路）
+        .min(9000) as i64;
+    Some(SessionNet {
+        ipv4,
+        gateway: if is_ipv4_literal(&gateway) {
+            gateway
+        } else {
+            String::new()
+        },
+        netmask: if is_ipv4_literal(&netmask) && netmask != "0.0.0.0" {
+            netmask
+        } else {
+            String::new()
+        },
+        mtu,
+    })
+}
+
+/// 严格点分十进制 IPv4 字面量（四段、每段 0~255、不接受空段）。
+fn is_ipv4_literal(s: &str) -> bool {
+    let s = s.trim();
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() == 4
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.len() <= 3 && p.parse::<u16>().map(|v| v <= 255).is_ok())
 }
 
 /// 仅供测试/排障：确认 `iface_name` 与计划一致（避免两边写歪）。

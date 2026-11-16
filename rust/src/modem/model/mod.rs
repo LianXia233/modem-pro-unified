@@ -24,6 +24,7 @@ mod network;
 mod params;
 // 拨号 APN 优选：一键拨号 / 自动重拨调度 / 拨号器托管三方共用（见 params.rs）
 pub use params::pick_dial_context;
+pub use params::is_internal_apn;
 pub mod quota;
 mod regstate;
 mod roam;
@@ -64,7 +65,7 @@ pub use imei::{ImeiStatus, ModemInfo};
 pub use lock::{BandLock, CellLock, LockCaps, LockStatus};
 pub use mode::ModePref;
 pub use modem::{at_resp_is_error, split_at_lines};
-pub use modem::{is_fibocom_350, Modem};
+pub use modem::{is_fibocom_350, is_tdtech_mt5700, Modem};
 pub use netscan::{NetScanResult, Operator};
 pub use netselect::NetSelect;
 pub use network::{NetworkInfo, NetworkStatus};

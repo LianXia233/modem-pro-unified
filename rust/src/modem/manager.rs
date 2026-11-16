@@ -129,13 +129,19 @@ impl ModemManager {
         // 顺序要紧：`known` 里要是还留着已拔掉设备的口，
         // `discover_new` 就会一直跳过它 —— 同一台设备重插后再也发现不了。
         self.reap_gone();
-        let known: BTreeSet<String> = self
-            .modems
-            .read()
-            .unwrap()
-            .values()
-            .map(|m| m.port())
-            .collect();
+        // `known` 里除了端口，还塞进**组键**（`usb:1-1` / `port:/dev/...`）：
+        // 手工把命令口绑到白名单外的 tty 时，`m.port()` 不在计划层的候选里，
+        // 只看端口会把同一台物理设备的其它口再登记成第二台模组（A-P2-19）。
+        let mut known: BTreeSet<String> = BTreeSet::new();
+        for m in self.modems.read().unwrap().values() {
+            let port = m.port();
+            known.insert(port.clone());
+            let group = match crate::modem::usbdev::identity_for_tty(&port) {
+                Some(u) if !u.bus_path.is_empty() => format!("usb:{}", u.bus_path),
+                _ => format!("port:{port}"),
+            };
+            known.insert(group);
+        }
 
         let mut added = 0;
         for d in discover_new(&known, baud, self.cfg.serial.probe_timeout()) {
@@ -324,17 +330,30 @@ impl ModemManager {
     /// - 最要命的是：它的口一直在 `known` 集合中，**同一台设备重插后再也发现不了**
     ///   —— 用户看到的就是「拔了再插，模组不见了」，只能重启 modemd。
     ///
-    /// ## 判据为什么只看「设备文件在不在」
+    /// ## 判据：设备文件在不在 + USB 身份指纹
     ///
     /// 用「打不开串口」当判据会误杀：设备正忙（另一个进程占着）、权限临时受限、
     /// 模组正在重启，都会让 `open` 失败，但设备其实还在 —— 那样会把一台好模组
     /// 反复删掉再重建，界面上 id 一直跳。只看设备文件是否存在则没有这个歧义：
     /// 拔掉了文件才消失。
+    ///
+    /// 但只查文件存在会漏掉另一种情况：同名 `/dev/ttyUSB*` 在 3 秒扫描间隔内
+    /// 被换成另一块模组（或同型号复位重枚举回同名 tty），文件始终存在，旧身份
+    /// 与方言永久残留。因此再加一层 USB 指纹（`vid:pid@bus`，见
+    /// [`Modem::usb_identity_changed`]）：指纹变了 ⇒ 视为旧设备已消失。
     pub fn reap_gone(&self) -> Vec<u32> {
         let gone: Vec<u32> = {
             let g = self.modems.read().unwrap();
             g.values()
-                .filter(|m| !super::discovery::port_exists(&m.port()))
+                .filter(|m| {
+                    // 设备文件消失 ⇒ 明确已拔掉。
+                    if !super::discovery::port_exists(&m.port()) {
+                        return true;
+                    }
+                    // 文件还在、但背后换了设备（同名 tty 热插拔 / 复位重枚举）：
+                    // 旧身份与方言全部作废，回收后按新设备重新识别（A-P1-1）。
+                    m.usb_identity_changed()
+                })
                 .map(|m| m.id)
                 .collect()
         };

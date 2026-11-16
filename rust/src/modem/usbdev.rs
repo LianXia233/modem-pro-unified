@@ -62,8 +62,10 @@ pub const MODEM_USB_FAMILIES: &[ModemUsbFamily] = &[
     ModemUsbFamily {
         vendor: Vendor::Fibocom,
         vid: "2cb7",
-        pids: &["0a06", "0104", "0109", "0113"],
-        note: "FM650-CN（展锐平台）/ FG150 / FM150 / FG101 等",
+        pids: &[
+            "0a04", "0a05", "0a06", "0a07", "0104", "0109", "010a", "010b", "010f", "0113",
+        ],
+        note: "FM650-CN（展锐平台）/ FG150 / FM150 / FG101 / FM170 等",
         vendor_only_ok: false,
     },
     ModemUsbFamily {
@@ -115,6 +117,96 @@ pub const MODEM_USB_FAMILIES: &[ModemUsbFamily] = &[
         vid: "05c6",
         pids: &["f601"],
         note: "SLM750/SLM730（高通 VID）",
+        vendor_only_ok: false,
+    },
+    // ---- 以下按上游 QModem 的 device DB 补齐（A-P1-6）----
+    // 缺了这些 VID 时，热插拔事件不会把设备当成模组，port 规则也不会去补 option 驱动。
+    ModemUsbFamily {
+        vendor: Vendor::Meig,
+        vid: "2dee",
+        pids: &[
+            "4d23", "4d38", "4d45", "4d50", "4d51", "4d52", "4d53", "4d57", "4d58", "4d59",
+        ],
+        note: "美格 SRM 系列新增 PID 段",
+        vendor_only_ok: false,
+    },
+    ModemUsbFamily {
+        vendor: Vendor::Meig,
+        vid: "1782",
+        pids: &[
+            "4d23", "4d38", "4d45", "4d50", "4d51", "4d52", "4d53", "4d57", "4d58", "4d59",
+        ],
+        note: "美格（展锐 VID 1782）—— 1782 非独占，必须锁 PID",
+        vendor_only_ok: false,
+    },
+    ModemUsbFamily {
+        vendor: Vendor::Huawei,
+        vid: "12d1",
+        pids: &[],
+        note: "华为 MH5000 系（VID 厂商独占；含海思/展锐平台）",
+        vendor_only_ok: true,
+    },
+    ModemUsbFamily {
+        vendor: Vendor::Foxconn,
+        vid: "105b",
+        pids: &[],
+        note: "富士康 Foxconn（T77W / T99W 代工）",
+        vendor_only_ok: true,
+    },
+    ModemUsbFamily {
+        vendor: Vendor::Foxconn,
+        vid: "413c",
+        pids: &[],
+        note: "Dell 代工口（Foxconn 模组）",
+        vendor_only_ok: false,
+    },
+    ModemUsbFamily {
+        vendor: Vendor::Foxconn,
+        vid: "03f0",
+        pids: &[],
+        note: "HP 代工口（Foxconn 模组）",
+        vendor_only_ok: false,
+    },
+    ModemUsbFamily {
+        vendor: Vendor::Foxconn,
+        vid: "05c6",
+        pids: &["90d5", "e0ab"],
+        note: "T99W175 / T77W968（高通 VID 枚举）",
+        vendor_only_ok: false,
+    },
+    ModemUsbFamily {
+        vendor: Vendor::Foxconn,
+        vid: "17cb",
+        pids: &["0306", "0308"],
+        note: "T99W 系（Qualcomm VID 枚举，按 PID 细分）",
+        vendor_only_ok: false,
+    },
+    ModemUsbFamily {
+        vendor: Vendor::Thales,
+        vid: "1e2d",
+        pids: &["00f1", "00f2"],
+        note: "Thales / Cinterion",
+        vendor_only_ok: false,
+    },
+    ModemUsbFamily {
+        vendor: Vendor::Telit,
+        vid: "1bc7",
+        pids: &["1075"],
+        note: "Telit",
+        vendor_only_ok: false,
+    },
+    ModemUsbFamily {
+        vendor: Vendor::Gosuncn,
+        vid: "305a",
+        pids: &["1404", "1405", "1406", "1421", "1422"],
+        note: "高新兴 Gosuncn",
+        vendor_only_ok: false,
+    },
+    ModemUsbFamily {
+        vendor: Vendor::Neoway,
+        vid: "3763",
+        pids: &["3c93"],
+        note: "有方 Neoway",
         vendor_only_ok: false,
     },
 ];
@@ -620,7 +712,12 @@ pub fn ensure_serial_tty(_dev: &ModemUsbDevice) -> Result<String, String> {
     Err(bind_note().to_string())
 }
 
-/// usb-serial 驱动目录里的 `new_id` 文件（优先 option）。
+/// usb-serial 驱动目录里的 `new_id` 文件（**只认 option**）。
+///
+/// 早先找不到 option 就退回 `dirs.first()`：机器上装了 ch341 / cp210x / ftdi_sio
+/// 而 option 尚未加载时，会把模组的 VID:PID 写进**别的**驱动，由错误驱动接管
+/// 接口（A-P1-9）。现在只接受 `option*`；加载后仍没有就放弃，交给上层的
+/// modprobe 重试与错误提示，绝不写错驱动。
 #[cfg(unix)]
 fn usb_serial_new_id_path() -> Option<(String, std::path::PathBuf)> {
     let root = std::path::Path::new("/sys/bus/usb-serial/drivers");
@@ -630,14 +727,11 @@ fn usb_serial_new_id_path() -> Option<(String, std::path::PathBuf)> {
         .map(|e| e.path())
         .collect();
     dirs.sort();
-    let pick = dirs
-        .iter()
-        .find(|d| {
-            d.file_name()
-                .map(|n| n.to_string_lossy().starts_with("option"))
-                .unwrap_or(false)
-        })
-        .or_else(|| dirs.first())?;
+    let pick = dirs.iter().find(|d| {
+        d.file_name()
+            .map(|n| n.to_string_lossy().starts_with("option"))
+            .unwrap_or(false)
+    })?;
     let new_id = pick.join("new_id");
     if !new_id.exists() {
         return None;

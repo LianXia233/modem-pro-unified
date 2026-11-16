@@ -7,11 +7,12 @@
 //! 消息统一为 `{type, modem_id?, data}`；客户端握手后发 `{action:"snapshot"}`
 //! 索取初始快照。无客户端连接时上层不应驱动 AT（见 [`WsHub::has_clients`]）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{ErrorKind, Read, Write};
-use std::net::TcpStream;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::net::{Shutdown, TcpStream};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
@@ -28,6 +29,14 @@ pub const DISPLAY_KEY: &str = "h29k-tft-9f3c1a7b";
 
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const MAX_FRAME: usize = 1 << 20;
+/// 单帧写超时：客户端 TCP 零窗口时不能让广播线程永远卡住（C-1）。
+const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
+/// 半开连接回收：空闲这么久就发一次服务端 ping（C-5）。
+const IDLE_PING: Duration = Duration::from_secs(30);
+/// 连续这么多次 ping 都没有任何上行数据，判对端已死。
+const IDLE_MISSES: u32 = 4;
+/// 单帧读超时：帧读到一半对端不发完，不能永远占线程。
+const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 一个已建立的 WebSocket 连接（对外只暴露写能力）。
 pub struct WsClient {
@@ -43,8 +52,23 @@ pub struct WsClient {
 impl WsClient {
     /// 发送一帧文本。
     pub fn send_text(&self, text: &str) -> Result<()> {
+        self.send_control(0x1, text.as_bytes())
+    }
+
+    /// 发送按 opcode 指定的帧（文本 / ping / pong）。
+    ///
+    /// **所有**写都必须经过这里：控制帧（pong）若绕过这把锁直接写原始 fd，
+    /// 会和广播的帧字节交错，WS 流当场损坏（C-2）。
+    pub fn send_control(&self, opcode: u8, payload: &[u8]) -> Result<()> {
         let mut stream = self.stream.lock().unwrap_or_else(|e| e.into_inner());
-        write_frame(&mut *stream, 0x1, text.as_bytes())
+        write_frame(&mut *stream, opcode, payload)
+    }
+
+    /// 主动断开底层 socket（广播写失败 / 判死时用，让读循环尽快退出）。
+    fn shutdown(&self) {
+        if let Ok(s) = self.stream.lock() {
+            let _ = s.shutdown(Shutdown::Both);
+        }
     }
 
     /// 发送一条标准事件 `{type, modem_id?, data}`。
@@ -85,18 +109,27 @@ impl WsHub {
         self.lock().iter().filter(|c| !c.display).count()
     }
 
-    /// 广播一条事件；写失败的连接随后会在读循环里被回收。
+    /// 广播一条事件；写失败的连接**立刻回收**（C-1：否则死连接会一直留在
+    /// 列表里，每次广播都卡一个写超时，采样循环整体变慢）。
     pub fn broadcast(&self, msg_type: &str, modem_id: Option<u32>, data: Value) {
         let clients: Vec<Arc<WsClient>> = self.lock().clone();
         for client in clients {
             if let Err(e) = client.send_event(msg_type, modem_id, data.clone()) {
-                log::debug!("推送失败（客户端 {}）: {e}", client.id);
+                log::warn!(
+                    "推送失败（客户端 {}），回收连接: {e}",
+                    client.id
+                );
+                client.shutdown();
+                self.unregister(client.id);
             }
         }
     }
 
     fn register(&self, stream: TcpStream, display: bool) -> Arc<WsClient> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        // 写超时设在 socket 上，try_clone 出来的 fd 共享同一份 SO_SNDTIMEO，
+        // 所以广播与读循环两个 fd 都受保护。
+        let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
         let client = Arc::new(WsClient {
             id,
             display,
@@ -164,11 +197,45 @@ pub fn serve(stream: TcpStream, head: &[u8], state: Arc<AppState>, loopback: boo
 }
 
 fn pump(stream: &mut TcpStream, client: &Arc<WsClient>, state: &Arc<AppState>) -> Result<()> {
+    let mut idle = 0u32;
     loop {
+        if client.display {
+            // 屏端是被动只读连接（自定义客户端，未必回 pong），不做 ping 探活；
+            // 它不参与 viewer_active，半开也不会影响采样节奏（C-5）。
+            stream.set_read_timeout(None)?;
+        } else {
+            // 先用 peek 等数据：空闲就发服务端 ping，连续多次没有任何上行
+            // 数据（连 pong 都不回）判死。peek 不消费字节，超时不会导致
+            // 帧读到一半状态错乱。
+            stream.set_read_timeout(Some(IDLE_PING))?;
+            let mut probe = [0u8; 1];
+            match stream.peek(&mut probe) {
+                Ok(0) => return Ok(()),
+                Ok(_) => {}
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    idle += 1;
+                    if idle >= IDLE_MISSES {
+                        log::info!("WebSocket 空闲超时，回收连接 id={}", client.id);
+                        return Ok(());
+                    }
+                    if let Err(e) = client.send_control(0x9, b"") {
+                        log::debug!("发送 ping 失败（客户端 {}）: {e}", client.id);
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(msg(format!("WebSocket 探活失败: {e}"))),
+            }
+            idle = 0;
+            // 有数据：整帧读取给一个有限超时，半截帧卡住不占线程
+            stream.set_read_timeout(Some(FRAME_TIMEOUT))?;
+        }
         match read_frame(stream)? {
             None => return Ok(()),
             Some((0x8, _)) => return Ok(()),
-            Some((0x9, payload)) => write_frame(stream, 0xA, &payload)?,
+            // pong 必须走同一把写锁（C-2），否则会与广播帧字节交错
+            Some((0x9, payload)) => client.send_control(0xA, &payload)?,
             Some((0x1, payload)) => {
                 let text = String::from_utf8_lossy(&payload);
                 handle_text(client, state, text.trim());
@@ -194,7 +261,7 @@ fn handle_text(client: &Arc<WsClient>, state: &Arc<AppState>, text: &str) {
             let Some(idx) = parse_index(&cmd.index) else {
                 return;
             };
-            with_modem_async(state, cmd.modem_id, move |modem, state| {
+            with_modem_async(state, cmd.modem_id, "sms_read", move |modem, state| {
                 if let Err(e) = modem.mark_sms_read(&idx.to_string()) {
                     log::warn!("标记短信已读失败（模组 {}）: {e}", modem.id);
                     return;
@@ -207,7 +274,7 @@ fn handle_text(client: &Arc<WsClient>, state: &Arc<AppState>, text: &str) {
             let Some(idx) = parse_index(&cmd.index) else {
                 return;
             };
-            with_modem_async(state, cmd.modem_id, move |modem, state| {
+            with_modem_async(state, cmd.modem_id, "sms_delete", move |modem, state| {
                 if let Err(e) = modem.delete_sms(&idx.to_string()) {
                     log::warn!("屏端删除短信失败（模组 {}）: {e}", modem.id);
                     return;
@@ -216,7 +283,7 @@ fn handle_text(client: &Arc<WsClient>, state: &Arc<AppState>, text: &str) {
             });
         }
         "mode_get" => {
-            with_modem_async(state, cmd.modem_id, move |modem, state| {
+            with_modem_async(state, cmd.modem_id, "mode_get", move |modem, state| {
                 super::push::push_mode(&state, &modem, String::new());
             });
         }
@@ -225,7 +292,7 @@ fn handle_text(client: &Arc<WsClient>, state: &Arc<AppState>, text: &str) {
             if value.is_empty() {
                 return;
             }
-            with_modem_async(state, cmd.modem_id, move |modem, state| {
+            with_modem_async(state, cmd.modem_id, "mode_set", move |modem, state| {
                 // 下发 + 回读确认都在 set_mode_pref 里（模组异步生效，可能占串口几秒）
                 let msg = match modem.set_mode_pref(&value) {
                     Ok(pref) => format!("已切换到 {}", pref.value_text),
@@ -237,7 +304,7 @@ fn handle_text(client: &Arc<WsClient>, state: &Arc<AppState>, text: &str) {
         "sms_send" => {
             let number = cmd.number.trim().to_string();
             let text = cmd.text.clone();
-            with_modem_async(state, cmd.modem_id, move |modem, state| {
+            with_modem_async(state, cmd.modem_id, "sms_send", move |modem, state| {
                 let err = modem.send_sms(&number, &text).err().map(|e| e.to_string());
                 super::push::push_sendsms(&state, &modem, &number, &text, err);
             });
@@ -245,7 +312,7 @@ fn handle_text(client: &Arc<WsClient>, state: &Arc<AppState>, text: &str) {
         "net_get" => {
             // 屏端是 Passive（不算"有人在看"），没人开网页时网络缓存是冷的，
             // 运营商名会一直空着 ⇒ 屏幕得自己开口要一次。
-            with_modem_async(state, cmd.modem_id, move |modem, state| {
+            with_modem_async(state, cmd.modem_id, "net_get", move |modem, state| {
                 super::push::push_network(&state, &modem);
             });
         }
@@ -277,21 +344,84 @@ fn modem_of(state: &AppState, id: u32) -> Option<Arc<crate::modem::model::Modem>
     state.mgr.get(id)
 }
 
-/// WS 指令的公共骨架：取模组 → 起独立线程干活。
+/// 同时在跑的 WS 占串口指令上限：屏端连点 / 多客户端重复下发时，
+/// 不能无限起线程再一起排 AT 队（D-C-8）。
+const MAX_CMD_THREADS: usize = 8;
+
+fn cmd_inflight() -> &'static Mutex<HashSet<(u32, &'static str)>> {
+    static SET: OnceLock<Mutex<HashSet<(u32, &'static str)>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn cmd_running() -> &'static AtomicUsize {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    &N
+}
+
+/// 指令配额守卫：线程结束（含 panic）才归还「在途」标记与计数。
+struct CmdSlot {
+    key: (u32, &'static str),
+}
+
+impl Drop for CmdSlot {
+    fn drop(&mut self) {
+        if let Ok(mut set) = cmd_inflight().lock() {
+            set.remove(&self.key);
+        }
+        cmd_running().fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// WS 指令的公共骨架：取模组 → 去重 → 起独立线程干活。
 ///
 /// 六个占串口的指令（sms_read / sms_delete / mode_get / mode_set / sms_send /
 /// net_get）都是这个形状。抽出来是为了让「取不到模组就静默返回」与
 /// 「必须离开 WS 读循环」这两条口径各自只有一处 —— 分叉一次，
 /// 某个指令就会在 WS 线程里同步占串口，把这一路的心跳与推送全卡住。
-fn with_modem_async<F>(state: &Arc<AppState>, id: u32, f: F)
-where
+///
+/// 同一 `(模组, 动作)` 只允许一个在途（屏端连点十次「读短信」没有意义），
+/// 总在途数也封顶 [`MAX_CMD_THREADS`]。
+fn with_modem_async<F>(
+    state: &Arc<AppState>,
+    id: u32,
+    action: &'static str,
+    f: F,
+) where
     F: FnOnce(Arc<crate::modem::model::Modem>, Arc<AppState>) + Send + 'static,
 {
     let Some(modem) = modem_of(state, id) else {
         return;
     };
+    let key = (id, action);
+    {
+        let Ok(mut set) = cmd_inflight().lock() else {
+            return;
+        };
+        if !set.insert(key) {
+            log::debug!("WS 指令 {action}（模组 {id}）已在执行，忽略重复请求");
+            return;
+        }
+    }
+    if cmd_running().fetch_add(1, Ordering::SeqCst) >= MAX_CMD_THREADS {
+        cmd_running().fetch_sub(1, Ordering::SeqCst);
+        if let Ok(mut set) = cmd_inflight().lock() {
+            set.remove(&key);
+        }
+        log::warn!("WS 指令并发已达 {MAX_CMD_THREADS}，丢弃 {action}（模组 {id}）");
+        return;
+    }
+    let slot = CmdSlot { key };
     let state = state.clone();
-    std::thread::spawn(move || f(modem, state));
+    let spawned = std::thread::Builder::new()
+        .name(format!("ws-{action}"))
+        .spawn(move || {
+            let _slot = slot;
+            f(modem, state);
+        });
+    if let Err(e) = spawned {
+        // 闭包（连同 slot）已被丢弃 ⇒ 配额已归还，只记日志
+        log::warn!("WS 指令线程启动失败（{action}）: {e}");
+    }
 }
 
 /// 屏端给的短信存储位置（只认非负整数；空 / 带空格等都当无效）。

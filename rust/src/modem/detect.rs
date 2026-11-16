@@ -176,10 +176,13 @@ fn same_family(a: Vendor, b: Vendor) -> bool {
 /// `MT5700M` / `MT5710` 在清单里挂在 `huawei` 名下，但它们的 ATI 与指令面
 /// 都是鼎桥那一套（`AT^MONSC` / `AT^CHIPTEMP`），项目既有归属也是鼎桥 ——
 /// 这里按型号纠一次，避免「清单说华为、方言用鼎桥」的错位。
+///
+/// ⚠️ `MH5000-*` **不能**跟着改判：`mh5000-31` 是华为海思、`mh5000-82/82m`
+/// 是展锐平台，但都是华为固件（Huawei 方言里有 unisoc 分支）；全系归 TDTech
+/// 会让它们拿到错误的拨号配方（A-P1-4）。
 fn vendor_of_entry(e: &catalog::Entry) -> Vendor {
     let m = catalog::flatten(&e.model);
-    if e.vendor == "huawei" && (m.starts_with("mt57") || m.starts_with("mh5000")) {
-        // MH5000 系列同样分华为/鼎桥两版：清单里归 huawei 的那些是鼎桥固件
+    if e.vendor == "huawei" && m.starts_with("mt57") {
         return Vendor::TDTech;
     }
     Vendor::from_key(&e.vendor).unwrap_or(Vendor::Unknown)
@@ -466,11 +469,11 @@ mod tests {
 
     #[test]
     fn exclusive_vid_is_enough_for_vendor() {
-        // 0e8d 在清单里只对应广和通，且这个 PID 没有端口规则
-        let u = usb("0e8d", "9999");
+        // 1a0e 在清单里只对应芯讯通，且这个 PID 没有端口规则
+        let u = usb("1a0e", "9999");
         let id = identify(Some(&u), &[]);
         assert_eq!(id.matched_by, MatchedBy::UsbVid);
-        assert_eq!(id.vendor, "fibocom");
+        assert_eq!(id.vendor, "simcom");
         assert_eq!(id.confidence, 45);
         assert_eq!(id.model, None, "只到厂商，不猜型号");
     }

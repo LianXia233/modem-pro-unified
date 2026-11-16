@@ -11,6 +11,80 @@
 
 ## [未发布]
 
+### 全量审查修复：模块识别 / 拨号 / 接口拉起 / V4·V6 取址 / APN 自动拨号 + 并发健壮性 (2026-11-16)
+
+围绕「模块识别、模块拨号、接口拉起、IPv4/IPv6 获取与分配、APN 自动拨号」做了一轮逐行审查
+（对照 QModem、ouyangzq/modem-pro、luci-proto-modem-pro、luci-app-fm350、luci-app-mt5700、
+openvohive 六个上游），并把发现的问题全部修完。归纳如下：
+
+**模组识别**
+- 同路径热插拔后按 USB 身份指纹（VID:PID@端口）判定更换并重建，不再沿用旧方言/参数缓存；
+  负探测缓存记录指纹，换设备立即失效，退避不再拖住新模组（A-P1-1/2）。
+- 无编号 MHI 通道（`mhi_DUN`/`mhi_AT`）归入同一组，不再注册成两台模组；PCIe 口按 BDF 分配
+  `wwan*` 名，补上大小写不敏感与 `/sys/class/mhi_uds` 解析（A-P1-3、A-P2-6/7）。
+- 厂商判定：`mt57*` 与目录中明确条目才改判 TDTech，`mh5000-*` 按平台归 Huawei/Unisoc；
+  SIMCom `1e0e` 走 VID 别名；补齐 Foxconn/Thales/Telit/Gosuncn/Neoway/Huawei 等 USB 家族与
+  `MODEM_VIDS`/`DATA_DRIVERS`（含 `mhi_netdev`/`t7xx`/`pcie_mhi`）（A-P1-4/5/6/7/8）。
+- `option new_id` 只写 `option*` 驱动，找不到时先 modprobe 再重试，绝不写进 ch341/cp210x 等
+  无关驱动（A-P1-9）。
+- 端口选择加入 `bInterfaceProtocol` 评分（0x12=PCUI/AT 优先，0x13/0x14 排除 AT 候选）与接口名
+  整词评分；`/dev` 目录扫描补 `ttyAP*` 等 serialport 漏枚举的口（A-P1-3、A-P2-11/16、A-P2-1）。
+- 修正 EM9291 quirk 键、EC20/EC200 词边界与平台归属、tdtech/foxconn 关键词、FM350 主机侧
+  VID=2cb7、catalog 补 gobinet/ncm 等目录级修正（A-P2-2/3/4/5/12/13/14/17、A-P2-18/19）。
+
+**拨号 / 自愈**
+- 探活移到全局会话锁之外（临时摘出 → 锁外 `alive()` → 放回），一个模组控制口卡死不再阻塞
+  其它模组的断开/协调（B-P1-1 / D-C-3）。
+- 拨号首段状态写入加代次守护，`usb_type()` 耗时期间用户点断开不会被 `manual_stop=false` 顶掉；
+  `dial_busy` 改 RAII，panic 不再永久卡住后续拨号（B-P1-2、B-P2-4）。
+- MBIM 去激活校验激活态并重试一次，start 失败路径补 deactivate；ACTIVATING 轮询到 ACTIVATED
+  才算成功，activating 超时按失败退避（B-P1-3、C-23）。
+- APN 优选四级回退修实：第 1 级与 `sync_dial_state` 均过滤 IMS/sos 内部 APN，拨号成功单独记录
+  `last_dial_apn`；运营商识别改为 ICCID（SIM 归属）优先，漫游时不再把中国预制 APN 写给外国 SIM
+  （B-P1-4、C-06、C-17）。
+- QMI stop 以 client 是否申请为闸门（不再被 handle==0 绕过）、失败重试并告警；result TLV 0x02
+  缺失判为该响应失败；MBIM 重同步改为逐字节滑动（B-P2-1/11/12）。
+- 原生拨号区分「用户手动拨号」与「自动协调」：`auto_dial=off` 只关自动重拨，页面点「拨号」仍生效；
+  `manual_stop` 按 USB 身份落盘并在重启首轮恢复，用户断开后重启不再自动连回（B-P2-5/8）。
+- 短暂 not-running 与 gone 走同一套清理（退避/自愈/在途/门禁/关联设备），旧账不再复活（B-P2-9）。
+- `reconcile` 加 single-flight；停止时 bump 代次并在 insert 前复查，退出期在途会话不会写回
+  会话表（B-P2-3 / D-C-12）。
+- 无 SIM / 未注册 / 无 APN 纳入轻量门禁（只读既有网络缓存，不新增 AT），不再周期性空拨；
+  MBIM 缺 APN 时给出显式 `no_apn` 停止原因（C-30、C-17）。
+- AT 断开内部上下文（IMS/sos）被拒时同样落 `manual_stop`/`stop_reason`，协调器不会立刻拨回；
+  非法 cid 分支也置手动停止（B-P2-2）。
+
+**接口拉起 / 取址 / 路由**
+- QMI `raw_ip=Y` 改用会话上报地址走 static（含会话真实子网掩码），主线 qmi_wwan 不再「已连接但
+  永远拿不到 IPv4」；MTU/DNS/网关一并落 UCI（C-01、C-11、C-25）。
+- 强制 DNS 改为 `delete + add_list`（netifd 的 dns 是 list 型，空格串会被整串丢弃）；hostnic
+  一键方案的 DNS 同样改 list；`uci show` 的 list 聚合口径与 cleanup 对齐（C-02、C-10、C-27）。
+- 主机地址采集改 `ip -o addr` 双栈并过滤 `fe80::/10`：v6-only 链路不再判「断开」，页面 v6 地址、
+  phase 的逐族路由检查恢复；`native_link_ok` 接受 v4 或 v6 任一有效地址（C-08）。
+- 断开链路补 `ifdown modem<id>` / `modem<id>_6`，`flush_stale` 增补 IPv6 全局地址与默认路由清理，
+  「已断开」后 v6 仍可上网的问题消除（C-03）。
+- v6 落地动作以「真的建了兄弟接口」为前提；`wan_ipv6_mode=static/ra` 在 modem_pro 且无兄弟接口时
+  不再产生路由/RA 副作用；RS 节流改单调时钟，NTP 校时跳变不再让 RS 停发数小时（C-04/05、C-16）。
+- `-P0` 仅在用户未显式给 `-P<n>` 时追加，`reqprefix` 的 PD 请求不再被覆盖（C-09）。
+- `is_usable_global_v6` 收紧到 2000::/3；归档恢复片段按 shell 规则转义单引号；cleanup 缺席轮数
+  按模组去重；`set_apn` 的 `pdp_type` 走白名单校验、回读比较忽略大小写（C-14/15/13、C-07、C-18）。
+- 幂等补 `ifup` 尊重 `manual_stop`：用户断开后不再每 45 秒把接口拉回来（B-P2-7）。
+- `interface_down` 改为解析 `ifstatus` 顶层 JSON `up`，嵌套字段不再掩盖真实 down（C-28）。
+
+**并发 / 进程健壮性**
+- WebSocket：写超时 + 写失败立即摘除；pong 走统一写锁不再与广播交错；服务端 ping + 读超时回收
+  半开连接；屏端占串口指令按 `(模组,动作)` 去重并限制总并发（C-1/2/5、D-C-8）。
+- 网关：并发连接上限 96（超限 503）、请求头不完整直接 400 关连接（截断头不再可能绕过
+  `X-Real-IP` 覆盖），头后转发加双向空闲超时（C-7、C-15）。
+- 后台循环（urc/netprov/push/traffic/quota/change/hotplug/sim/logs + 巡检/定时/ifstat/ntp）统一用
+  `catch_unwind` 监护，panic 记日志并退避重启（C-6）；线程总数按实际接线统计（C-14）。
+- 任务注册去重与插入同一把锁；`progress()` 不再把已取消任务写回 Running（C-4、C-16）。
+- 退出钩子先删 PID，再限时 5 秒执行清理，超时直接退出，procd 重启不再被卡住的清理挡住；
+  台账落盘：QuotaStore 改原子写，SchedStore 锁内快照、锁外写（C-13、D-C-10/11）。
+
+**测试**：`cargo test --locked` 全绿（891 项），新增/扩充覆盖上述修复点的单测。
+
+
 ### 修复：LuCI 调试工具「预设 AT 命令」下拉为空 (2026-11-17)
 
 - `luci/app/js/view/modemd/tools.js`：AT 调试台的「常用指令预设」下拉此前把

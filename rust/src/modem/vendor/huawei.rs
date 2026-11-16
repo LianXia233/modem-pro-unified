@@ -30,7 +30,9 @@ impl VendorSpec for Spec {
     }
 
     fn detect(&self, lines: &[String]) -> bool {
-        any_line(lines, &["HUAWEI", "MH5000", "MT5710"])
+        // 不认 MT5710：那是鼎桥固件（TDTech 在 DETECT_ORDER 里排在前面）。
+        // 两边都认会让同一块模块的归属随检测顺序漂移（A-P2-5）。
+        any_line(lines, &["HUAWEI", "MH5000"])
     }
 
     fn serving_cell_cmd(&self) -> &'static str {
@@ -113,6 +115,7 @@ impl VendorSpec for Spec {
                 autodial_probe: Some(super::datacall::AutodialProbe {
                     query: "AT^SETAUTODIAL?",
                     fallback: "AT^NDISDUP=0,0",
+                    status: None,
                 }),
                 note: "展锐平台由模组自拨，主机不持有 PDP；断开需 CFUN 循环（先查自拨状态）",
             });

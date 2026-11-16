@@ -8,7 +8,7 @@
 //! 分组口径见 `module/netdev/ports_unix.go:112` 的 `GroupByUSBDevice`。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,6 +32,12 @@ pub struct Modem {
     pub id: u32,
     /// AT 口路径（/dev/ttyUSB0 或 COM3）；切口时整口换掉（见 `repoint`），故加锁保护
     port: Mutex<String>,
+    /// 当前 AT 口背后的 USB 身份指纹（`vid:pid@bus`；取不到为空）。
+    ///
+    /// 同名的 `/dev/ttyUSB*` 在热插拔后可能换成另一块模组（或同型号复位重枚举）。
+    /// `reap_gone` 只查设备文件是否存在会漏掉这种情况，旧身份/方言/缓存会一直
+    /// 残留（A-P1-1）。指纹变化 ⇒ 视为旧模组已消失，回收后按新设备重建。
+    usb_fp: Mutex<String>,
     /// 这台物理设备上的全部**可作 AT 口**的 tty（首选项在前）。
     ///
     /// 排序约定：下标 0 是首选（也是当前口），其后是回退候选；切口
@@ -53,6 +59,11 @@ pub struct Modem {
     /// 与 `vendor` / `model` 分开存：那两个是「结论」，这里是「为什么」。
     /// 页面要显示识别依据、排障要看冲突原因，都得从这里取。
     ident: Mutex<Option<crate::modem::detect::Identify>>,
+    /// 连续「AT 完全无应答」的识别次数。
+    ///
+    /// 一次读超时就清空厂商/型号会让身份抖动（页面在「已识别 / 未识别」之间跳，
+    /// 方言缓存被反复作废）。连续 3 次都问不出话才认定为真的识别不出（A-P2-18）。
+    ident_misses: std::sync::atomic::AtomicU32,
     /// 这台模组的 AT 命令口是用户手动指定的（界面标「手动」；见 http/at_port.rs）
     at_port_manual: AtomicBool,
     /// 惰性打开的 AT 口（首次查询时打开）
@@ -111,6 +122,12 @@ pub struct Modem {
     pub(super) link_since: Mutex<Option<Instant>>,
     /// 拨号状态机（见 model/dial.rs；零值 = 没拨过号）
     pub(super) dial_state: Mutex<DialState>,
+    /// 最近一次**实际拨号用过**的 APN（内部专用 APN 不记）。
+    ///
+    /// 独立于 `dial_state.apn`：后者会被本次请求（可能留空）覆盖，也会被
+    /// `CGCONTRDP` 报的在用 APN 刷新甚至写成内部上下文（ims 等）。空 APN
+    /// 拨号时需要这里回退（MBIM 必须 `-s`、FM350 cid 消失后补写）。
+    pub(super) last_dial_apn: Mutex<String>,
     /// 拨号流程进行中（拨号要连发几条 AT，不允许并发）
     pub(super) dial_busy: AtomicBool,
     /// 连接代次（generation）：每次「连接意图」变化就 +1。
@@ -128,6 +145,13 @@ pub struct Modem {
     ///
     /// 只做「提交门禁」，不打断在途 AT 收发（串口上发出去的字节收不回来）。
     pub(super) dial_epoch: AtomicU64,
+    /// 「用户显式点了拨号」的一次性标记（只对主机侧拨号类型有意义）。
+    ///
+    /// QMI/MBIM 的 [`Modem::dial`] 只把请求**交办**给协调器（真正的会话由
+    /// `runtime/dialer::reconcile` 建）。自动拨号开关（`[net] auto_dial`）关闭时
+    /// 必须能区分「人点的」与「协调器自己巡检到的」：否则要么用户点了没反应，
+    /// 要么关了开关还自动重连（B-P2-5）。
+    pub(super) manual_dial_req: AtomicBool,
     /// USB 类型识别缓存（30 秒 TTL，见 model/dial.rs 的 `usb_type`）
     pub(super) dial_type: Mutex<Option<(DialTypeInfo, Instant)>>,
     /// IMEI 缓存（`imei()` 每次发 AT；定时器目标解析会反复问，见 model/schedule.rs）
@@ -177,11 +201,22 @@ struct SmsCache {
     unread: usize,
 }
 
+/// 某 AT 口背后的 USB 身份指纹（`vid:pid@bus`）；非 USB / 取不到返回空串。
+///
+/// 只看 vid/pid 不够：同一台模组复位重枚举会换 bus 路径，而同一 bus 路径也可能
+/// 插上另一块同型号模组 —— 两者一起才构成「这台设备是谁」的稳定标识。
+fn fingerprint_for(port: &str) -> String {
+    crate::modem::usbdev::identity_for_tty(port)
+        .map(|u| format!("{}:{}@{}", u.vid, u.pid, u.bus_path))
+        .unwrap_or_default()
+}
+
 impl Modem {
     pub fn new(id: u32, port: String, baud: u32, cmd_timeout: Duration, vendor: Vendor) -> Self {
         Self {
             id,
             port: Mutex::new(port.clone()),
+            usb_fp: Mutex::new(fingerprint_for(&port)),
             ttys: Mutex::new(vec![port]),
             baud,
             first_seen: Instant::now(),
@@ -190,6 +225,7 @@ impl Modem {
             model: Mutex::new(None),
             model_raw: Mutex::new(None),
             ident: Mutex::new(None),
+            ident_misses: std::sync::atomic::AtomicU32::new(0),
             at_port_manual: AtomicBool::new(false),
             at: Mutex::new(None),
             at_cooldown: super::super::at::OpenCooldown::default(),
@@ -210,8 +246,10 @@ impl Modem {
             netscan_stop: Mutex::new(None),
             link_since: Mutex::new(None),
             dial_state: Mutex::new(DialState::default()),
+            last_dial_apn: Mutex::new(String::new()),
             dial_busy: AtomicBool::new(false),
             dial_epoch: AtomicU64::new(0),
+            manual_dial_req: AtomicBool::new(false),
             dial_type: Mutex::new(None),
             imei_cache: Mutex::new(None),
             mode_supported_slot: Mutex::new(None),
@@ -674,7 +712,8 @@ impl Modem {
             .unwrap_or_default();
         let lines = split_at_lines(&ati);
         let mut evidence_lines = lines.clone();
-        if lines.is_empty() || at_resp_is_error(&lines) {
+        let mut answered = !lines.is_empty() && !at_resp_is_error(&lines);
+        if !answered {
             for alt in ["AT+CGMM", "AT+CGMR"] {
                 let resp = self
                     .with_at_prio(Prio::Data, |p| p.command(alt, self.cmd_timeout))
@@ -683,8 +722,26 @@ impl Modem {
                 if alt_lines.is_empty() || at_resp_is_error(&alt_lines) {
                     continue;
                 }
+                answered = true;
                 evidence_lines.extend(alt_lines);
             }
+        }
+
+        // 串口这次**完全没应答**（超时 / 正在重启），而上一轮已经认出过身份：
+        // 不能立刻清空型号 —— 一次读超时就让页面在「已识别/未识别」之间跳、
+        // 方言缓存反复作废。连续 3 次问不出话才当真（A-P2-18）。
+        // 有应答但型号不在清单里属于真实结论，照旧走下面的清除逻辑。
+        if !answered && self.model.lock().unwrap().is_some() {
+            let misses = self.ident_misses.fetch_add(1, Ordering::SeqCst) + 1;
+            if misses < 3 {
+                log::warn!(
+                    "模组 {} 本轮 AT 无应答，保留上次身份（连续第 {misses}/3 次）",
+                    self.id
+                );
+                return Ok(());
+            }
+        } else if answered {
+            self.ident_misses.store(0, Ordering::SeqCst);
         }
 
         let usb = crate::modem::usbdev::identity_for_tty(&self.port());
@@ -747,6 +804,7 @@ impl Modem {
     pub fn repoint(&self, port: &str) -> Result<()> {
         *self.at.lock().unwrap() = None;
         *self.port.lock().unwrap() = port.to_string();
+        *self.usb_fp.lock().unwrap() = fingerprint_for(port);
         {
             // 切过去的口排到最前，其余保留（页面「其它 tty」据此显示）
             let mut list = self.ttys.lock().unwrap();
@@ -761,6 +819,27 @@ impl Modem {
         // 手动指定可能指向另一台机器：IMEI 缓存一并作废
         *self.imei_cache.lock().unwrap() = None;
         self.identify()
+    }
+
+    /// 当前 AT 口背后的设备身份是否已经换了（A-P1-1）。
+    ///
+    /// 设备文件还在、但 USB 指纹（vid:pid@bus）与登记时不同 ⇒ 同名 tty 上
+    /// 已经换成另一块模组 / 同型号复位重枚举到了新拓扑。调用方应把旧 Modem
+    /// 回收重建，否则厂商 / 型号 / 方言 / 各类缓存全是上一块设备的。
+    ///
+    /// 无 USB 身份（PCIe、纯串口）或两边都取不到指纹时返回 `false` ——
+    /// 没有证据就不动，避免把好设备误杀。
+    pub fn usb_identity_changed(&self) -> bool {
+        let cur = fingerprint_for(&self.port());
+        let mut slot = self.usb_fp.lock().unwrap_or_else(|e| e.into_inner());
+        if cur.is_empty() || slot.is_empty() {
+            return false;
+        }
+        if *slot != cur {
+            *slot = cur;
+            return true;
+        }
+        false
     }
 
     /// 手动指定命令口时用的「模组身份」键：

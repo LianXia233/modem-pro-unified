@@ -148,6 +148,12 @@ impl Modem {
         if !valid_apn(apn) {
             return Err(msg("APN 只允许字母 / 数字与 . - _"));
         }
+        // PDP 类型是**直接拼进 AT 命令**的参数，必须先归一 + 白名单校验：
+        // `pdp_type='IP","x'` 之类会改写 CGDCONT 的参数结构（HTTP 边界注入）。
+        let pdp_type = pdp_type.trim().to_ascii_uppercase();
+        if !super::dial::valid_pdp_type(&pdp_type) {
+            return Err(msg("PDP 类型只允许 IP / IPV6 / IPV4V6"));
+        }
         let mut steps = Vec::new();
 
         // 幂等闸门：该 cid 已经是同 APN + 同类型时**跳过重写与重激活**。
@@ -196,7 +202,13 @@ impl Modem {
                 .iter()
                 .find(|c| c.cid == cid)
                 .map(|c| c.apn.clone());
-            if stored.as_deref() != Some(apn) {
+            // 回读比较忽略大小写：部分固件会把 APN 规范化成大写存储，
+            // 精确比较会把「写入成功」误报成失败。
+            let same = stored
+                .as_deref()
+                .map(|v| v.eq_ignore_ascii_case(apn))
+                .unwrap_or(false);
+            if !same {
                 return Err(msg(format!(
                     "模组回读了不一样的 APN（写入 {apn}，回读 {}）",
                     stored.unwrap_or_else(|| "空".to_string())

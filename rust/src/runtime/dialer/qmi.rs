@@ -179,13 +179,20 @@ pub fn find_tlv(payload: &[u8], kind: u8, skip_result: bool) -> Option<&[u8]> {
         .map(|(_, v)| v)
 }
 
-/// 读结果码：`(result, error)`；没有结果码 TLV 视为成功（有些固件省略）。
+/// 应答缺少/截断结果 TLV 时的返回值（QMI 里没有这个组合，作协议错误标记）。
+pub const RESULT_PROTOCOL_ERROR: (u16, u16) = (0xFFFF, 0xFFFF);
+
+/// 读结果码：`(result, error)`。
+///
+/// **响应类消息必须带 0x02 结果 TLV**（QMI 规范要求）。缺失说明应答被截断
+/// 或帧错位 —— 必须判失败；早先「没有结果码就视为成功」会把畸形/断帧
+/// 当成操作成功，例如 Start 实际没起来却返回成功（B-P2-11）。
 pub fn result(payload: &[u8]) -> Result<(), (u16, u16)> {
     let Some(v) = find_tlv(payload, 0x02, false) else {
-        return Ok(());
+        return Err(RESULT_PROTOCOL_ERROR);
     };
     if v.len() < 4 {
-        return Ok(());
+        return Err(RESULT_PROTOCOL_ERROR);
     }
     let r = u16::from_le_bytes([v[0], v[1]]);
     let e = u16::from_le_bytes([v[2], v[3]]);
@@ -636,6 +643,10 @@ mod tests {
         // 失败结果码
         let bad = tlv(0x02, &[1, 0, 0x2D, 0]);
         assert_eq!(result(&bad), Err((1, 45)));
+        // 缺结果 TLV / 结果 TLV 被截断 ⇒ 协议错误，不能当成功（B-P2-11）
+        assert_eq!(result(&tlv(0x01, &[1, 2])), Err(RESULT_PROTOCOL_ERROR));
+        assert_eq!(result(&tlv(0x02, &[0, 0])), Err(RESULT_PROTOCOL_ERROR));
+        assert_eq!(result(&[]), Err(RESULT_PROTOCOL_ERROR));
     }
 
     #[test]

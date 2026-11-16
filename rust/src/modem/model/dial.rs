@@ -131,6 +131,20 @@ pub fn valid_cid(cid: i32) -> bool {
     (0..=42).contains(&cid)
 }
 
+/// `Modem::dial_busy` 的 RAII 释放器（见 [`Modem::dial`]）。
+///
+/// 拨号流程里有多条 `?` 提前返回的路径；手工 `store(false)` 一旦漏一条
+/// 或某处 panic，busy 就永远是 true，之后所有拨号都被拒到进程重启。
+struct DialBusyGuard<'a> {
+    flag: &'a std::sync::atomic::AtomicBool,
+}
+
+impl Drop for DialBusyGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// PDP 类型合法性（只认实测枚举出来的三种，PPP 不用于数据）。
 pub fn valid_pdp_type(t: &str) -> bool {
     matches!(t.trim().to_uppercase().as_str(), "IP" | "IPV6" | "IPV4V6")
@@ -250,7 +264,9 @@ pub struct DialState {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub backend: String,
     /// 这一轮为什么没拨 / 为什么被停（稳定代码，见 [`crate::runtime::dialer::gate`]）：
-    /// `host_dial_off` / `dial_disabled` / `roaming` / `airplane` / `manual_stop` / `quota`。
+    /// `host_dial_off` / `dial_disabled` / `roaming` / `airplane` / `manual_stop` / `quota`；
+    /// 协调器另外可能写 `sim_missing` / `no_service`（缓存判明没卡/未注册）/
+    /// `no_apn`（MBIM 缺 APN，需用户配置）。
     ///
     /// 与 `last_error` 的分工：`last_error` 是短信式的说明（含文本），本字段是给
     /// 前端与 ubus 做**判断**用的 —— 例如只有 `manual_stop` 才该阻止自动重拨，
@@ -778,9 +794,13 @@ pub fn match_dial_iface(name: &str) -> (bool, bool) {
 /// IPv6 能从 `/proc/net/if_inet6` 读到，IPv4 则必须走 `getifaddrs` ——
 /// Rust 标准库没有这个接口，而本仓库刻意不引 libc 依赖（OpenWrt 交叉编译越省越好）。
 ///
-/// 于是用 `ip -4 -o addr show dev <dev>`：OpenWrt 自带 iproute2，输出稳定，
-/// 一行一台地址。**带 5 秒缓存**是因为 `/api/dial` 与 `/api/snapshot` 都会被
-/// 页面轮询，不缓存就会每 3 秒 fork 一个进程 —— 在 MT7621 这类小机器上很浪费。
+/// 于是用 `ip -o addr show dev <dev>` 一次取**双族**地址：OpenWrt 自带
+/// iproute2，输出稳定，一行一台地址。IPv6 链路本地（`fe80::/10`，`scope link`）
+/// 不是可路由地址，读出来会把「IPv6-only 已就绪」误判成在线、也会让页面把
+/// 一个 fe80 地址当成本机 IPv6 —— 一律过滤（C-08）。
+///
+/// **带 5 秒缓存**是因为 `/api/dial` 与 `/api/snapshot` 都会被页面轮询，
+/// 不缓存就会每 3 秒 fork 一个进程 —— 在 MT7621 这类小机器上很浪费。
 ///
 /// `pub(crate)`：拨号协调器的掉线自愈（`runtime::dialer`）也用它判
 /// 「会话在跑但数据网卡一直没有地址」（对齐上游 `hostDialHasAddr`）。
@@ -805,10 +825,46 @@ pub(crate) fn iface_addrs_cached(dev: &str) -> Vec<String> {
     addrs
 }
 
-/// 真正执行 `ip -4 -o addr show dev <dev>` 并解析。
+/// 解析 `ip -o addr show dev <dev>` 的输出（纯函数，便于单测）。
+///
+/// 行形如：
+///   `2: eth2    inet 10.42.0.16/24 brd 10.42.0.255 scope global eth2`
+///   `2: eth2    inet6 2408:.../64 scope global dynamic`
+///   `2: eth2    inet6 fe80::.../64 scope link`    ← 丢弃
+fn parse_iface_addrs(text: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    for line in text.lines() {
+        let (v6, rest) = if let Some(p) = line.find(" inet ") {
+            (false, &line[p + 6..])
+        } else if let Some(p) = line.find(" inet6 ") {
+            (true, &line[p + 7..])
+        } else {
+            continue;
+        };
+        let addr = rest.split_whitespace().next().unwrap_or("");
+        if addr.is_empty() {
+            continue;
+        }
+        if v6 {
+            // fe80::/10 链路本地：scope link 或前缀落在 fe80–febf。二者取一即丢弃。
+            let low = addr.to_ascii_lowercase();
+            let link_local = low.starts_with("fe8")
+                || low.starts_with("fe9")
+                || low.starts_with("fea")
+                || low.starts_with("feb");
+            if link_local || rest.contains("scope link") {
+                continue;
+            }
+        }
+        v.push(addr.to_string());
+    }
+    v
+}
+
+/// 真正执行 `ip -o addr show dev <dev>`（双族）。
 fn read_iface_addrs(dev: &str) -> Vec<String> {
     let out = std::process::Command::new("ip")
-        .args(["-4", "-o", "addr", "show", "dev", dev])
+        .args(["-o", "addr", "show", "dev", dev])
         .output();
     let Ok(out) = out else {
         return Vec::new();
@@ -816,21 +872,7 @@ fn read_iface_addrs(dev: &str) -> Vec<String> {
     if !out.status.success() {
         return Vec::new();
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut v = Vec::new();
-    for line in text.lines() {
-        // 形如：`2: eth2    inet 10.42.0.16/24 brd 10.42.0.255 scope global eth2`
-        let Some(pos) = line.find(" inet ") else {
-            continue;
-        };
-        let rest = &line[pos + 6..];
-        let addr = rest.split_whitespace().next().unwrap_or("");
-        if addr.is_empty() {
-            continue;
-        }
-        v.push(addr.to_string());
-    }
-    v
+    parse_iface_addrs(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// netifd 接口在线时长（秒）—— `ifstatus <iface>` 的 `uptime`，带 5 秒缓存。
@@ -1423,6 +1465,41 @@ pub fn split_addrs(field: &str) -> (String, String) {
     (ipv4, ipv6)
 }
 
+/// `AT^SETAUTODIAL?` 应答是否表示「自拨已开启」。
+///
+/// 应答形如 `^SETAUTODIAL: 1,4`；固件也可能印成 `^SETAUTODAIL:`（手册自身
+/// 拼写不一致，见上游 luci-app-mt5700）。取关键字后第一个逗号段作为开关，
+/// 容忍冒号/逗号后的空格 —— 早先按子串 `":1"` 判断，遇到 `": 1"` 会误判成
+/// 「没开」，一次点击断开就退化成不碰射频、挂不断数据。
+fn autodial_is_on(resp: &str) -> bool {
+    resp.lines().any(|line| {
+        let l = line.trim();
+        if !l.to_ascii_uppercase().contains("SETAUTO") {
+            return false;
+        }
+        l.split(':')
+            .nth(1)
+            .and_then(|rest| rest.split(',').next())
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// `AT^NDISSTATQRY?` 应答 → USB 数据面是否已连接。
+///
+/// 手册 §16.4.1/§16.4.5：`^NDISSTATQRY: <cid>,<stat>[,...]`，**首段是 cid**，
+/// 只有 `cid == 1 && stat == 1` 才算已连接（上游曾把首段当状态读，已修正）。
+/// 无该行 / 字段不足 / 非数字 → `None`（无法判定，不是「未连接」）。
+fn ndis_stat_active(resp: &str) -> Option<bool> {
+    let line = resp
+        .lines()
+        .find(|l| l.trim().to_ascii_uppercase().starts_with("^NDISSTATQRY"))?;
+    let mut f = line.split(':').nth(1)?.split(',');
+    let cid: i32 = f.next()?.trim().parse().ok()?;
+    let stat: i32 = f.next()?.trim().parse().ok()?;
+    Some(cid == 1 && stat == 1)
+}
+
 /// 从 `AT+CGPADDR` 应答里取主数据上下文的 IPv4/IPv6。
 ///
 /// 优先 preferCID（通常 cid=1），拿不到再取第一个非空的上下文。
@@ -1706,6 +1783,15 @@ impl Modem {
     /// 为什么要在 idle 时补：自动组网（`auto_wan`）早就把 `modem<id>` 建起来、
     /// 地址也拿到了，但状态机仍是 `idle`（没手动拨过号）—— 早先这两格只在
     /// `connected` 时才填，页面上「主机侧网卡」永远是 `-`，看着像没读到数据。
+    /// 用户是否点过「断开」（`manual_stop`）。只读内存状态：不发 AT、不查网卡，
+    /// 供自动组网每轮做「别再补 ifup」这类轻量判断（见 B-P2-7）。
+    pub fn manual_stopped(&self) -> bool {
+        self.dial_state
+            .lock()
+            .map(|s| s.manual_stop)
+            .unwrap_or(false)
+    }
+
     pub fn dial_status(&self) -> DialState {
         let mut st = self.dial_state.lock().unwrap().clone().normalized();
         st.modem_id = self.id;
@@ -1943,7 +2029,9 @@ impl Modem {
         }
         self.dial_update(|s| {
             if let Some(apn) = st.apn.as_deref() {
-                if !apn.is_empty() && apn != s.apn {
+                // 固件常把 IMS / SOS 等内部上下文列在最前；那不是数据 APN，
+                // 原生拨号拿它去 WDS Start / MBIM CONNECT 会被拒（B-P1-4）。
+                if !apn.is_empty() && !is_internal_apn(apn) && apn != s.apn {
                     s.apn = apn.to_string();
                 }
             }
@@ -2155,6 +2243,27 @@ impl Modem {
         true
     }
 
+    /// 重启后恢复「用户已经断开」的意图（B-P2-8）。
+    ///
+    /// `manual_stop` 只在内存里，进程重启就丢；协调器首轮从
+    /// `dial_intent.json` 读回来后再调本函数。**只恢复门禁**，不猜链路状态：
+    /// 真连着的话，地址/阶段字段会由 `dial_status()` 的实测部分给出。
+    pub(crate) fn restore_manual_stop(&self, stop_reason: &str) {
+        let reason = if stop_reason.trim().is_empty() {
+            "manual_stop".to_string()
+        } else {
+            stop_reason.trim().to_string()
+        };
+        self.dial_update(|s| {
+            s.manual_stop = true;
+            s.stop_reason = reason;
+            if s.state == DIAL_CONNECTED || s.state == DIAL_DIALING {
+                s.state = DIAL_IDLE.to_string();
+                s.state_text = dial_state_text(DIAL_IDLE);
+            }
+        });
+    }
+
     /// 原生后端掉线 / 被重建：把状态从 connected 拉回 dialing（准备重拨）并记原因。
     ///
     /// 与 [`Self::hangup`] 的区别：那不是「人」的意图，**不能**置 `manual_stop`
@@ -2312,11 +2421,20 @@ impl Modem {
         ))
     }
 
-    /// 最近一次**从模组读出来**的 APN（拨号时记下的）。内部专用 APN 不算。
+    /// 最近一次**实际拨号用过**的 APN（内部专用 APN 不算）。
+    ///
+    /// 读独立字段（`last_dial_apn`），不再读 `dial_state.apn` —— 后者会被
+    /// 本次请求（可能留空）覆盖，也被 `CGCONTRDP` 的在用值刷新；两者共用
+    /// 会让「四级回退」的第 2 级变成死代码（B-P1-4）。
     ///
     /// `pub(crate)`：拨号器托管要用它给 MBIM 补 `-s`（没 APN 拨号器直接退出）。
     pub(crate) fn last_dial_apn(&self) -> String {
-        let apn = self.dial_state.lock().unwrap().apn.trim().to_string();
+        let apn = self
+            .last_dial_apn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .trim()
+            .to_string();
         if apn.is_empty() || is_internal_apn(&apn) {
             return String::new();
         }
@@ -2374,10 +2492,25 @@ impl Modem {
         {
             return Err(msg("上一次拨号还在进行中，请稍候再试"));
         }
-        let result = self.dial_inner(req, activate_ims);
-        self.dial_busy
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        result
+        // RAII：`dial_inner` 里任何一条 `?` 提前返回、甚至 panic，都要把 busy
+        // 放掉。早先是手工 store(false)，一旦某条路径 panic 就永远 busy，
+        // 之后所有拨号都被拒到进程重启（B-P2-4）。
+        let _busy = DialBusyGuard {
+            flag: &self.dial_busy,
+        };
+        self.dial_inner(req, activate_ims)
+    }
+
+    /// 是否有「用户显式点了拨号」的交办还没被协调器消费（见 `manual_dial_req`）。
+    pub(crate) fn manual_dial_requested(&self) -> bool {
+        self.manual_dial_req
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 消费一次「用户显式点了拨号」的交办（协调器真正开始建会话时调）。
+    pub(crate) fn take_manual_dial_request(&self) -> bool {
+        self.manual_dial_req
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// 拨号主流程（busy 锁由 [`Self::dial`] 持有）。
@@ -2421,6 +2554,33 @@ impl Modem {
             .as_ref()
             .map(|d| d.host_setup.clone())
             .unwrap_or_default();
+        // `usb_type(force)` 可能耗数秒（重新枚举 USB 拓扑）。这期间用户点断开
+        // （`hangup` bump 代次并置 manual_stop）或自动调度发起新一轮拨号 ——
+        // 若继续写状态，下面的 manual_stop=false / state=dialing 会把断开意图
+        // 顶掉（拨号↔断开竞态，B-P1-2）。代次失配 ⇒ 本次不再写任何状态。
+        self.dial_stale(epoch)?;
+        // 记住「上一次在用的 / 本次显式指定的 APN」，供空 APN 拨号回退
+        // （MBIM 必须 `-s`、FM350 cid 停用后消失需补写）。必须在下面的
+        // `dial_update` 覆盖 `s.apn` 之前读旧值；内部 APN 一律不记。
+        {
+            let prev = self
+                .dial_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .apn
+                .trim()
+                .to_string();
+            let mut slot = self
+                .last_dial_apn
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !prev.is_empty() && !is_internal_apn(&prev) {
+                *slot = prev;
+            }
+            if !apn.is_empty() && !is_internal_apn(apn) {
+                *slot = apn.to_string();
+            }
+        }
         self.dial_update(|s| {
             s.state = DIAL_DIALING.to_string();
             s.state_text = dial_state_text(DIAL_DIALING);
@@ -2547,11 +2707,15 @@ impl Modem {
                 self.id,
                 info.kind,
                 if apn.is_empty() {
-                    "（沿用模组配置）"
+                    "（沿用模组配置）".to_string()
                 } else {
-                    apn
+                    apn.to_string()
                 }
             );
+            // 这次是**人**点的（自动路径不会调到这里）：留一个一次性标记，
+            // 协调器在 `[net] auto_dial` 关闭时据此放行这一次建会话（B-P2-5）。
+            self.manual_dial_req
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             return Ok(st);
         }
 
@@ -2704,6 +2868,20 @@ impl Modem {
             Err(e) => self.dial_step("读取本机地址（AT+CGPADDR）", false, &e.to_string()),
         }
 
+        // ③b 模组侧数据面核对（鼎桥 MT5700：`AT^NDISSTATQRY?`）。
+        //     只看 `AT+CGPADDR` 不够 —— 模组可能报了 PDP 地址却根本没把数据
+        //     送进 USB 网卡。上游把这条与 `AT+CGACT?` 一起当「可用性双判决」。
+        if let Some(cmd) = plan.autodial_probe.as_ref().and_then(|p| p.status) {
+            let resp = self.at_cmd_prio(Prio::Data, cmd);
+            let (ok, note) = match ndis_stat_active(&resp) {
+                Some(true) => (true, "cid=1 数据面已连接"),
+                Some(false) => (false, "模组报告 cid=1 未连接（自拨可能未生效）"),
+                // 固件不支持/回 ERROR：不据此判失败，以主机网卡与路由为准
+                None => (true, "应答无法解析（固件可能不支持该查询），以主机网卡为准"),
+            };
+            self.dial_step(&format!("模组数据面（{cmd}）"), ok, note);
+        }
+
         // ④ 找主机侧网卡：**只认这个模组 USB 设备下的网卡**，绝不按名字猜。
         //
         //    早先走 `pick_dial_iface(&dial_iface_snapshot())` 的名字匹配，
@@ -2791,11 +2969,14 @@ impl Modem {
     ///   其它        → 发 `AT+CGACT=0,<cid>` + 回读确认。
     ///
     /// cid <= 0 时用当前拨号状态里的 cid，再不行用数据默认 cid。
-    /// ⚠️ 内部上下文（IMS / sos）有的固件不许手动停用，会回 ERROR —— 那时如实报错、不改状态。
+    /// ⚠️ 内部上下文（IMS / sos）有的固件不许手动停用，会回 ERROR —— 那时如实报错，
+    /// 数据面状态保持不动，但会落 `manual_stop`，避免自动组网马上又拨回来。
     pub fn hangup(&self, cid: i32) -> Result<DialState> {
         // 「用户要断开」是最高优先级的意图：第一步就作废所有在途拨号流程
         // （它们醒来后会被 `dial_stale` 挡住，不会把状态改回 connected）。
         self.bump_dial_epoch();
+        // 同时作废「人刚点的拨号」交办：断开之后再让协调器建会话就自相矛盾了。
+        self.take_manual_dial_request();
         let mut cid = cid;
         if cid <= 0 {
             cid = self.dial_state.lock().unwrap().cid;
@@ -2804,7 +2985,17 @@ impl Modem {
             cid = DEFAULT_DATA_CID;
         }
         if !valid_cid(cid) {
-            return Err(msg(format!("cid 必须在 0~42 之间，当前 {cid}")));
+            // 已经 bump 了代次（在途拨号会被挡住），但如果只返回 Err、不留「人」的
+            // 停止意图，协调器下一轮就会按退避把会话重新建起来 —— 用户看到的是
+            // 「点了断开又自己连上」。所以这里同样落 manual_stop，状态其余字段
+            // 保持现状（我们不知道模组当前实际处于什么状态）。
+            let reason = format!("cid 必须在 0~42 之间，当前 {cid}");
+            self.dial_update(|s| {
+                s.last_error = reason.clone();
+                s.manual_stop = true;
+                s.stop_reason = "manual_stop".to_string();
+            });
+            return Err(msg(reason));
         }
 
         // QMI/MBIM：数据呼叫归主机侧拨号器，模组侧本来就没有我们激活的上下文。
@@ -2853,9 +3044,9 @@ impl Modem {
         // 变成整模组重新注册（掉网几秒到几十秒），此时改走通用 NDISDUP。
         if let Some(probe) = &plan.autodial_probe {
             let resp = self.at_cmd_prio(Prio::Data, probe.query);
-            // 回读形如 `^SETAUTODAIL:1,4`（上游脚本里这个关键字就带拼写错误），
+            // 回读形如 `^SETAUTODIAL: 1,4`（固件也可能印成 `^SETAUTODAIL:`），
             // 冒号后第一段是开关状态；查不到/回 ERROR 一律按「没开」处理。
-            let autodial_on = resp.contains("SETAUTO") && resp.contains(":1");
+            let autodial_on = autodial_is_on(&resp);
             self.dial_step(
                 &format!("查询模组自拨状态（{}）", probe.query),
                 true,
@@ -2868,7 +3059,7 @@ impl Modem {
             if !autodial_on {
                 steps = vec![datacall::AtStep::new(
                     probe.fallback,
-                    "上游对未开启自拨的华为展锐机型走通用 NDISDUP 断开，不碰射频",
+                    "自拨未开启时改发通用 NDISDUP 断开，不碰射频",
                 )];
             }
         }
@@ -2907,10 +3098,21 @@ impl Modem {
             if !is_ok(&resp) {
                 let tail = format!("{}（{}）", step.cmd, step.why);
                 self.dial_step(&format!("断开数据连接（{}）", step.cmd), false, &tail);
-                return Err(msg(format!(
+                // 断开被拒（内部上下文 IMS/sos 不允许手动停用；或该 cid 本来就没激活）
+                // 时**不改数据面状态**——我们不知道它现在到底连没连。但「人点了断开」
+                // 这个意图必须落下来：否则协调器按退避又把会话拨回来，页面看起来
+                // 像「点了断开，过一会儿自己连上」。manual_stop 只影响自动组网，
+                // 不会替模组去动内部上下文。
+                let err = format!(
                     "模组拒绝 {}（内部上下文 IMS/sos 不允许手动停用；或该 cid 本来就没激活）",
                     step.cmd
-                )));
+                );
+                self.dial_update(|s| {
+                    s.last_error = err.clone();
+                    s.manual_stop = true;
+                    s.stop_reason = "manual_stop".to_string();
+                });
+                return Err(msg(err));
             }
             last_ok = step.cmd.clone();
         }
@@ -2953,6 +3155,35 @@ mod tests {
     use super::*;
 
     // ---------- 链路阶段 ----------
+
+    /// 自拨状态回读：冒号后可能带空格，固件还有 `SETAUTODAIL` 拼写。
+    #[test]
+    fn autodial_probe_parses_switch_after_colon() {
+        assert!(autodial_is_on("^SETAUTODIAL: 1,4\r\nOK"));
+        assert!(autodial_is_on("^SETAUTODAIL:1,4"));
+        assert!(!autodial_is_on("^SETAUTODIAL: 0,4"));
+        assert!(!autodial_is_on("ERROR"), "回 ERROR 按未开启处理");
+        assert!(!autodial_is_on(""), "空应答按未开启处理");
+        // 关键字出现在普通日志行里但没有冒号，不得误判
+        assert!(!autodial_is_on("AT^SETAUTODIAL?"));
+    }
+
+    /// `^NDISSTATQRY` 首段是 cid：只有 `1,1` 才算已连接。
+    #[test]
+    fn ndis_stat_reads_cid_then_state() {
+        assert_eq!(
+            ndis_stat_active("^NDISSTATQRY: 1,1,,,\"IPV4\",0,,,\"IPV6\"\r\nOK"),
+            Some(true)
+        );
+        // 未连接的回包 `1,0,...`：首段同样是 cid，不能读成「已连接」
+        assert_eq!(ndis_stat_active("^NDISSTATQRY: 1,0,,,\"IPV4\""), Some(false));
+        // 其它 cid 的活动不算主数据面
+        assert_eq!(ndis_stat_active("^NDISSTATQRY: 3,1"), Some(false));
+        // 不支持的固件 / 回 ERROR / 字段不足 → 无法判定
+        assert_eq!(ndis_stat_active("ERROR"), None);
+        assert_eq!(ndis_stat_active("^NDISSTATQRY: 1"), None);
+        assert_eq!(ndis_stat_active("^NDISSTATQRY: x,1"), None);
+    }
 
     #[test]
     fn phase_layers_follow_the_three_facts() {
@@ -3571,6 +3802,96 @@ mod tests {
         let before = m.dial_epoch();
         let _ = m.hangup(1); // 端口不存在 ⇒ 必失败，但 bump 已经发生
         assert!(m.dial_epoch() > before);
+        // 失败也必须落「人」的停止意图：否则协调器按退避又拨回来
+        let st = m.dial_status();
+        assert!(st.manual_stop, "AT 断开失败也要置 manual_stop");
+        assert_eq!(st.stop_reason, "manual_stop");
+        assert!(!st.last_error.is_empty(), "错误要留给页面看");
+    }
+
+    #[test]
+    fn iface_addr_parser_reads_both_families_and_drops_link_local() {
+        let text = "\
+2: eth2    inet 10.42.0.16/24 brd 10.42.0.255 scope global eth2\n\
+2: eth2    inet6 2408:8207:1234::1/64 scope global dynamic mngtmpaddr\n\
+2: eth2    inet6 fe80::1/64 scope link\n\
+2: eth2    inet6 febf::2/64 scope global\n\
+3: wwan0    inet6 2001:db8::5/64 scope global\n";
+        assert_eq!(
+            parse_iface_addrs(text),
+            vec![
+                "10.42.0.16/24".to_string(),
+                "2408:8207:1234::1/64".to_string(),
+                "2001:db8::5/64".to_string(),
+            ],
+            "双族都要读到，fe80::/10 链路本地一律丢弃"
+        );
+        // 没有地址 / 空输出
+        assert!(parse_iface_addrs("2: eth2    inet6 fe80::1/64 scope link\n").is_empty());
+        assert!(parse_iface_addrs("").is_empty());
+    }
+
+    #[test]
+    fn restored_manual_stop_blocks_auto_dial() {
+        // 重启后从盘上恢复「用户断开」：状态应为 idle、manual_stop=true，
+        // 且 auto_connect_allowed 必须拒绝自动拨号（B-P2-8）。
+        let m = dev_modem();
+        m.restore_manual_stop("");
+        let st = m.dial_status();
+        assert!(st.manual_stop);
+        assert_eq!(st.stop_reason, "manual_stop");
+        assert_eq!(st.state, DIAL_IDLE);
+        assert!(
+            !crate::runtime::dialer::auto_connect_allowed(&st, true, true, false, true),
+            "恢复的断开意图必须挡住自动拨号"
+        );
+        // 用户点「拨号」后应解除（恢复只是启动时的门禁，不是永久锁）
+        let req = crate::modem::model::DialRequest::default();
+        let _ = m.dial(&req, true, false);
+        assert!(!m.dial_status().manual_stop);
+    }
+
+    #[test]
+    fn manual_dial_request_is_one_shot_and_cleared_by_hangup() {
+        let m = dev_modem();
+        assert!(!m.manual_dial_requested());
+        m.manual_dial_req
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(m.manual_dial_requested());
+        assert!(m.take_manual_dial_request());
+        assert!(!m.manual_dial_requested(), "交办是一次性的");
+        m.manual_dial_req
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = m.hangup(1);
+        assert!(!m.manual_dial_requested(), "断开要作废点过的拨号");
+    }
+
+    #[test]
+    fn failed_dial_releases_busy_flag() {
+        // 端口不存在 ⇒ 拨号在早期就失败；busy 必须随 RAII 放掉，
+        // 否则第二次拨号会一直报「上一次拨号还在进行中」（B-P2-4）。
+        let m = dev_modem();
+        let req = crate::modem::model::DialRequest::default();
+        assert!(m.dial(&req, true, false).is_err());
+        assert!(!m.dial_in_progress(), "失败后 busy 必须已释放");
+        // 第二次仍应进入拨号流程（失败原因还是端口，而不是 busy）
+        let err = m.dial(&req, true, false).unwrap_err().to_string();
+        assert!(
+            !err.contains("还在进行中"),
+            "第二次不该被 busy 拦住：{err}"
+        );
+    }
+
+    #[test]
+    fn hangup_with_invalid_cid_still_records_manual_stop() {
+        // cid 越界是调用方 bug，但意图仍是「断开」——不能因为参数错就丢掉它，
+        // 否则自动组网会把链路拉回来。
+        let m = dev_modem();
+        assert!(m.hangup(99).is_err());
+        let st = m.dial_status();
+        assert!(st.manual_stop);
+        assert_eq!(st.stop_reason, "manual_stop");
+        assert!(!st.last_error.is_empty());
     }
 
     // ---------- 主机侧拨号的承载独占（移植自上游 modemUsesHostDialer 闸门） ----------

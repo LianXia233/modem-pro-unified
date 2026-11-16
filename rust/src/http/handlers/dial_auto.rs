@@ -5,6 +5,10 @@
 //! ≤15 秒一轮）统一巡检：
 //! PDP 掉了 / 开机没拨就自动重拨；用户手动断开（manual_stop）后不再打扰。
 //!
+//! 关着时**只禁自动**：AT 侧（ECM/RNDIS/NCM）不再空拨，原生侧（QMI/MBIM）
+//! 也不再自主建会话 —— 但用户刚在页面点过「拨号」的那一次交办仍会执行
+//! （`Modem::manual_dial_req`），否则会变成「关了开关，点拨号也没反应」。
+//!
 //! `on` 必须显式给值（同 `/api/dial/enable` 的口径，防误关）。
 
 use std::collections::HashMap;

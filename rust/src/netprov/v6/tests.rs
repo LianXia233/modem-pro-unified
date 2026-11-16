@@ -67,6 +67,20 @@ fn placeholder_and_non_global_v6_is_rejected() {
 }
 
 #[test]
+fn ula_zone_and_malformed_are_rejected() {
+    // ULA（fd00::/8）不是全球可路由地址：写进 static-v6 只会得到黑洞路由
+    assert!(!is_usable_global_v6("fd00::1"));
+    assert!(!is_usable_global_v6("fc00:1:2::3"));
+    // 带 zone 的串：链路本地拒绝，全局地址应剥掉 zone 后接受
+    assert!(!is_usable_global_v6("fe80::1%wwan0"));
+    assert!(is_usable_global_v6("2001:db8::1%wwan0"));
+    // 畸形串
+    assert!(!is_usable_global_v6("2001:db8:::1"));
+    assert!(!is_usable_global_v6("2001:db8::1::2"));
+    assert!(!is_usable_global_v6("not-an-ipv6"));
+}
+
+#[test]
 fn static_v6_picks_only_usable_address() {
     assert_eq!(
         usable_static_v6("2001:db8:1:2::8/64").as_deref(),

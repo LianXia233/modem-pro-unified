@@ -210,6 +210,10 @@ fn platform_by_token(model: &str) -> String {
     if u.trim().is_empty() {
         return String::new();
     }
+    // EC200 跨平台，不能整体算高通（A-P2-4）：按型号后缀细分。
+    if let Some(p) = ec200_platform(&u) {
+        return p.to_string();
+    }
     const TOKENS: &[(&str, &str)] = &[
         ("FM350R", "mediatek"),
         ("RW350R", "mediatek"),
@@ -260,7 +264,6 @@ fn platform_by_token(model: &str) -> String {
         ("EC21", "qualcomm"),
         ("EC25", "qualcomm"),
         ("EG25", "qualcomm"),
-        ("EC200", "qualcomm"),
         ("SRM815", "qualcomm"),
         ("SRM825", "qualcomm"),
         ("SIM8200", "qualcomm"),
@@ -311,10 +314,13 @@ pub fn family_for(vendor: Vendor, model: &str) -> Family {
 /// 平台档位判定（lte 旧款优先于芯片平台）。
 pub fn flavor_for(vendor: Vendor, model: &str) -> Flavor {
     let u = model.to_uppercase();
-    // 移远旧款 4G：EM12 用词边界，EM120K 是 lte12 不算
-    let quectel_legacy = ["EM05", "EP06", "EC20", "EC21", "EC25", "EG25", "EC200"]
+    // 移远旧款 4G：EM12 用词边界（EM120K 是 lte12 不算）；
+    // EC20 必须不是 EC200（EC200U/T 是展锐，不能判成 legacy）；A-P2-3。
+    let quectel_legacy = ["EM05", "EP06", "EC21", "EC25", "EG25"]
         .iter()
         .any(|k| u.contains(k))
+        || token_at_word(&u, "EC20")
+        || ec200_legacy(&u)
         || token_at_word(&u, "EM12");
     if quectel_legacy {
         return Flavor::LegacyLte;
@@ -329,6 +335,47 @@ pub fn flavor_for(vendor: Vendor, model: &str) -> Flavor {
         "hisilicon" => Flavor::HiSilicon,
         _ => Flavor::Unknown,
     }
+}
+
+/// EC200 系列的平台细分（上游 modem_support.json 逐型号口径）。
+///
+/// - `EC200U` / `EC200T` → 展锐 unisoc
+/// - `EC200A` → 翱捷 asrmicro
+/// - `EC200S`（-CN 等）→ 高通 qualcomm
+///
+/// 只看「EC200 后面紧跟的那一个字母」；不是 EC200 型号返回 `None`，
+/// 交给后续 TOKENS 表。
+fn ec200_platform(u: &str) -> Option<&'static str> {
+    let mut from = 0usize;
+    while let Some(pos) = u[from..].find("EC200") {
+        let at = from + pos;
+        let rest = &u[at + 5..];
+        let next = rest.chars().next();
+        match next {
+            Some('U') | Some('T') => return Some("unisoc"),
+            Some('A') => return Some("asrmicro"),
+            Some('S') | None | Some('-') | Some('_') => return Some("qualcomm"),
+            // 其他后缀（EC2001 等）：不像型号结尾，继续找
+            _ => from = at + 5,
+        }
+    }
+    None
+}
+///
+/// EC200 跨平台：`EC200U` / `EC200T` 是展锐、`EC200A` 是 ASR，只有
+/// `EC200S-CN` 等才算高通旧款。判据看紧跟其后的字符：
+/// 结尾 / `-` / `_` / `S` ⇒ legacy；`U` / `T` / `A` 等一律不算。
+fn ec200_legacy(u: &str) -> bool {
+    let mut from = 0usize;
+    while let Some(pos) = u[from..].find("EC200") {
+        let at = from + pos;
+        let rest = &u[at + 5..];
+        if rest.is_empty() || rest.starts_with(['-', '_', 'S']) {
+            return true;
+        }
+        from = at + 5;
+    }
+    false
 }
 
 /// 关键字按词出现（前后不是字母/数字），用于 `S10` / `EM12` 这类短名。

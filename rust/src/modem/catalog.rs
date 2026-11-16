@@ -271,16 +271,35 @@ pub fn vendor_by_vid(vid: &str) -> Option<&'static str> {
     for e in catalog().iter().filter(|e| e.vid == v) {
         *counts.entry(e.vendor.as_str()).or_insert(0) += 1;
     }
+    if counts.is_empty() {
+        // 清单没登记、但上游 device DB 明确归属的 VID 别名。
+        return vendor_alias(&v);
+    }
     counts
         .into_iter()
         .max_by_key(|(name, n)| (*n, std::cmp::Reverse(*name)))
         .map(|(name, _)| name)
 }
 
+/// 清单外的 VID 别名（只收**能确定归属**的）。
+///
+/// `1e0e` 是 SIMCom 高通模组的实际 VID（QModem
+/// `device.simcom.qualcomm.vendor_id = ["1a0e","1e0e","17cb"]`），而本清单的
+/// simcom 条目历史上只登记了 `1a0e`，导致真机拿不到 VID 证据（A-P1-5）。
+/// `17cb` 是 Qualcomm 通用 VID、`05c6` 亦是参考设计段 —— 必须按 PID 细分，
+/// 不能整体归给某一家，故不列入。
+fn vendor_alias(v: &str) -> Option<&'static str> {
+    match v {
+        "1e0e" => Some("simcom"),
+        _ => None,
+    }
+}
+
 /// 这个 VID 在清单里是否只对应一家厂商。
 ///
-/// `true` 时「VID → 厂商」可以当**确定证据**（如 `1e0e` SIMCom、`3466` 鼎桥）；
-/// `false` 时只能当提示（如 `2c7c` 同时有移远/广和通/美格的登记型号）。
+/// `true` 时「VID → 厂商」可以当**确定证据**（如 `3466` 鼎桥）；
+/// `false` 时只能当提示（如 `2c7c` 同时有移远/广和通/美格的登记型号，
+/// `1e0e` 虽属 SIMCom 但不独占）。
 pub fn vendor_is_exclusive(vid: &str) -> bool {
     let v = vid.trim().to_ascii_lowercase();
     if v.is_empty() {
@@ -461,8 +480,13 @@ mod tests {
         assert_eq!(with_vid, 87, "VID 迁移自 QModem 的 manufacturer_id");
 
         assert_eq!(vendor_by_vid("2c7c"), Some("quectel"));
-        assert_eq!(vendor_by_vid("0e8d"), Some("fibocom"));
-        assert_eq!(vendor_by_vid("1e0e"), None, "清单里没有的 VID 不猜");
+        // FM350 的主机侧 VID 是 2cb7（0e8d 是 AP 域 gadget 的，见 A-P2-14）
+        assert_eq!(vendor_by_vid("2cb7"), Some("fibocom"));
+        // 1e0e 是 SIMCom 真机 VID（清单只登记了 1a0e，靠别名表补齐，A-P1-5）；
+        // 但它不是独占 VID，仍不能当「确定证据」。
+        assert_eq!(vendor_by_vid("1e0e"), Some("simcom"));
+        assert!(!vendor_is_exclusive("1e0e"));
+        assert_eq!(vendor_by_vid("dead"), None, "清单里没有的 VID 不猜");
 
         // 独占 VID 可当证据，多厂商 VID 只能当提示。
         // 2c7c 曾经「名下全是移远」，QDC507（实机 2c7c:0125）进来之后共享该 VID
@@ -473,7 +497,7 @@ mod tests {
 
         // 型号自带的 VID 与端口规则用的是同一口径（小写 4 位）
         let e = lookup("FM350-GL").expect("fm350-gl");
-        assert_eq!(e.vid, "0e8d");
+        assert_eq!(e.vid, "2cb7", "主机侧枚举到的 Fibocom VID");
         assert_eq!(e.vid.len(), 4);
     }
 

@@ -95,9 +95,9 @@ pub enum Vendor {
 /// `Quectel`，但探测链第一条 `AT+CGMM` 会给出含 `QDC507` 的型号 —— 先认百旺
 /// 才能拿到「只发 CGACT」的正确方言（错认成移远会去发 `QNETDEVCTL`）。
 ///
-/// 关键：`TDTech` 排在 `Huawei` **之前** —— `MT5700M` 是两家共线型号，
-/// 项目原有归属是鼎桥（`AT^MONSC` / `AT^CHIPTEMP` 那一族），华为模块因此
-/// 不认 `MT5700M`（只认 `HUAWEI` / `MH5000` / `MT5710`）。
+/// 关键：`TDTech` 排在 `Huawei` **之前** —— `MT5700M` / `MT5710` 是两家共线
+/// 型号，项目原有归属是鼎桥（`AT^MONSC` / `AT^CHIPTEMP` 那一族），华为模块
+/// 因此不认它们（只认 `HUAWEI` / `MH5000`，见 `vendor/huawei.rs` 的 detect）。
 /// 同理 `Foxconn` 的 `T99W*` 与 Thales（共用 `AT^DEBUG`）要先认富士康。
 pub const DETECT_ORDER: [Vendor; 15] = [
     Vendor::Baiwang,

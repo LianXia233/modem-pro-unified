@@ -102,16 +102,26 @@ impl AtPort {
     }
 
     /// 读走并丢弃当前缓冲区里的残留数据（避免上一条命令的尾巴串进下一条）。
+    ///
+    /// 字节仍要**先过 `LineGate`**：命令间隙到达的 URC（`+CEREG`、`^RSSI`…）
+    /// 是真事件，直接读掉丢弃会让注册态/信号变化永远收不到（A-P2-9）。
+    /// 只有非 URC 的残留才丢；跨块拼接的半行在结束时一并清掉，
+    /// 免得被下一条应答当成前缀。
     fn drain(&mut self) {
         let _ = self.inner.set_timeout(Duration::from_millis(30));
         let mut buf = [0u8; 512];
+        let mut sink = Vec::new();
         for _ in 0..8 {
             match self.inner.read(&mut buf) {
                 Ok(0) => break,
-                Ok(_) => continue,
+                Ok(n) => {
+                    self.gate.feed(&buf[..n], &mut sink);
+                    sink.clear();
+                }
                 Err(_) => break,
             }
         }
+        self.gate.discard_partial();
     }
 
     fn read_until_terminator(
