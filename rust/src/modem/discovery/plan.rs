@@ -43,6 +43,10 @@ pub struct PortInfo {
     pub vid: String,
     /// 4 位小写十六进制。
     pub pid: String,
+    /// USB 接口描述串（sysfs `interface`，如 `TDTECH Connect - PC UI Interface`）。
+    pub iface_name: String,
+    /// `bInterfaceProtocol`（小写十六进制、去 `0x`，如 `12` = PCUI/AT、`13` = DIAG）。
+    pub protocol: String,
 }
 
 impl PortInfo {
@@ -98,6 +102,97 @@ fn natural_key(path: &str) -> (String, u64) {
     let (head, tail) = path.split_at(idx);
     let num: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
     (head.to_string(), num.parse().unwrap_or(0))
+}
+
+/// 把接口描述串切成大写整词（非字母数字一律作分隔）。
+///
+/// 必须整词匹配而不是 `contains`：实机 `TDTECH Connect - Application Interface`
+/// 里含子串 `at`（Applic**at**ion），按子串会把它误判成 AT 口，
+/// 而真正的 `PC UI Interface` 反被排到后面（A-P2-16）。
+fn tokenize(iface: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for ch in iface.chars() {
+        if ch.is_ascii_alphanumeric() {
+            cur.push(ch.to_ascii_uppercase());
+        } else if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn has_token(tokens: &[String], words: &[&str]) -> bool {
+    tokens.iter().any(|t| words.iter().any(|w| t == w))
+}
+
+/// 接口名是否给出了**强** AT 口信号（PCUI / PC UI / ATPORT）。
+///
+/// 强信号优先于协议号：这些是 MT5700 系列对 AT 口的专有叫法，
+/// 误写概率极低；而 `AT` / `Modem` 这类通用词可能被 OEM 误用在数据口上。
+fn strong_at_name(iface: &str) -> bool {
+    let t = tokenize(iface);
+    has_token(&t, &["PCUI"])
+        || (has_token(&t, &["PC"]) && has_token(&t, &["UI"]))
+        || has_token(&t, &["ATPORT"])
+}
+
+/// 接口名打分：0=AT 口，1=模组/命令口，2=未知，3=明确不是 AT 口。
+fn iface_score(iface: &str) -> Option<u8> {
+    if iface.trim().is_empty() {
+        return None;
+    }
+    let t = tokenize(iface);
+    let at_port = has_token(&t, &["PCUI"])
+        || (has_token(&t, &["PC"]) && has_token(&t, &["UI"]))
+        || (has_token(&t, &["AT"]) && has_token(&t, &["PORT"]))
+        || has_token(&t, &["ATPORT"])
+        || (has_token(&t, &["AT"]) && has_token(&t, &["INTERFACE", "CMD"]));
+    if at_port {
+        return Some(0);
+    }
+    // GPS/NMEA 只吐定位语句，DIAG 是调试口：先于弱 AT 词判定
+    if has_token(&t, &["GPS", "GNSS", "NMEA", "DIAG", "DIAGNOSTIC"]) {
+        return Some(3);
+    }
+    if has_token(&t, &["MODEM", "COMMAND", "AT", "ATCMD", "DUN"]) {
+        return Some(1);
+    }
+    Some(2)
+}
+
+/// `bInterfaceProtocol` 打分，只认「明确是 / 明确不是」：
+/// 0x12=PCUI(AT)；0x14=GPS、0x13/0x1b/0x1c=DIAG/Serial_B/C 均为明确非 AT 口。
+///
+/// 与上游（`luci-app-mt5700` serialdetect 给 0x13 打 2=未知）相比，这里把
+/// DIAG/Serial 一并降到 3：它们**不是**命令口，排到未知口之后仍会作为最后
+/// 兜底被尝试（不丢弃），但不会因为驱动名/编号序抢在真实候选前面。
+fn protocol_score(proto: &str) -> Option<u8> {
+    match proto.trim().trim_start_matches("0x") {
+        "12" => Some(0),
+        "13" | "14" | "1b" | "1c" => Some(3),
+        _ => None,
+    }
+}
+
+/// 端口角色分（0 最好）：接口名强信号 → 名字/协议交叉校验 → 协议兜底 → 未知。
+fn port_score(p: &PortInfo) -> u8 {
+    if strong_at_name(&p.iface_name) {
+        return 0;
+    }
+    let name = iface_score(&p.iface_name);
+    let proto = protocol_score(&p.protocol);
+    match (name, proto) {
+        // 名字只是弱 AT 信号，但协议号明确说「不是 AT 口」→ 信协议号
+        (Some(0 | 1), Some(s @ 2..=3)) => s,
+        (Some(s), _) if s != 2 => s,
+        // 名字缺失/不认识 → 协议号兜底
+        (_, Some(s)) => s,
+        _ => 2,
+    }
 }
 
 /// 生成 probe 计划（纯函数）。
@@ -172,6 +267,9 @@ pub fn plan(ports: &[PortInfo]) -> Vec<Group> {
         allowed.sort_by(|a, b| {
             iface_rank(a)
                 .cmp(&iface_rank(b))
+                // 接口角色分（接口名 + bInterfaceProtocol）：0x12/PCUI 优先，
+                // DIAG/GPS 沉底（A-P2-16）
+                .then(port_score(a).cmp(&port_score(b)))
                 .then(driver_rank(&a.driver).cmp(&driver_rank(&b.driver)))
                 .then(natural_key(&a.path).cmp(&natural_key(&b.path)))
         });
@@ -179,8 +277,29 @@ pub fn plan(ports: &[PortInfo]) -> Vec<Group> {
         allowed.dedup_by(|a, b| a.path == b.path);
         members.clear();
 
-        let primary = allowed[0].path.clone();
-        let fallbacks = allowed.iter().skip(1).map(|p| p.path.clone()).collect();
+        // 明确不是 AT 口的口（GPS/DIAG/Serial_B/C，分数 3）不参与首选；
+        // 只有组内全是这类口时才退而求其次（保留为最后兜底，而不是直接丢弃）。
+        let primary_idx = allowed
+            .iter()
+            .position(|p| port_score(p) < 3)
+            .unwrap_or(0);
+        let primary = allowed[primary_idx].path.clone();
+        // 回退序里把「明确不是 AT 口」的口排到最后：规则白名单可能把 GPS/DIAG
+        // 也列进来且接口顺序靠前，不能让它抢在普通候选之前被尝试。
+        let mut good_fb: Vec<String> = Vec::new();
+        let mut bad_fb: Vec<String> = Vec::new();
+        for (i, p) in allowed.iter().enumerate() {
+            if i == primary_idx {
+                continue;
+            }
+            if port_score(p) >= 3 {
+                bad_fb.push(p.path.clone());
+            } else {
+                good_fb.push(p.path.clone());
+            }
+        }
+        good_fb.extend(bad_fb);
+        let fallbacks = good_fb;
         let rule_note = match rule {
             Some(r) => format!(
                 "端口规则 {}:{} → {}（AT 接口 {}）",
@@ -224,6 +343,26 @@ mod tests {
             driver: driver.into(),
             vid: vid.into(),
             pid: pid.into(),
+            iface_name: String::new(),
+            protocol: String::new(),
+        }
+    }
+
+    /// 带接口名 / 协议号的端口（A-P2-16 的判据输入）。
+    fn pn(
+        path: &str,
+        dev: &str,
+        iface: &str,
+        driver: &str,
+        vid: &str,
+        pid: &str,
+        name: &str,
+        proto: &str,
+    ) -> PortInfo {
+        PortInfo {
+            iface_name: name.into(),
+            protocol: proto.into(),
+            ..p(path, dev, iface, driver, vid, pid)
         }
     }
 
@@ -321,5 +460,95 @@ mod tests {
         assert_eq!(g[0].primary, "/dev/ttyUSB0", "1.1 是规则登记的 AT 口");
         assert!(g[0].fallbacks.is_empty(), "1.2 不在白名单，不能当回退口");
         assert_eq!(g[0].skipped.len(), 1);
+    }
+
+    /// 实机 MT5700：`Application` 含子串 at，但真正的 AT 口是 `PC UI`
+    /// （A-P2-16：整词匹配，不能按子串）。
+    #[test]
+    fn application_interface_never_beats_pcui() {
+        let ports = vec![
+            pn(
+                "/dev/ttyUSB0",
+                "1-1",
+                "1.2",
+                "option",
+                "3466",
+                "0001",
+                "TDTECH Connect - Application Interface",
+                "13",
+            ),
+            pn(
+                "/dev/ttyUSB1",
+                "1-1",
+                "1.3",
+                "option",
+                "3466",
+                "0001",
+                "TDTECH Connect - PC UI Interface",
+                "12",
+            ),
+        ];
+        assert_eq!(
+            port_score(&ports[0]),
+            3,
+            "Application 里的 at 子串不算 AT 信号，协议 0x13 又明确是 DIAG ⇒ 末位"
+        );
+        // 单看接口名（无协议号）也必须是「未知」，不能因 Application 里的 at 子串升格
+        let bare = pn(
+            "/dev/ttyUSB9",
+            "1-1",
+            "1.2",
+            "option",
+            "3466",
+            "0001",
+            "TDTECH Connect - Application Interface",
+            "",
+        );
+        assert_eq!(port_score(&bare), 2);
+        assert_eq!(port_score(&ports[1]), 0, "PC UI 是强 AT 信号");
+        let g = plan(&ports);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].primary, "/dev/ttyUSB1");
+        assert_eq!(g[0].fallbacks, vec!["/dev/ttyUSB0"]);
+    }
+
+    /// 接口名缺失时靠 bInterfaceProtocol：0x12 = PCUI/AT。
+    #[test]
+    fn protocol_number_breaks_ties_without_names() {
+        let ports = vec![
+            pn("/dev/ttyUSB0", "1-1", "1.2", "option", "", "", "", "13"),
+            pn("/dev/ttyUSB1", "1-1", "1.3", "option", "", "", "", "12"),
+            pn("/dev/ttyUSB2", "1-1", "1.4", "option", "", "", "", ""),
+        ];
+        let g = plan(&ports);
+        assert_eq!(g[0].primary, "/dev/ttyUSB1");
+        // 0x13 明确不是 AT 口，排到末尾；未知协议的普通口优先于它
+        assert_eq!(g[0].fallbacks, vec!["/dev/ttyUSB2", "/dev/ttyUSB0"]);
+    }
+
+    /// 名字弱信号被协议号否决：OEM 把数据口也写成 "AT Port"，但协议号是 DIAG。
+    #[test]
+    fn protocol_overrides_weak_name_signal() {
+        let ports = vec![
+            pn("/dev/ttyUSB0", "1-1", "1.2", "option", "", "", "AT Port", "13"),
+            pn("/dev/ttyUSB1", "1-1", "1.3", "option", "", "", "Modem", "00"),
+        ];
+        assert_eq!(port_score(&ports[0]), 3, "弱 AT 名 + DIAG 协议 → 不可信");
+        assert_eq!(port_score(&ports[1]), 1);
+        let g = plan(&ports);
+        assert_eq!(g[0].primary, "/dev/ttyUSB1");
+    }
+
+    /// GPS/DIAG/Serial 口只作最后兜底：有正常候选时绝不当首选，但也不丢。
+    #[test]
+    fn non_at_ports_are_kept_only_as_last_resort() {
+        let ports = vec![
+            pn("/dev/ttyUSB0", "1-1", "1.0", "option", "", "", "GPS NMEA", "14"),
+            pn("/dev/ttyUSB1", "1-1", "1.1", "option", "", "", "Serial_B", "1b"),
+        ];
+        let g = plan(&ports);
+        // 全是非 AT 口时仍给一个首选（否则设备彻底不可用）
+        assert_eq!(g[0].primary, "/dev/ttyUSB0");
+        assert_eq!(g[0].fallbacks, vec!["/dev/ttyUSB1"]);
     }
 }

@@ -488,7 +488,9 @@ const ARCHIVE_KEEP: usize = 20;
 pub fn archive_entry(section: &RawSection, modem_id: u32, at: &str) -> ArchiveEntry {
     let mut recover = vec![format!("uci set network.{}=interface", section.name)];
     for (k, v) in &section.options {
-        // 值里可能有空格（`dns` 列表）⇒ 统一加单引号，照抄即可执行
+        // 值里可能有空格（`dns` 列表）或单引号（用户自加的注释键）⇒ 统一用
+        // 单引号包裹，并先按 shell 规则转义 `'`，保证留档片段总能原样执行（C-14）。
+        let v = v.replace('\'', "'\\''");
         recover.push(format!("uci set network.{}.{k}='{v}'", section.name));
     }
     recover.push(format!("uci commit network"));
@@ -591,6 +593,9 @@ pub fn sweep(
     let mut ops: Vec<UciOp> = Vec::new();
     let mut dropped: Vec<String> = Vec::new();
     let mut removed: Vec<(String, u32)> = Vec::new();
+    // 同一轮里主接口 + 兄弟接口各有一条记录，不能各记一次「缺席轮数」——
+    // 否则 MISS_ROUNDS=4 实际两轮就凑满，抖动窗口形同虚设（C-13）。
+    let mut misses: HashMap<u32, (u32, Duration)> = HashMap::new();
 
     for (name, rec) in records {
         // ① 模组还在 ⇒ 接口就是它该有的，清计数
@@ -609,8 +614,10 @@ pub fn sweep(
             clear_miss(rec.modem_id);
             continue;
         }
-        // ④ 抖动窗口：连续多轮 + 最小等待都满足才动手
-        let (rounds, waited) = note_miss(rec.modem_id, now);
+        // ④ 抖动窗口：连续多轮 + 最小等待都满足才动手（同一模组每轮只记一次）
+        let (rounds, waited) = *misses
+            .entry(rec.modem_id)
+            .or_insert_with(|| note_miss(rec.modem_id, now));
         if !stable_gone(rounds, waited) {
             log::debug!(
                 "清理残留接口 {name}：设备 {dev:?} 不在（第 {rounds} 轮 / 已等 {}s），等待稳定",
@@ -973,6 +980,19 @@ network.@switch[0]=switch
         assert_eq!(
             e.recover.last().map(String::as_str),
             Some("uci commit network")
+        );
+    }
+
+    #[test]
+    fn archive_snippet_escapes_single_quotes() {
+        let sec = section("modem1", &[("proto", "modem_pro"), ("note", "it's mine")]);
+        let e = archive_entry(&sec, 1, "t");
+        assert!(
+            e.recover
+                .iter()
+                .any(|c| c == "uci set network.modem1.note='it'\\''s mine'"),
+            "{:?}",
+            e.recover
         );
     }
 

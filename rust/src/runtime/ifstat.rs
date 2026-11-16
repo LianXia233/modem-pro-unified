@@ -344,7 +344,7 @@ pub fn spawn(stat: Arc<IfStat>, pick: impl Fn() -> Option<String> + Send + 'stat
     if stat.running.swap(true, Ordering::SeqCst) {
         return; // 已经起过
     }
-    std::thread::spawn(move || {
+    crate::runtime::supervise("ifstat", move || {
         log::info!("流量采样线程已启动：固定 {SAMPLE_MS}ms 一拍（不依赖前端连接）");
         let mut last_pick = Instant::now() - Duration::from_secs(3600);
         loop {

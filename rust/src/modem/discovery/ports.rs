@@ -7,9 +7,10 @@ use super::plan::PortInfo;
 /// 列出候选串口路径。
 ///
 /// - unix：serialport 返回的 `/dev/ttyUSB*`、`/dev/ttyACM*`；
-/// - 再并上 PCIe/MHI 模组的 AT 口（`/dev/mhi_*DUN*`、`/dev/mhi_*AT*`、`/dev/wwan*at*`）——
-///   这些不是 tty，serialport 枚举不到，必须单独加（上游 Go 版
-///   `module/netdev/ports_unix.go:38-51` 同样用 glob 补这四类）；
+/// - 再并上 `/dev` 目录里 serialport 不一定枚举的节点：展锐/ASR 的 `ttyAP*`、
+///   USB gadget 的 `ttyGS*`，以及 PCIe/MHI 的 AT 口（`mhi_*DUN*`、`mhi_*AT*`、
+///   `wwan*at*`）。serialport 在 `default-features = false` 的构建里只认
+///   ttyUSB/ttyACM，缺了目录扫描，这些口永远进不了候选（A-P2-11）；
 /// - windows：COMx。
 pub fn list_candidates() -> Vec<String> {
     let mut out: Vec<String> = serialport::available_ports()
@@ -18,6 +19,7 @@ pub fn list_candidates() -> Vec<String> {
         .map(|p| p.port_name)
         .filter(|name| is_at_candidate(name))
         .collect();
+    out.extend(scan_dev_dir());
     for name in crate::modem::pcidev::pcie_at_port_candidates() {
         let path = format!("/dev/{name}");
         if is_at_candidate(&path) {
@@ -27,6 +29,39 @@ pub fn list_candidates() -> Vec<String> {
     out.sort();
     out.dedup();
     out
+}
+
+/// 扫 `/dev` 补上 serialport 可能漏掉的 AT 节点（A-P2-11）。
+///
+/// 只按白名单前缀取，避免把 `/dev` 下大量无关节点带进来；真正的
+/// 「像不像 AT 口」仍由 [`is_at_candidate`] 决定。
+#[cfg(unix)]
+fn scan_dev_dir() -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir("/dev") else {
+        return out;
+    };
+    for ent in rd.flatten() {
+        let name = ent.file_name().to_string_lossy().to_string();
+        let lower = name.to_ascii_lowercase();
+        let interested = name.starts_with("ttyAP")
+            || name.starts_with("ttyGS")
+            || lower.starts_with("mhi_")
+            || lower.starts_with("wwan");
+        if !interested {
+            continue;
+        }
+        let path = format!("/dev/{name}");
+        if is_at_candidate(&path) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+#[cfg(not(unix))]
+fn scan_dev_dir() -> Vec<String> {
+    Vec::new()
 }
 
 /// 是否是「值得拿 AT 去探」的串口名。
@@ -90,6 +125,10 @@ pub fn describe(path: &str) -> PortInfo {
     };
     info.usb_dev = bus;
     info.iface = iface;
+    // 接口描述串与 bInterfaceProtocol：接口名缺失/被改成厂商自定义描述时，
+    // 协议号（0x12=PCUI）是识别 AT 口的稳定兜底（A-P2-16）。
+    info.iface_name = read_str(&iface_dir.join("interface"));
+    info.protocol = normalize_proto(&read_str(&iface_dir.join("bInterfaceProtocol")));
     // 接口目录的父目录是 USB 设备目录（`2-1`），vid/pid 在那里
     let usb_dir = iface_dir.parent().unwrap_or(&iface_dir);
     info.vid = read_trim(&usb_dir.join("idVendor"));
@@ -144,11 +183,14 @@ pub fn pseudo_group_for(path: &str) -> String {
     if let Some(rest) = base.strip_prefix("mhi_") {
         for marker in ["dun", "at", "uci_q", "qmi", "mbim"] {
             if let Some(idx) = rest.find(marker) {
-                let head = &rest[..idx];
+                let head = rest[..idx].trim_end_matches(['_', '-']);
                 if !head.is_empty() {
-                    let head = head.trim_end_matches(['_', '-']);
                     return format!("mhi_{head}");
                 }
+                // 无编号命名（`mhi_DUN0` / `mhi_AT0`）：marker 就在开头，
+                // 取不到实例号。若回退到全名，DUN 与 AT 会被拆成两台「模组」
+                // （A-P1-3）。同一台设备的通道统一归到固定组 "mhi"。
+                return "mhi".to_string();
             }
         }
         return format!("mhi_{rest}");
@@ -186,6 +228,21 @@ fn read_trim(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// 读字符串、去首尾空白（保留原大小写，接口描述要给人看）。
+#[cfg(unix)]
+fn read_str(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// 协议号统一成小写、去 `0x`（sysfs 实测是 `12`，不同内核可能写成 `0x12`）。
+#[cfg(unix)]
+fn normalize_proto(raw: &str) -> String {
+    let t = raw.trim().to_ascii_lowercase();
+    t.strip_prefix("0x").unwrap_or(&t).to_string()
+}
+
 /// 这台设备「出现多久了」（秒）；取不到返回 `None`。
 ///
 /// 用途是探活退避的**预热窗口**：刚插上的 5G 模组要几十秒才把 AT 口拉起来，
@@ -195,10 +252,15 @@ fn read_trim(path: &Path) -> String {
 #[cfg(unix)]
 pub fn device_age_secs(path: &str) -> Option<u64> {
     let name = Path::new(path).file_name()?.to_str()?;
-    let link = Path::new("/sys/class/tty").join(name).join("device");
-    let dir = std::fs::canonicalize(link).ok()?;
-    // USB 接口目录的父目录是设备目录；非 USB（MHI 等）直接用自己
-    let dev_dir = dir.parent().unwrap_or(&dir);
+    let tty_link = Path::new("/sys/class/tty").join(name).join("device");
+    let node = match std::fs::canonicalize(&tty_link) {
+        Ok(p) => p,
+        // MHI / wwan 的 AT 通道不是 tty：没有 tty 类目，按字符设备号解析
+        // （否则 age 永远是 None ⇒ 刚枚举的 PCIe 模组直接进退避，A-P2-8）
+        Err(_) => crate::modem::pcidev::char_device_sysfs(name)?,
+    };
+    // USB 接口目录的父目录是设备目录；非 USB（MHI 等）节点同样取上一级
+    let dev_dir = node.parent().unwrap_or(&node);
     let modified = std::fs::metadata(dev_dir).ok()?.modified().ok()?;
     modified.elapsed().ok().map(|d| d.as_secs())
 }
@@ -243,6 +305,25 @@ mod tests {
         assert!(is_at_candidate("/dev/ttyACM0"));
         assert!(is_at_candidate("COM5"));
         assert!(!is_at_candidate("/dev/ttyS0"));
+        // 展锐/ASR AP 口、USB gadget 串口、MHI/wwan AT 通道（A-P2-11）
+        assert!(is_at_candidate("/dev/ttyAP0"));
+        assert!(is_at_candidate("/dev/ttyGS0"));
+        assert!(is_at_candidate("/dev/mhi_1AT0"));
+        assert!(is_at_candidate("/dev/mhi_DUN0"));
+        assert!(is_at_candidate("/dev/wwan0at0"));
+        assert!(!is_at_candidate("/dev/wwan0"));
+        assert!(!is_at_candidate("/dev/mhi_wwan_ctrl0"));
+    }
+
+    #[test]
+    fn mhi_channels_without_number_share_one_group() {
+        // 有编号：按实例号归组
+        assert_eq!(super::pseudo_group_for("/dev/mhi_1DUN0"), "mhi_1");
+        assert_eq!(super::pseudo_group_for("/dev/mhi_1AT0"), "mhi_1");
+        // 无编号：DUN / AT / QMI 必须同组，不能拆成多台模组（A-P1-3）
+        assert_eq!(super::pseudo_group_for("/dev/mhi_DUN0"), "mhi");
+        assert_eq!(super::pseudo_group_for("/dev/mhi_AT0"), "mhi");
+        assert_eq!(super::pseudo_group_for("/dev/mhi_QMI0"), "mhi");
     }
 
     #[test]

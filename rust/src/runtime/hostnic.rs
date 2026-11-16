@@ -195,6 +195,11 @@ pub fn normalize_plan(p: &HostNicPlan) -> HostNicPlan {
 /// 真正的网段/网关只有模组那份配置知道，所以这份值在页面上**可改**。
 pub fn suggest_plan(modem_ip: &str) -> Option<HostNicPlan> {
     let o = parse_v4(modem_ip)?;
+    // 语义说明（C-21）：本函数面向「模组当网关」的场景（RNDIS/ECM，模组自己持有
+    // 上报地址、主机旁挂一个同网段地址），所以主机取 .2、网关取模组地址。
+    // 自动组网（netprov）走的是另一条路径：FM350/QMI raw_ip 的点对点 static 把
+    // **模组上报地址直接配在主机网卡上**，网关由地址派生（.1/.254）。
+    // 两条路径不应对同一张网卡先后套用；页面也按场景分开给出建议。
     // 同网段里最后一个字节取 2：避开 .0 / .1（网络号与常见网关）
     let mut last: u8 = 2;
     if o[3] == 2 {
@@ -542,11 +547,16 @@ pub fn persist_commands(plan: &HostNicPlan, platform: &str) -> Vec<HostNicComman
             ],
         );
     }
-    for d in &p.dns {
-        push(
-            "DNS（交给 dnsmasq）",
-            &["uci", "set", &format!("network.modem.dns={d}")],
-        );
+    // DNS 是 netifd 的 **list** 型选项：一条 `uci set ...dns=a b` 会被整串丢弃
+    // （类型不符），逐条 `set` 又只剩最后一条。必须先 delete 再逐条 add_list（C-10）。
+    if !p.dns.is_empty() {
+        push("清掉旧 DNS 列表", &["uci", "-q", "delete", "network.modem.dns"]);
+        for d in &p.dns {
+            push(
+                "DNS（交给 dnsmasq）",
+                &["uci", "add_list", &format!("network.modem.dns={d}")],
+            );
+        }
     }
     // WAN 也有一条 default，metric 小的优先
     push(
@@ -750,7 +760,18 @@ fn is_virtual_iface(name: &str) -> bool {
 /// 数据通道网卡的驱动（与 FM350 参考实现同口径）。
 ///
 /// ⚠️ 这里**没有** `ccmni`：那是模组内部 AP 域的 CCCI 网卡，主机侧不存在。
-pub const DATA_DRIVERS: &[&str] = &["rndis_host", "cdc_ether", "cdc_ncm", "qmi_wwan", "mbim"];
+/// PCIe 模组（FM350 / MT5700 / T7xx）的数据口走 MHI，驱动名不是 USB 那套 ——
+/// 缺了它们 wwan0 拿不到「强证据」，会退回 eth2/eth3/usb0 按名字猜（A-P1-7）。
+pub const DATA_DRIVERS: &[&str] = &[
+    "rndis_host",
+    "cdc_ether",
+    "cdc_ncm",
+    "qmi_wwan",
+    "mbim",
+    "mhi_netdev",
+    "t7xx",
+    "pcie_mhi",
+];
 
 /// 板载 / 虚拟 / 无线网卡的驱动：它们**不是**模组数据口（选错会把 LAN/WAN 口配成蜂窝口）。
 const ONBOARD_DRIVERS: &[&str] = &[
@@ -775,13 +796,24 @@ const ONBOARD_DRIVERS: &[&str] = &[
 /// 已知模组厂商的 USB VID（探测到多个数据口时优先挑它们，与 FM350 参考实现同思路）。
 const MODEM_VIDS: &[&str] = &[
     "2cb7", // Fibocom 广和通
-    "0e8d", // MediaTek（FM350 那类 MTK 平台模组）
+    "0e8d", // MediaTek（参考/gadget 域；FM350 主机侧 VID 是 2cb7，见下）
     "2c7c", // Quectel 移远
     "1e0e", // SIMCom 芯讯通
     "2dee", // MeiG 美格
     "19d2", // ZTE 中兴
-    "1782", // TD Tech 鼎桥
-    "2df3", // Unisoc 展锐
+    "1782", // Spreadtrum / Unisoc 展锐（**不是** TD Tech；鼎桥是 3466）
+    "2df3", // Unisoc 展锐（另一段 VID）
+    "3466", // TD Tech 鼎桥
+    "12d1", // Huawei 华为（含 MH5000 系）
+    "05c6", // Qualcomm 高通参考设计兜底
+    "1508", // Quectel 移远（旧段）
+    "305a", // Gosuncn 高新兴
+    "1199", // Sierra Wireless
+    "1bc7", // Telit
+    "1e2d", // Thales / Cinterion
+    "413c", // Dell（部分 Foxconn 代工模组）
+    "105b", // Foxconn 富士康
+    "03f0", // HP（Foxconn 代工）
 ];
 
 /// 读某张网卡的驱动名（sysfs `device/driver` 的 basename；拿不到返回空串）。

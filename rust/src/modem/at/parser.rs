@@ -1,16 +1,21 @@
 //! AT 应答解析（终结符判定与字段提取）。
 
-/// 是否收到了 AT 应答的终结符。
+/// 一行是否是错误终结符（`ERROR` / `+CME ERROR: …` / `+CMS ERROR: …`）。
+///
+/// **必须按行判定**：`contains("ERROR")` 会把内容行里的数据当成终结符 ——
+/// 例如 `^SYSINFOEX: …, "ERROR"`、APN 或厂商名里带 ERROR 字样时，
+/// 请求会被误判成失败（或提前结束读取）。
+fn is_error_line(line: &str) -> bool {
+    let up = line.trim().to_ascii_uppercase();
+    up == "ERROR" || up.starts_with("+CME ERROR") || up.starts_with("+CMS ERROR")
+}
+
+/// 是否收到了 AT 应答的终结符（`OK` 或错误行）。
 pub(super) fn has_terminator(text: &str) -> bool {
-    const TERMS: [&str; 6] = [
-        "\r\nOK\r\n",
-        "\r\nERROR",
-        "OK\r\n",
-        "ERROR",
-        "+CME ERROR",
-        "+CMS ERROR",
-    ];
-    TERMS.iter().any(|t| text.contains(t))
+    text.lines().any(|line| {
+        let up = line.trim().to_ascii_uppercase();
+        up == "OK" || is_error_line(&up)
+    })
 }
 
 /// 从 AT 应答里取一个 `+XXX: <值>` 形式的字段值。
@@ -56,9 +61,19 @@ pub fn to_i32(value: &str) -> Option<i32> {
     value.trim().trim_matches('"').parse::<i32>().ok()
 }
 
-/// 是否收到成功终结符（`OK`）且没有 `ERROR`。
+/// 是否收到成功终结符（`OK`）且没有错误行。
 pub fn is_ok(resp: &str) -> bool {
-    resp.contains("OK") && !resp.contains("ERROR")
+    let mut ok = false;
+    for line in resp.lines() {
+        let up = line.trim().to_ascii_uppercase();
+        if is_error_line(&up) {
+            return false;
+        }
+        if up == "OK" {
+            ok = true;
+        }
+    }
+    ok
 }
 
 /// 取出应答里的错误行（`ERROR` / `+CME ERROR: xxx` / `+CMS ERROR: xxx`）。
@@ -96,7 +111,18 @@ mod tests {
     fn terminators() {
         assert!(has_terminator("AT\r\r\nOK\r\n"));
         assert!(has_terminator("+CME ERROR: 3\r\n"));
+        assert!(has_terminator("\r\nERROR\r\n"));
         assert!(!has_terminator("AT\r\r\n"));
+    }
+
+    /// 内容行里出现 ERROR/OK 字样不能被当成终结符（A-P2-10）。
+    #[test]
+    fn terminator_is_line_anchored() {
+        assert!(!has_terminator("\r\n^SYSINFOEX: 2,1,,,\"ERROR\"\r\n"));
+        assert!(!has_terminator("\r\n+CGDCONT: 1,\"IP\",\"notok.ERROR\"\r\n"));
+        assert!(has_terminator("\r\n^SYSINFO: 1\r\n\r\nOK\r\n"));
+        // 末尾没有换行的 OK 也要认（部分固件如此）
+        assert!(has_terminator("\r\n^SYSINFO: 1\r\n\r\nOK"));
     }
 
     #[test]
@@ -135,6 +161,11 @@ mod tests {
     fn ok_and_error() {
         assert!(is_ok("\r\nOK\r\n"));
         assert!(!is_ok("\r\n+CME ERROR: 3\r\n"));
+        // 内容行里的 ERROR 字样不影响成功判定
+        assert!(is_ok("\r\n^SYSINFOEX: 2,1,,,\"ERROR\"\r\n\r\nOK\r\n"));
+        // 有 OK 但随后又报错 → 失败
+        assert!(!is_ok("\r\nOK\r\n+CME ERROR: 3\r\n"));
+        assert!(!is_ok(""));
     }
 
     #[test]

@@ -141,6 +141,36 @@ impl MbimLink {
         }
     }
 
+    /// 去激活一个会话并**校验结果**。
+    ///
+    /// 设备拒绝 / 应答超时不能当成功：会话若仍激活，下次 `CONNECT` 会撞残留
+    /// 被拒（B-P1-3）。失败重试一次；状态只接受「不在激活态」
+    /// （deactivated / deactivating / unknown），仍有 activated/activating 才算失败。
+    pub fn deactivate(&mut self, session: u32) -> Result<(), String> {
+        let mut last = String::new();
+        for attempt in 1..=2 {
+            let info = mbim::connect_set(session, false, "", "", "", mbim::IP_TYPE_DEFAULT);
+            match self.command(CID_CONNECT, mbim::CMD_SET, &info, OP_TIMEOUT) {
+                Ok(out) => {
+                    let state = mbim::connect_state(&out).unwrap_or(mbim::ACTIVATION_UNKNOWN);
+                    let nw = mbim::connect_nw_error(&out).unwrap_or(0);
+                    if !matches!(
+                        state,
+                        mbim::ACTIVATION_ACTIVATED | mbim::ACTIVATION_ACTIVATING
+                    ) {
+                        return Ok(());
+                    }
+                    last = format!("activation_state={state}, nw_error={nw:#x}");
+                }
+                Err(e) => last = e,
+            }
+            if attempt == 1 {
+                log::debug!("原生 MBIM：去激活未被接受（{last}），重试一次");
+            }
+        }
+        Err(format!("去激活未被设备接受：{last}"))
+    }
+
     /// 订阅者是否就绪（SIM 已解锁 / 已注册）。
     pub fn subscriber_ready(&mut self) -> bool {
         self.command(CID_SUBSCRIBER_READY, mbim::CMD_QUERY, &[], OP_TIMEOUT)
@@ -187,20 +217,25 @@ impl MbimLink {
         Ok(mbim::parse_ip_configuration(&info))
     }
 
-    /// 当前是否已激活（探活用）。
-    pub fn activated(&mut self, session: u32) -> Result<bool, String> {
+    /// 查一次会话激活状态（`CONNECT` QUERY 的 `activation_state`）。
+    pub fn activation_state(&mut self, session: u32) -> Result<u32, String> {
         let info = self.command(
             CID_CONNECT,
             mbim::CMD_QUERY,
             &session.to_le_bytes(),
             OP_TIMEOUT,
         )?;
+        mbim::connect_state(&info).ok_or_else(|| "CONNECT 查询应答太短".to_string())
+    }
+
+    /// 当前是否已激活（探活用）。
+    pub fn activated(&mut self, session: u32) -> Result<bool, String> {
         // activating 也算活着：设备正在把会话拉起来，这时判 false 会让调度层
         // 立刻拆掉一个正在建立的会话（地址还没下发就被重拨，表现为抖动）。
         // 真正的「没有数据」由调度层的地址 / 载波检查兜底。
         Ok(matches!(
-            mbim::connect_state(&info),
-            Some(mbim::ACTIVATION_ACTIVATED) | Some(mbim::ACTIVATION_ACTIVATING)
+            self.activation_state(session),
+            Ok(mbim::ACTIVATION_ACTIVATED) | Ok(mbim::ACTIVATION_ACTIVATING)
         ))
     }
 
@@ -244,9 +279,45 @@ impl MbimSession {
         } else {
             mbim::IP_TYPE_IPV4
         };
-        let nw_error = link.connect(session, true, apn, ip_type)?;
+        let nw_error = match link.connect(session, true, apn, ip_type) {
+            Ok(nw) => nw,
+            Err(e) => {
+                // 半激活残留：CONNECT 可能已被设备接受、只是应答超时 / 状态
+                // 未达。`Drop for MbimLink` 只发 CLOSE，不会去激活 —— 这里
+                // 必须先尽力 deactivate，否则下次 CONNECT 撞残留被拒（B-P1-3）。
+                if let Err(e2) = link.deactivate(session) {
+                    log::warn!("原生 MBIM：激活失败后的清理去激活也未成功: {e2}");
+                }
+                return Err(e);
+            }
+        };
         if nw_error != 0 {
             note = format!("激活带网络错误 nw_error={nw_error:#x}");
+        }
+        // 弱网下设备常先回 activating(2)：不能就此当成功（页面会假在线，
+        // 要等 60s 无地址 heal 才纠正）。轮询 CONNECT QUERY 直到
+        // activated(1)；超时 / 回落到去激活态按失败处理（C-23）。
+        // 查询本身不被支持（连续出错）时退回原行为，避免把能用的设备判死。
+        let mut state = link.activation_state(session).ok();
+        let deadline = Instant::now() + CONNECT_TIMEOUT;
+        while state == Some(mbim::ACTIVATION_ACTIVATING) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(500));
+            state = link.activation_state(session).ok();
+        }
+        match state {
+            Some(mbim::ACTIVATION_ACTIVATED) | None => {}
+            Some(mbim::ACTIVATION_ACTIVATING) => {
+                if let Err(e) = link.deactivate(session) {
+                    log::warn!("原生 MBIM：激活超时后的清理去激活未成功: {e}");
+                }
+                return Err(format!(
+                    "MBIM 会话在 {} 秒内未完成激活（一直 activating）",
+                    CONNECT_TIMEOUT.as_secs()
+                ));
+            }
+            Some(s) => {
+                return Err(format!("MBIM 会话未激活（activation_state={s}）"));
+            }
         }
         let settings = link.ip_configuration(session).unwrap_or_default();
         if settings.ipv4.is_none() {
@@ -268,11 +339,10 @@ impl MbimSession {
     }
 
     pub fn stop(&mut self) {
-        if let Err(e) = self
-            .link
-            .connect(self.session, false, "", mbim::IP_TYPE_DEFAULT)
-        {
-            log::debug!("原生 MBIM：去激活失败: {e}");
+        // 去激活必须校验结果并重试（B-P1-3）：设备拒绝时若悄悄当成功，
+        // 模组侧会残留激活上下文，下次 `CONNECT` 撞残留被拒。
+        if let Err(e) = self.link.deactivate(self.session) {
+            log::warn!("原生 MBIM：去激活未成功（会话可能残留）: {e}");
         }
     }
 

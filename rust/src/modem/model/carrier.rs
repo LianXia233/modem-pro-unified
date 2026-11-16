@@ -7,13 +7,14 @@
 //! 之前自动拨号只认「模组里已存的上下文」，没人把运营商对应的 APN 写进去。
 //! 本模块给出可维护的映射表与识别逻辑，供 [`super::apn_auto`] 的决策使用。
 //!
-//! ## 识别优先级（与需求口径一致）
+//! ## 识别优先级（2026-11 修订：APN 属于 SIM 归属，不属于拜访网）
 //!
-//! 1. **运营商名称**（`AT+COPS?` 的 `<oper>`）：最直观；
-//! 2. **MCC/MNC（PLMN）**（`AT+QNWINFO` / `COPS format=2`）：数字最可靠；
-//!    名称与 PLMN 都认出但**指向不同运营商**时取 PLMN（显示名可能带漫游地）；
-//! 3. **SIM 卡归属**（ICCID 前缀，即发卡行 IIN）：只在前两级都拿不到时兜底 ——
-//!    物联网卡 / 企业卡常由代理发卡，IIN 只能作为**中等置信**的证据；
+//! 1. **SIM 卡归属**（ICCID 前缀，即发卡行 IIN）：APN 是发卡运营商的属性；
+//!    与名称 / PLMN（拜访网）一致 ⇒ 确认，**不一致 ⇒ 判漫游**并返回未知
+//!    （调用方保留现有 APN，绝不把中国预制值写给外国 SIM）；
+//! 2. **运营商名称**（`AT+COPS?` 的 `<oper>`）：ICCID 认不出时使用；
+//! 3. **MCC/MNC（PLMN）**（`AT+QNWINFO` / `COPS format=2`）：ICCID 认不出时，
+//!    名称与 PLMN 都认出但**指向不同运营商**则取 PLMN（显示名可能带漫游地）；
 //! 4. 全部失败 ⇒ `CarrierMatch::unknown()`，调用方**不得**动现有 APN。
 //!
 //! ## 覆盖范围（2026-10-21 口径）
@@ -148,7 +149,7 @@ const PLMN_TABLE: &[(&str, Carrier)] = &[
     ("46015", Carrier::Cbnet),
 ];
 
-/// ICCID 前缀（发卡行 IIN 前 6 位）→ 运营商。**只作兜底证据**。
+/// ICCID 前缀（发卡行 IIN 前 6 位）→ 运营商。**SIM 归属证据，优先级最高**。
 const ICCID_TABLE: &[(&str, Carrier)] = &[
     ("898600", Carrier::Cmcc),
     ("898602", Carrier::Cmcc),
@@ -235,14 +236,47 @@ pub fn apn_carrier(apn: &str) -> Option<Carrier> {
         .map(|(_, c)| *c)
 }
 
-/// 综合识别：名称 → PLMN → ICCID，逐级兜底；冲突以 PLMN 裁决。
+/// 综合识别：**ICCID（SIM 归属）优先**，其次名称 + PLMN 互相确认。
 ///
 /// - `operator`：`AT+COPS?` 的 `<oper>`（format=0/1 的显示名）；
-/// - `plmn`：`AT+QNWINFO` 或 COPS format=2 的数字串；
+/// - `plmn`：`AT+QNWINFO` 或 COPS format=2 的数字串（**拜访网络**，漫游时不是归属）；
 /// - `iccid`：SIM 身份缓存里的 ICCID（没有就传 `None`）。
+///
+/// ## 为什么 ICCID 优先
+///
+/// APN 是**SIM 归属运营商**的属性，不是「当前注册在谁家网络」的属性。
+/// 外国 SIM 在中国漫游时 PLMN 是 460xx，旧逻辑会据此把 cmnet 写进这张卡，
+/// 覆盖它本应使用的归属 APN —— 漫游数据直接不通。因此：
+///
+/// - ICCID 可识别：与名称/PLMN 一致 ⇒ 确认；不一致 ⇒ 判「漫游」，
+///   返回 [`CarrierMatch::unknown`]（调用方保留现有 APN，不写预制值）；
+/// - ICCID 不可识别：退回名称 + PLMN，冲突时信 PLMN（显示名可能带漫游地）。
 pub fn identify(operator: Option<&str>, plmn: Option<&str>, iccid: Option<&str>) -> CarrierMatch {
     let by_name = by_name(operator);
     let by_plmn = by_plmn(plmn);
+    // ① SIM 归属：ICCID 前缀（发卡行 IIN）
+    if let Some(home) = by_iccid(iccid) {
+        // 注册网络 / 显示名给出的「当前运营商」（数字优先）
+        let seen = by_plmn.or(by_name);
+        return match seen {
+            None => CarrierMatch {
+                carrier: Some(home),
+                evidence: Evidence::Iccid,
+                note: format!("按 SIM 归属（ICCID 前缀）识别：{}", home.label()),
+            },
+            Some(c) if c == home => CarrierMatch {
+                carrier: Some(home),
+                evidence: Evidence::Iccid,
+                note: format!("ICCID 与注册网络双重确认：{}（{}）", home.label(), home.default_apn()),
+            },
+            Some(c) => CarrierMatch::unknown(format!(
+                "SIM 归属 {}，但当前注册在 {} 的网络（漫游）；为避免把归属 APN 覆盖成漫游地预制值，保留现有配置",
+                home.label(),
+                c.label()
+            )),
+        };
+    }
+    // ② 没有可用 ICCID：名称 + PLMN（原有口径）
     match (by_name, by_plmn) {
         (Some(c), Some(p)) => {
             if c == p {
@@ -274,19 +308,9 @@ pub fn identify(operator: Option<&str>, plmn: Option<&str>, iccid: Option<&str>)
             evidence: Evidence::Plmn,
             note: format!("按 MCC/MNC（{}）识别：{}", plmn.unwrap_or(""), c.label()),
         },
-        (None, None) => match by_iccid(iccid) {
-            Some(c) => CarrierMatch {
-                carrier: Some(c),
-                evidence: Evidence::Iccid,
-                note: format!(
-                    "名称与 PLMN 都没认出来，按 ICCID 前缀识别：{}（中等置信）",
-                    c.label()
-                ),
-            },
-            None => CarrierMatch::unknown(
-                "运营商名称 / MCC-MNC / ICCID 都没认出来，保留现有 APN 配置不动",
-            ),
-        },
+        (None, None) => CarrierMatch::unknown(
+            "运营商名称 / MCC-MNC / ICCID 都没认出来，保留现有 APN 配置不动",
+        ),
     }
 }
 
@@ -354,14 +378,22 @@ mod tests {
     }
 
     #[test]
-    fn identifies_by_iccid_only_as_fallback() {
+    fn iccid_is_the_home_sim_authority() {
+        // 仅 ICCID：识别出归属，证据为中置信 Iccid（不会用来改写别家预制 APN）
         let m = identify(None, None, Some("89860404102390000000"));
         assert_eq!(m.carrier, Some(Carrier::Cmcc));
         assert_eq!(m.evidence, Evidence::Iccid);
-        // 名称在时轮不到 ICCID
-        let m = identify(Some("CMCC"), None, Some("8986031111111111111"));
+        assert!(!m.strong(), "Iccid 级不足以校正别家预制 APN");
+        // ICCID 与注册网络一致 ⇒ 归属确认（仍是 Iccid 级）
+        let m = identify(Some("CMCC"), Some("46000"), Some("89860404102390000000"));
         assert_eq!(m.carrier, Some(Carrier::Cmcc));
-        assert_eq!(m.evidence, Evidence::Name);
+        assert_eq!(m.evidence, Evidence::Iccid);
+        assert!(m.note.contains("确认"));
+        // ICCID 归属电信，但显示名 / PLMN 是移动（漫游）⇒ 未知，保留现有 APN
+        let m = identify(Some("CMCC"), Some("46000"), Some("8986031111111111111"));
+        assert!(!m.matched(), "归属与拜访网冲突时不得下判断");
+        assert_eq!(m.evidence, Evidence::None);
+        assert!(m.note.contains("漫游"));
         // 全都没有 ⇒ 未知（调用方不得动 APN）
         let m = identify(None, None, None);
         assert!(!m.matched());

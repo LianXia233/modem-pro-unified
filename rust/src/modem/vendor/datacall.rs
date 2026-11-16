@@ -88,6 +88,11 @@ pub struct AutodialProbe {
     pub query: &'static str,
     /// 回读未显示「开着」时改发的断开指令（`AT^NDISDUP=0,0`）。
     pub fallback: &'static str,
+    /// 拨号后核对**模组侧数据面**的查询指令（`AT^NDISSTATQRY?`）；`None` = 不核对。
+    ///
+    /// 鼎桥 MT5700 手册 §16.4：`^NDISSTATQRY: <cid>,<stat>,…`，`cid==1 && stat==1`
+    /// 才算已连接（首段是 cid，不是状态 —— 上游曾误读，见 luci-app-mt5700）。
+    pub status: Option<&'static str>,
 }
 
 /// 一家厂商在某个平台上的数据通道配方。
@@ -387,6 +392,34 @@ mod tests {
             assert!(p.activate[0].cmd.ends_with(&format!(",{cid}")));
             assert!(p.deactivate[0].cmd.ends_with(&format!(",{cid}")));
         }
+    }
+
+    /// 鼎桥 MT5700/MT5710 实机是**展锐自拨方言**（上游 luci-app-mt5700 抓样），
+    /// 清单里平台列却仍是 hisilicon —— 必须按型号命中，不能再走巴龙 NDISDUP。
+    #[test]
+    fn tdtech_mt5700_uses_unisoc_autodial_even_on_hisilicon_platform() {
+        let p = plan(
+            Vendor::TDTech,
+            &ctx("ecm", "hisilicon", "mt5700m-cn", 1),
+        );
+        assert_eq!(p.activate[0].cmd, "AT^SETAUTODIAL=1,4");
+        assert!(!p.pdp_first);
+        let probe = p.autodial_probe.expect("鼎桥 MT5700 必须带自拨状态查询");
+        assert_eq!(probe.query, "AT^SETAUTODIAL?");
+        assert_eq!(probe.fallback, "AT^NDISDUP=0,0");
+        assert_eq!(probe.status, Some("AT^NDISSTATQRY?"));
+        // 断开必须先关自拨、再 CFUN 循环
+        let cmds: Vec<&str> = p.deactivate.iter().map(|s| s.cmd.as_str()).collect();
+        assert_eq!(cmds, ["AT^SETAUTODIAL=0", "AT+CFUN=0", "AT+CFUN=1"]);
+
+        // 型号是 MT5710 也要命中
+        let p = plan(Vendor::TDTech, &ctx("ncm", "hisilicon", "mt5710_cn", 2));
+        assert_eq!(p.activate[0].cmd, "AT^SETAUTODIAL=1,4");
+
+        // 只报到厂商名（型号不明）时保持保守的巴龙路径
+        let p = plan(Vendor::TDTech, &ctx("ecm", "hisilicon", "", 1));
+        assert_eq!(p.activate[0].cmd, "AT^NDISDUP=1,1");
+        assert!(p.autodial_probe.is_none());
     }
 
     /// 华为展锐自拨：挂断前先查 `AT^SETAUTODIAL?`，没开着才走通用 NDISDUP

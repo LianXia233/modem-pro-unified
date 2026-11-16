@@ -35,8 +35,6 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::logging::unix_now;
-
 /// IPv6 取址方式（`[net] wan_ipv6_mode`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -129,34 +127,36 @@ pub fn is_link_local_v6(ip: &str) -> bool {
     }
 }
 
-/// 这个地址能不能当**全局地址**用（过滤链路本地 / 回环 / 组播 / 无前缀残值）。
+/// 这个地址能不能当**全局地址**用（只认 2000::/3 全局单播）。
 ///
 /// 「无前缀残值」是实机踩出来的：`AT+CGPADDR=1` 在 PDP 只拿到 IPv4 时，
 /// v6 位照样回 `0.0.0.0.0.0.0.0.24.223.154.1.249.130.129.90`
 /// （解码即 `::18df:9a01:f982:815a`）—— 只有接口标识、前缀全零。
 /// 这种地址写进 UCI 只会得到一条永远不通的默认路由，必须当成「没有」。
+///
+/// 严格解析还有一个现实收益：`fd00::/8`（ULA）、带 `%zone` 的串、
+/// 截断/畸形串一律拒绝，不会让 static-v6 写出黑洞路由。
 pub fn is_usable_global_v6(ip: &str) -> bool {
-    let ip = ip.trim().trim_end_matches('/');
-    if ip.is_empty() {
+    let Some(groups) = parse_v6(ip) else {
         return false;
+    };
+    // IANA 全球单播 2000::/3：前 3 位是 001。
+    // 顺带排除 ::/::1（前缀零）、fe80::/10、ff00::/8、fc00::/7(ULA)。
+    groups[0] & 0xe000 == 0x2000
+}
+
+/// 手写 IPv6 文本解析（`::` 压缩、可选 `%zone`、可选 `/prefix`）。
+///
+/// 不引 `std::net::Ipv6Addr` 也能做，但这里用它更严谨；返回 8 组 u16。
+/// 带内嵌 IPv4（`::ffff:1.2.3.4`）或非法字符 ⇒ `None`。
+fn parse_v6(ip: &str) -> Option<[u16; 8]> {
+    let ip = ip.trim();
+    let ip = ip.split('/').next().unwrap_or("").trim();
+    let ip = ip.split('%').next().unwrap_or("").trim();
+    if ip.is_empty() || !ip.contains(':') {
+        return None;
     }
-    let lower = ip.to_ascii_lowercase();
-    // 未指定 / 回环 / 只有接口标识（`::xxxx:...`，前缀为零）
-    if lower == "::" || lower == "::1" || lower.starts_with("::") {
-        return false;
-    }
-    // 链路本地、组播
-    if is_link_local_v6(&lower) {
-        return false;
-    }
-    let first = lower.split(':').next().unwrap_or("");
-    if let Ok(v) = u16::from_str_radix(first, 16) {
-        if v & 0xff00 == 0xff00 {
-            return false; // ff00::/8 组播
-        }
-    }
-    // 只接受 8 组以内的冒号写法（`ip -o addr` 那种会带 `%eth2` 后缀）
-    lower.contains(':')
+    ip.parse::<std::net::Ipv6Addr>().ok().map(|a| a.segments())
 }
 
 /// 从模组侧读到的一串地址里挑一个能用的全局 IPv6（可带 `/prefix`）。
@@ -577,12 +577,14 @@ pub fn maybe_resolicit(mode: V6Mode, dev: &str) {
     if !should_resolicit(mode, dev, uptime, has_v6) {
         return;
     }
-    static LAST: std::sync::Mutex<Option<(String, u64)>> = std::sync::Mutex::new(None);
-    let now = unix_now() as u64;
+    // 用单调时钟节流：开机 NTP 校时可能把墙钟往前/往后跳几小时，
+    // 用 `unix_now` 会让 RS 停发很久或连发（C-16）。
+    static LAST: std::sync::Mutex<Option<(String, Instant)>> = std::sync::Mutex::new(None);
+    let now = Instant::now();
     {
         let mut guard = LAST.lock().unwrap();
         if let Some((last_dev, at)) = guard.as_ref() {
-            if last_dev == dev && now.saturating_sub(*at) < 60 {
+            if last_dev == dev && now.duration_since(*at) < Duration::from_secs(60) {
                 return;
             }
         }

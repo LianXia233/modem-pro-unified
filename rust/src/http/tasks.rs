@@ -165,6 +165,11 @@ impl Task {
     pub fn progress(&self, text: impl Into<String>) {
         if let Ok(mut g) = self.inner.lock() {
             g.progress = text.into();
+            // 已取消的任务不能被 progress「复活」成 Running（C-16）：
+            // worker 可能刚越过取消检查就调到这里，窗口虽小但状态会自相矛盾。
+            if g.state == State::Cancelled {
+                return;
+            }
             // 已经开始跑说明从队列里出来了
             if g.started.is_none() {
                 g.started = Some(Instant::now());
@@ -180,6 +185,10 @@ impl Task {
         }
         {
             let mut g = self.inner.lock().unwrap();
+            // 排队期间被取消：不要把它改回 Running（C-16）
+            if g.state == State::Cancelled {
+                return;
+            }
             g.state = State::Running;
             g.started = Some(Instant::now());
         }
@@ -284,9 +293,13 @@ impl Registry {
     {
         self.gc();
 
-        // ① 去重：同键且在跑 → 直接复用
+        // ① 去重与登记必须在**同一把锁**里完成（C-4）：分两次拿锁时，两个并发
+        //    提交会同时查不到、各起一个 worker —— 双倍占串口，正是本模块要防的。
+        let n = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let id = format!("t{n}");
+        let task = Arc::new(Task::new(id.clone(), &spec));
         {
-            let map = self.map.lock().unwrap();
+            let mut map = self.map.lock().unwrap();
             if let Some(t) = map
                 .values()
                 .find(|t| t.key == spec.key && t.is_active())
@@ -300,12 +313,8 @@ impl Registry {
                 );
                 return t;
             }
+            map.insert(id, task.clone());
         }
-
-        let n = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        let id = format!("t{n}");
-        let task = Arc::new(Task::new(id.clone(), &spec));
-        self.map.lock().unwrap().insert(id.clone(), task.clone());
 
         let worker = task.clone();
         std::thread::spawn(move || {

@@ -209,15 +209,40 @@ pub fn interface_down(name: &str) -> Option<bool> {
         return None;
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    // `ifstatus` 输出的 `up` 是顶层布尔；只认这个字段，别拿 `"up": false`
-    // 之外的东西猜（`pending` / `autostart` 都在附近，容易误判）。
-    if text.contains("\"up\": true") {
-        Some(false)
-    } else if text.contains("\"up\": false") {
-        Some(true)
-    } else {
-        None
+    // `ifstatus` 的顶层 `up` 是布尔。必须按 JSON 解析顶层字段：
+    // 早先全文 `contains("\"up\": true")` 会被**嵌套对象**里的 up 字段骗到
+    // （不同 netifd 版本的输出结构有差异），把真实 down 判成 up ⇒ 永远不补 ifup。
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(v) => match v.get("up").and_then(|x| x.as_bool()) {
+            Some(true) => Some(false),
+            Some(false) => Some(true),
+            None => None,
+        },
+        Err(_) => None,
     }
+}
+
+/// 幂等地把接口 ifdown（断开数据连接时清 netifd 侧状态）。
+///
+/// 只断**本模组的数据接口**（`modem<id>` / `modem<id>_6`）。接口不存在或
+/// 本来就没 up 都视为目标状态 —— `ifdown` 对这类输入可能返回非 0，
+/// 不能因此把「用户点断开」判成失败。
+pub fn ifdown(name: &str) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(msg("接口名为空，拒绝 ifdown"));
+    }
+    let out = run_with_timeout("ifdown", &[name], Duration::from_secs(20))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let lower = err.to_ascii_lowercase();
+    // 「没加载 / 没 up」对断开语义来说已经达成，不升级成错误。
+    if err.is_empty() || lower.contains("not found") || lower.contains("not up") {
+        return Ok(());
+    }
+    Err(msg(format!("ifdown {name} 失败: {err}")))
 }
 
 /// 幂等地把一张已存在但 DOWN 的接口拉起来（`ifup <name>`）。
@@ -304,7 +329,18 @@ pub fn parse_existing(
             "ip6addr" => out[i].ip6addr = value,
             "mp_no_v6" => out[i].mp_no_v6 = value,
             "force_link" => out[i].force_link = value,
-            "dns" => out[i].dns = value,
+            "mtu" => out[i].mtu = value,
+            // UCI list：`uci show` 每个成员一行，拼成空格分隔（与
+            // `cleanup::parse_sections` 同口径）。早先按行覆盖只剩最后一条，
+            // 导致 diff 永远判「不一致」→ 每轮把用户刚改成 list 的 dns 覆写回字符串。
+            "dns" => {
+                if out[i].dns.is_empty() {
+                    out[i].dns = value;
+                } else {
+                    out[i].dns.push(' ');
+                    out[i].dns.push_str(&value);
+                }
+            }
             _ => {}
         }
     }

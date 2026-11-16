@@ -47,6 +47,24 @@ pub fn handle(mut req: Request, state: &AppState, query: &HashMap<String, String
             },
         );
     }
+    // 断开会话 ≠ netifd 接口 down：proto 接口还 up 着，udhcpc 会续租、
+    // odhcp6c 的 v6 地址/默认路由继续生效（等于「断开失败」）。
+    // 因此这里显式 ifdown 本模组的主接口与 v6 兄弟接口；接口不存在/已 down
+    // 都视为目标状态（`uci::ifdown` 内部宽松处理）。
+    let mut ifdown_notes: Vec<String> = Vec::new();
+    for name in [
+        crate::netprov::iface_name(modem.id),
+        crate::netprov::iface_name_v6(modem.id),
+    ] {
+        match crate::netprov::uci::ifdown(&name) {
+            Ok(()) => ifdown_notes.push(format!("{name} 已 ifdown")),
+            Err(e) => {
+                log::warn!("断开：ifdown {name} 失败: {e}");
+                ifdown_notes.push(format!("{name} ifdown 失败"));
+            }
+        }
+    }
+    modem.note_step("断开 netifd 接口", true, &ifdown_notes.join("；"));
     match hung_up {
         Ok(_) => {
             let st = modem.dial_status();

@@ -474,7 +474,7 @@ where
 
     let timeout = Duration::from_secs(cfg.timeout_secs.clamp(1, 10) as u64);
     let on_change = Arc::new(on_change);
-    std::thread::spawn(move || {
+    crate::runtime::supervise("ntp", move || {
         let mut phase = Phase::Fast;
         let mut attempts = 0u32;
         let mut next_at = system_now() + FIRST_DELAY;

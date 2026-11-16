@@ -7,6 +7,7 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +19,25 @@ use super::{router, ws, AppState};
 
 const MAX_HEAD: usize = 16 * 1024;
 const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 同时在线的连接上限：每条连接一个线程，外加一条到内部的连接。
+///
+/// 超限直接 503 关掉，而不是无限起线程 —— 局域网里一个扫描器就能把
+/// 线程栈耗尽（每条线程默认 2 MB 虚拟内存）。WebSocket 也占用配额。
+const MAX_CONNS: usize = 96;
+
+/// 转发阶段的空闲超时：请求头读完后，两端都可能永远不再发数据
+/// （半开 TCP / 客户端消失），不设超时线程就一直挂着。
+const PROXY_IDLE: Duration = Duration::from_secs(300);
+
+/// 连接配额守卫：析构（含 panic 展开）时把计数还回去。
+struct ConnGuard(Arc<AtomicUsize>);
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// 启动网关与内部 HTTP 服务（阻塞）。
 pub fn run(listen: String, state: Arc<AppState>) -> Result<()> {
@@ -44,6 +64,7 @@ pub fn run(listen: String, state: Arc<AppState>) -> Result<()> {
         TcpListener::bind(&listen).map_err(|e| msg(format!("监听 {listen} 失败: {e}")))?;
     log::info!("HTTP 服务已启动: http://{listen}/");
 
+    let conns = Arc::new(AtomicUsize::new(0));
     for incoming in listener.incoming() {
         let stream = match incoming {
             Ok(stream) => stream,
@@ -52,8 +73,21 @@ pub fn run(listen: String, state: Arc<AppState>) -> Result<()> {
                 continue;
             }
         };
+        // 先占配额再起线程：超限的慢连接直接关掉，不排队、不阻塞 accept。
+        if conns.fetch_add(1, Ordering::SeqCst) >= MAX_CONNS {
+            conns.fetch_sub(1, Ordering::SeqCst);
+            log::warn!("连接数超过 {MAX_CONNS}，拒绝新连接");
+            let mut stream = stream;
+            let _ = stream.write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            );
+            let _ = stream.shutdown(Shutdown::Both);
+            continue;
+        }
         let state = state.clone();
+        let guard = ConnGuard(conns.clone());
         std::thread::spawn(move || {
+            let _guard = guard; // 线程结束（或 panic）才归还配额
             if let Err(e) = serve_conn(stream, internal_addr, state) {
                 log::debug!("连接处理结束: {e}");
             }
@@ -71,6 +105,15 @@ fn serve_conn(mut stream: TcpStream, internal: SocketAddr, state: Arc<AppState>)
 
     let head = read_head(&mut stream)?;
     if head.is_empty() {
+        return Ok(());
+    }
+    if !head_complete(&head) {
+        // 头部没读到空行就断了（超时 / 超长 / 对端半关）：**不能**转发。
+        // 否则客户端可以在 `HEAD_TIMEOUT` 后继续发字节，绕过下面
+        // `inject_real_ip` 的覆盖式鉴权头（补一个伪造 `X-Real-IP`）。
+        let _ = stream
+            .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+        let _ = stream.shutdown(Shutdown::Both);
         return Ok(());
     }
     let _ = stream.set_read_timeout(None);
@@ -100,11 +143,12 @@ fn serve_conn(mut stream: TcpStream, internal: SocketAddr, state: Arc<AppState>)
 /// 自带的那一行 —— 否则外部请求可以自己伪造一个 `X-Real-IP: 127.0.0.1` 绕过闸门。
 fn inject_real_ip(head: &[u8], ip: std::net::IpAddr) -> Vec<u8> {
     let text = String::from_utf8_lossy(head);
-    // 正常情况一定有 `\r\n\r\n`；异常截断时退回「原样 + 追加」，不让请求整个丢掉
-    let (head_part, tail) = match text.find("\r\n\r\n") {
-        Some(i) => (&text[..i], &text[i..]),
-        None => (text.as_ref(), ""),
+    // `serve_conn` 已保证头部以空行结束；这里再兜一层：没有分隔符就原样返回，
+    // 绝不把 `X-Real-IP` 拼在半个头上（后续字节会被解析成同一请求的续行）。
+    let Some(i) = text.find("\r\n\r\n") else {
+        return head.to_vec();
     };
+    let (head_part, tail) = (&text[..i], &text[i..]);
     let mut lines: Vec<&str> = head_part.split("\r\n").collect();
     lines.retain(|l| {
         !l.trim_start()
@@ -115,6 +159,11 @@ fn inject_real_ip(head: &[u8], ip: std::net::IpAddr) -> Vec<u8> {
     out.push_str(&format!("\r\nX-Real-IP: {ip}"));
     out.push_str(tail);
     out.into_bytes()
+}
+
+/// 请求头是否完整读到空行（`read_head` 也可能因超时 / 超长 / EOF 提前返回）。
+fn head_complete(head: &[u8]) -> bool {
+    head.ends_with(b"\r\n\r\n")
 }
 
 /// 读取到请求头结束（`\r\n\r\n`）为止，剩余字节留在 socket 里由 `proxy` 透传。
@@ -164,6 +213,12 @@ fn proxy(
         TcpStream::connect(internal).map_err(|e| msg(format!("连接内部服务失败: {e}")))?;
     let _ = client.set_nodelay(true);
     let _ = upstream.set_nodelay(true);
+    // 头部读完后不再有 `HEAD_TIMEOUT` 兜底：两端都挂空闲超时，
+    // 否则半开连接会把线程和配额一起占死。
+    let _ = client.set_read_timeout(Some(PROXY_IDLE));
+    let _ = client.set_write_timeout(Some(PROXY_IDLE));
+    let _ = upstream.set_read_timeout(Some(PROXY_IDLE));
+    let _ = upstream.set_write_timeout(Some(PROXY_IDLE));
 
     let mut up_writer = upstream.try_clone()?;
     // 注入真实对端地址：内部 tiny_http 的 remote_addr 恒为 127.0.0.1，
@@ -235,14 +290,18 @@ mod tests {
     }
 
     #[test]
-    fn truncated_head_does_not_lose_request() {
-        // 没有头体分隔（异常/超长截断）：不能把整个请求丢掉，仍要能转发
+    fn truncated_head_is_rejected_not_injected() {
+        // 没有头体分隔（超时 / 超长截断）：不注入鉴权头、原样返回，
+        // 由 `serve_conn` 以 400 关连接 —— 否则后续字节可绕过覆盖式覆盖
         let head = b"GET /api/x HTTP/1.1\r\nHost: y";
-        let out = text(&inject_real_ip(
-            head,
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-        ));
-        assert!(out.starts_with("GET /api/x HTTP/1.1"), "{out}");
-        assert!(out.contains("X-Real-IP: 10.0.0.1"), "{out}");
+        assert!(!super::head_complete(head));
+        let out = inject_real_ip(head, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(out, head.to_vec());
+    }
+
+    #[test]
+    fn complete_head_is_recognised() {
+        assert!(super::head_complete(b"GET / HTTP/1.1\r\n\r\n"));
+        assert!(!super::head_complete(b"GET / HTTP/1.1\r\n\r"));
     }
 }

@@ -136,7 +136,7 @@
   "note": "Sierra MC7354/MC7355（老 4G 模块）：服务小区/信号与 EM919x 同为 `AT!GSTATUS?`（同一套 key:value 解析）——⚠️ 老固件的键**没有 `LTE `/`NR5G ` 前缀**，所以 ParseSierraGStatus 里每项都兼带了无前缀候选；电压 `AT!PCVOLT?`、温度 `AT!PCTEMP?` 同 EM919x。若某固件回的是单行 CSV 形式，则解析不到（只保留原始应答，不猜）。"
  },
  {
-  "match": "EM9291EM919",
+  "match": "EM9291",
   "voltage_cmd": "AT!PCVOLT?",
   "temp_cmd": "AT!PCTEMP?",
   "iccid_cmd": "",

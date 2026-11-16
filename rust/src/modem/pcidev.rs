@@ -469,7 +469,39 @@ fn assign_by_bdf<F: Fn(&str) -> bool>(
     out
 }
 
-/// 从名字表里挑属于这个 BDF 的（wwan 端口的 `<name>/device` 解析后判断）。
+/// `/sys/dev/char/<maj>:<min>` 的下标（glibc dev_t 编码）。
+#[cfg(unix)]
+fn dev_major_minor(dev: u64) -> (u64, u64) {
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    (major, minor)
+}
+
+/// `/dev/<name>`（或完整路径）对应的 sysfs 真实路径，**任意字符设备**适用。
+///
+/// MHI 的 AT/QMI 通道不是 tty：`/sys/class/tty/<n>/device` 不存在，
+/// `/sys/class/wwan/<n>/device` 只覆盖数据口。按设备号走
+/// `/sys/dev/char/<maj>:<min>` 能解析到 MHI UCI、wwan 等所有节点，
+/// 多块 PCIe 模组时据此把端口分回各自的 BDF（A-P2-7）。
+#[cfg(unix)]
+pub fn char_device_sysfs(name_or_path: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let dev = if name_or_path.contains('/') {
+        std::path::PathBuf::from(name_or_path)
+    } else {
+        std::path::Path::new("/dev").join(name_or_path)
+    };
+    let md = std::fs::metadata(&dev).ok()?;
+    let (major, minor) = dev_major_minor(md.rdev());
+    std::fs::canonicalize(format!("/sys/dev/char/{major}:{minor}")).ok()
+}
+
+#[cfg(not(unix))]
+pub fn char_device_sysfs(_name_or_path: &str) -> Option<std::path::PathBuf> {
+    None
+}
+
+/// 从名字表里挑属于这个 BDF 的（wwan 端口 / MHI 字符设备解析后判断）。
 #[cfg(unix)]
 fn assign_names_by_bdf(bdf: &str, names: &[String], single: bool) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -478,14 +510,17 @@ fn assign_names_by_bdf(bdf: &str, names: &[String], single: bool) -> Vec<String>
             out.push(n.clone());
             continue;
         }
-        let link = std::path::Path::new("/sys/class/wwan")
+        // 数据口在 /sys/class/wwan 下；MHI 的 AT/QMI 口不在，需按字符设备号解析
+        let wwan = std::path::Path::new("/sys/class/wwan")
             .join(n)
             .join("device");
-        let real = std::fs::canonicalize(&link)
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| link.to_string_lossy().to_string());
-        if path_has_bdf(&real, bdf) {
-            out.push(n.clone());
+        let real = std::fs::canonicalize(&wwan)
+            .ok()
+            .or_else(|| char_device_sysfs(n));
+        if let Some(p) = real {
+            if path_has_bdf(&p.to_string_lossy(), bdf) {
+                out.push(n.clone());
+            }
         }
     }
     out.sort();
@@ -518,6 +553,10 @@ fn dedup_sorted(mut v: Vec<String>) -> Vec<String> {
 }
 
 /// 极简 glob：只支持 `*`（匹配任意字符序列）。
+///
+/// 比较**大小写不敏感**：部分内核把 MHI 通道名写成小写
+/// （`mhi_1at0`），而候选模式按上游写法是大写 `mhi_*AT*` ——
+/// 严格匹配会整条漏检（A-P2-6）。
 // 仅 unix 路径与单测使用：非 unix 平台别报「未用」。
 #[cfg_attr(not(unix), allow(dead_code))]
 fn glob_match(pattern: &str, s: &str) -> bool {
@@ -527,7 +566,7 @@ fn glob_match(pattern: &str, s: &str) -> bool {
     let mut star: Option<usize> = None;
     let mut mark = 0usize;
     while ti < t.len() {
-        if pi < p.len() && p[pi] == t[ti] {
+        if pi < p.len() && p[pi].eq_ignore_ascii_case(&t[ti]) {
             pi += 1;
             ti += 1;
         } else if pi < p.len() && p[pi] == '*' {
@@ -560,9 +599,25 @@ mod tests {
         assert!(!looks_like_bdf("usb1"));
     }
 
+    /// glibc dev_t 编码：/dev/null = 1:3（0x103）。（A-P2-7 的字符设备解析基础）
+    #[cfg(unix)]
     #[test]
-    fn pci_id_and_driver() {
-        assert_eq!(normalize_pci_id("0x17CB"), "17cb");
+    fn dev_t_major_minor_matches_glibc() {
+        assert_eq!(dev_major_minor(0x103), (1, 3));
+        assert_eq!(dev_major_minor(0), (0, 0));
+        assert_eq!(dev_major_minor((188u64 << 8) | 7), (188, 7));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn char_device_sysfs_resolves_standard_node() {
+        let p = char_device_sysfs("/dev/null").expect("/dev/null 是字符设备");
+        let s = p.to_string_lossy();
+        assert!(s.contains("/devices/"), "{s}");
+    }
+
+    #[test]
+    fn pci_id_and_driver() {        assert_eq!(normalize_pci_id("0x17CB"), "17cb");
         assert!(pci_driver_is_mhi("mhi_pci_generic"));
         assert!(pci_driver_is_mhi("fibo_mhi")); // 广和通厂外树 MHI
         assert!(pci_driver_is_modem_driver("mtk_t7xx"));

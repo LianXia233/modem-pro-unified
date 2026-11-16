@@ -77,9 +77,24 @@ pub fn run() -> error::Result<()> {
     let pid_on_exit = cfg.server.pid_file.clone();
     runtime::signals::install(move || {
         log::info!("收到退出信号，落盘台账、停止主机侧拨号器并退出");
-        runtime::store::flush_all();
-        runtime::dialer::cleanup_all();
+        // 先删 PID：清理可能卡在无响应的模组上（QMI/MBIM 命令要等超时），
+        // 若 PID 文件还在，procd 会认为旧实例仍活着，重启被白白挡住。
         runtime::pid::remove(&pid_on_exit);
+        runtime::store::flush_all();
+        // 清理限时执行（C-13）：设备被拔掉但 USB 节点尚未消失时，停止拨号器
+        // 可能连续等好几轮超时。超时就先退出 —— 下次启动的 `cleanup_stale`
+        // 会把残留的拨号进程收尾。
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            runtime::dialer::cleanup_all();
+            let _ = done_tx.send(());
+        });
+        match done_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(()) => log::info!("退出清理完成"),
+            Err(_) => log::warn!(
+                "退出清理超过 5 秒未完成，直接退出（残留拨号器由下次启动的 cleanup_stale 收尾）"
+            ),
+        }
         std::process::exit(0);
     });
 

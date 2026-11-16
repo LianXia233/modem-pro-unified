@@ -62,6 +62,10 @@ pub const DEACTIVATE: u32 = 0;
 pub const ACTIVATION_ACTIVATED: u32 = 1;
 /// `2` = 正在激活：设备收到 `CONNECT` 后可能先回这个、随后才转 `1`。
 pub const ACTIVATION_ACTIVATING: u32 = 2;
+/// `0` = 未知（部分固件在无会话时回 0）。去激活后视同「已不在激活态」；
+/// `3` / `4`（deactivated / deactivating）同属非激活态，判据统一用
+/// 「不是 1 也不是 2」的负向匹配，不单列常量。
+pub const ACTIVATION_UNKNOWN: u32 = 0;
 
 /// 上下文 IP 类型。
 pub const IP_TYPE_DEFAULT: u32 = 0;
@@ -136,9 +140,11 @@ pub fn take(buf: &mut Vec<u8>) -> Option<Message> {
         let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
         let transaction = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
         // 长度必须 >= 头、且不超过一个合理的控制传输上限（8 KiB）。
-        // 坏长度说明流错位了：丢 4 字节继续找（同一轮里重同步，不把脏帧留给调用方）。
+        // 坏长度说明流错位了：**每次只丢 1 字节**再找（B-P2-12）。
+        // 按 4 字节跳会跳过「恰好对齐」的合法帧头（USB 聚合/短包边界上很常见），
+        // 于是把一整帧当成垃圾扔掉，调用方只能等超时。
         if !(12..=8192).contains(&len) {
-            buf.drain(..4);
+            buf.drain(..1);
             continue;
         }
         if buf.len() < len {
@@ -306,13 +312,16 @@ fn ipv6_at(b: &[u8], off: usize) -> Option<String> {
 /// | 36 / 40 | v4 DNS 条数 / 偏移 |
 /// | 44 / 48 | v6 DNS 条数 / 偏移 |
 /// | 52 | v4 MTU |
+/// | 56 | v6 MTU（仅 60 字节头的新版载荷有；见 C-24） |
 ///
 /// 可用性位图：bit0 地址、bit1 网关、bit2 DNS、bit3 MTU。
 ///
-/// 长度约定：`info` 短于 56 字节直接返回空结构；每个地址条目按 `b.get(off..off+n)`
-/// 取，越界返回 `None` 而不是 panic —— 设备把条数写大时只丢多余条目。
+/// 长度约定：`info` 短于 56 字节直接返回空结构；v6 MTU 只在 `info.len() >= 60`
+/// 时读 —— 旧固件（56 字节头）不因缺这个字段而整体判空。每个地址条目按
+/// `b.get(off..off+n)` 取，越界返回 `None` 而不是 panic —— 设备把条数写大时只丢多余条目。
 pub fn parse_ip_configuration(info: &[u8]) -> IpConfig {
     const HDR: usize = 56;
+    const HDR_V6_MTU: usize = 60;
     if info.len() < HDR {
         return IpConfig::default();
     }
@@ -344,8 +353,15 @@ pub fn parse_ip_configuration(info: &[u8]) -> IpConfig {
             }
         }
     }
-    if v4_avail & 8 != 0 {
+    if v4_avail & 8 != 0 && v4_mtu > 0 {
         cfg.mtu = v4_mtu;
+    } else if v6_avail & 8 != 0 && info.len() >= HDR_V6_MTU {
+        // v4 MTU 缺省（v6-only 承载）：采用 IPv6 MTU，别让上层拿到 0
+        // 再回退到默认值（C-24）
+        let v6_mtu = u32_at(info, 56);
+        if v6_mtu > 0 {
+            cfg.mtu = v6_mtu;
+        }
     }
     if v6_avail & 1 != 0 && v6_count > 0 {
         let prefix = (u32_at(info, v6_addr_off) & 0xff) as u8;
@@ -424,9 +440,25 @@ mod tests {
         assert_eq!(got.transaction, 2);
     }
 
+    /// 脏字节只偏 1 位时，合法帧头必须能被找回来（B-P2-12：不能按 4 字节跳）。
     #[test]
-    fn command_done_status_and_info() {
-        let mut body = le32(0).to_vec(); // status = success
+    fn resync_slides_one_byte_to_find_aligned_frame() {
+        // 自造 len=256 的帧：错位后长度字段会变成 0x00010000（非法），
+        // 按 4 字节跳会直接跨过真正的帧头。
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&le32(MSG_OPEN));
+        frame.extend_from_slice(&le32(256));
+        frame.extend_from_slice(&le32(7));
+        frame.resize(256, 0);
+        let mut buf = vec![0u8];
+        buf.extend_from_slice(&frame);
+        let got = take(&mut buf).expect("滑动 1 字节后应取到合法帧");
+        assert_eq!(got.transaction, 7);
+        assert_eq!(got.kind, MSG_OPEN);
+    }
+
+    #[test]
+    fn command_done_status_and_info() {        let mut body = le32(0).to_vec(); // status = success
         body.extend_from_slice(&le32(3)); // info len
         body.extend_from_slice(&[1, 0, 0]); // activation_state = 1(activated)
         let mut frame = le32(MSG_COMMAND_DONE).to_vec();
@@ -544,6 +576,22 @@ mod tests {
     fn ip_configuration_tolerates_short_buffer() {
         assert_eq!(parse_ip_configuration(&[]), IpConfig::default());
         assert_eq!(parse_ip_configuration(&[0u8; 20]), IpConfig::default());
+    }
+
+    /// v6-only 承载：v4 MTU 缺省时采用 60 字节头里的 IPv6 MTU（C-24）。
+    #[test]
+    fn ip_configuration_falls_back_to_v6_mtu() {
+        let mut info = vec![0u8; 60];
+        info[4..8].copy_from_slice(&le32(0)); // v4 不可用
+        info[8..12].copy_from_slice(&le32(0b1000)); // v6 MTU 可用
+        info[20..24].copy_from_slice(&le32(0)); // 无 v6 地址
+        info[56..60].copy_from_slice(&le32(1420));
+        let cfg = parse_ip_configuration(&info);
+        assert_eq!(cfg.mtu, 1420);
+
+        // 56 字节旧头：v6 MTU 字段不存在，不能越界读、也不该 panic
+        let old = vec![0u8; 56];
+        assert_eq!(parse_ip_configuration(&old).mtu, 0);
     }
 
     #[test]

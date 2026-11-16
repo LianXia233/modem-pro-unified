@@ -99,7 +99,7 @@ const SMS_REFRESH_MIN_GAP: Duration = Duration::from_secs(10);
 /// `network_interval`，新短信不用手动刷页面 —— 两者都变成「下一拍就查」。
 fn spawn_urc(state: &Arc<AppState>, interval: u64) {
     let state = state.clone();
-    std::thread::spawn(move || {
+    crate::runtime::supervise("urc", move || {
         // 每个模组：已见过的类别（首见记一条 info，便于排障时知道这台模组会发什么）
         let mut seen: HashMap<u32, Vec<UrcKind>> = HashMap::new();
         // 每个模组：上次洪水告警时刻（累计丢弃数是排障第一个该看的数）
@@ -239,7 +239,7 @@ fn log_urc(modem: &Modem, lines: &[UrcLine], seen: &mut Vec<UrcKind>) {
 fn spawn_hotplug_notify(state: &Arc<AppState>, interval: i64) {
     let every = if interval <= 0 { 3 } else { interval as u64 };
     let state = state.clone();
-    std::thread::spawn(move || {
+    crate::runtime::supervise("hotplug", move || {
         let mut last = signature(&state);
         loop {
             std::thread::sleep(Duration::from_secs(every));
@@ -282,7 +282,7 @@ fn spawn_push(state: &Arc<AppState>, interval: i64) {
         return;
     }
     let state = state.clone();
-    std::thread::spawn(move || {
+    crate::runtime::supervise("push", move || {
         let mut last_net: HashMap<u32, i64> = HashMap::new();
         let mut last_modem: HashMap<u32, i64> = HashMap::new();
         loop {
@@ -343,7 +343,7 @@ fn spawn_traffic(state: &Arc<AppState>, interval: i64) {
         return;
     }
     let state = state.clone();
-    std::thread::spawn(move || loop {
+    crate::runtime::supervise("traffic", move || loop {
         std::thread::sleep(Duration::from_secs(interval as u64));
         if !state.viewer_active(VIEWER_WINDOW_S) {
             continue;
@@ -364,7 +364,7 @@ fn spawn_traffic(state: &Arc<AppState>, interval: i64) {
 /// 启动先跑一轮，把上次退出时「已限制」的状态恢复上（模组可能已经重新拨上了）。
 fn spawn_quota(state: &Arc<AppState>, interval: u64) {
     let state = state.clone();
-    std::thread::spawn(move || {
+    crate::runtime::supervise("quota", move || {
         quota_tick_all(&state);
         loop {
             std::thread::sleep(Duration::from_secs(interval));
@@ -389,7 +389,7 @@ pub fn quota_tick_all(state: &AppState) {
 /// 有人看的时候查询会顺手记录（`handlers/signal.rs` 等），没必要重复占串口。
 fn spawn_change(state: &Arc<AppState>, interval: i64) {
     let state = state.clone();
-    std::thread::spawn(move || {
+    crate::runtime::supervise("change", move || {
         let mut last_net: HashMap<u32, i64> = HashMap::new();
         loop {
             std::thread::sleep(Duration::from_secs(interval as u64));
@@ -421,7 +421,7 @@ fn spawn_sim_watch(state: &Arc<AppState>, every: Duration) {
         return;
     }
     let state = state.clone();
-    std::thread::spawn(move || loop {
+    crate::runtime::supervise("sim-watch", move || loop {
         std::thread::sleep(crate::modem::model::SIM_WATCH_TICK);
         for modem in state.mgr.all() {
             if !modem.is_running() {
@@ -446,7 +446,7 @@ fn spawn_sim_watch(state: &Arc<AppState>, every: Duration) {
 /// 日志增量推送：有客户端在线才读文件。
 fn spawn_logs(state: &Arc<AppState>, interval: u64) {
     let state = state.clone();
-    std::thread::spawn(move || {
+    crate::runtime::supervise("logs", move || {
         let mut pusher = super::logtail::LogPusher::new(&state.cfg.server.log_file);
         loop {
             std::thread::sleep(Duration::from_secs(interval));
@@ -483,9 +483,25 @@ fn network_due(state: &AppState, last: &mut HashMap<u32, i64>) -> Vec<u32> {
 }
 
 /// 后台线程总数（供启动日志与单测核对接线是否齐全）。
+///
+/// 与 `spawn_all` 的接线逐项对应，顺序也一致：
+/// - 恒定 6 个：urc / netprov / push / traffic / quota / hotplug；
+/// - `change`：`change_interval > 0`；
+/// - `sim_watch`：`hotswap_interval` 解析后非零（`spawn_sim_watch` 里判零跳过）；
+/// - `logs`：`log_file` 非空。
+///
+/// `schedule` 不在其中：它由 `http::serve` 单独接线，不计入本函数。
 pub fn thread_count(state: &AppState) -> usize {
-    let mut n = 7; // urc / netprov / push / traffic / quota / hotplug / logs / sim（auto_dial 已并入 netprov）
+    let mut n = 6; // urc / netprov / push / traffic / quota / hotplug
     if state.cfg.server.change_interval > 0 {
+        n += 1;
+    }
+    let sim_every =
+        crate::config::parse_duration(&state.cfg.sim.hotswap_interval, Duration::from_secs(20));
+    if !sim_every.is_zero() {
+        n += 1;
+    }
+    if !state.cfg.server.log_file.trim().is_empty() {
         n += 1;
     }
     n
@@ -501,7 +517,7 @@ pub fn thread_count(state: &AppState) -> usize {
 /// - 但拨号器托管**照跑**：那两个开关管的是「建不建接口」，不是「谁拨号」。
 fn spawn_netprov(state: &Arc<AppState>, interval: u64) {
     let state = state.clone();
-    std::thread::spawn(move || {
+    crate::runtime::supervise("netprov", move || {
         // 先跑一轮再进节拍（quota 循环同一模式）：启动时 HTTP 已就绪、后台
         // discover 正在收尾，立即跑一轮能让「已经就绪的路径」早 15 秒生效 ——
         // 接口早建起来，同一轮里的拨号器托管也早 15 秒看到模组（否则插上

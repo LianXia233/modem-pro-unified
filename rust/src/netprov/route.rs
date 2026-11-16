@@ -200,7 +200,9 @@ pub fn flush_stale(dev: &str) -> Vec<String> {
     }
     #[cfg(unix)]
     {
-        // ① 逐条删默认路由（先看有哪些）
+        // ① 逐条删默认路由（先看有哪些）。
+        //    只回传**最小关键字段**（default via/dev/metric），不带 `proto`/`src`
+        //    等选择子 —— OpenWrt 精简版 ip（busybox/iplite）不认这些，会直接拒绝。
         if let Ok(out) = std::process::Command::new("ip")
             .args(["-4", "route", "show", "default", "dev", dev])
             .output()
@@ -208,7 +210,7 @@ pub fn flush_stale(dev: &str) -> Vec<String> {
             let text = String::from_utf8_lossy(&out.stdout);
             for spec in default_route_specs(&text) {
                 let mut args = vec!["-4".to_string(), "route".to_string(), "del".to_string()];
-                args.extend(spec.iter().skip(1).cloned());
+                args.extend(minimal_default_del_args(&spec));
                 if std::process::Command::new("ip")
                     .args(&args)
                     .status()
@@ -228,6 +230,36 @@ pub fn flush_stale(dev: &str) -> Vec<String> {
         {
             done.push(format!("ip -4 addr flush dev {dev}"));
         }
+        // ③ IPv6：断开时 odhcp6c/RA 拿到的全局地址和默认路由会继续生效
+        //    （断开会话 ≠ netifd 接口 down）。不清理的话 v6 仍可上网、
+        //    「已断开」名不副实；static-v6 由本程序装的那条默认路由也在这里收尾。
+        if let Ok(out) = std::process::Command::new("ip")
+            .args(["-6", "route", "show", "default", "dev", dev])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for spec in default_route_specs(&text) {
+                let mut args = vec!["-6".to_string(), "route".to_string(), "del".to_string()];
+                args.extend(minimal_default_del_args(&spec));
+                if std::process::Command::new("ip")
+                    .args(&args)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+                {
+                    done.push(format!("ip {}", args.join(" ")));
+                }
+            }
+        }
+        // 只清 global scope：link-local（fe80::/64）留着无害，清了反而影响邻居发现。
+        if std::process::Command::new("ip")
+            .args(["-6", "addr", "flush", "dev", dev, "scope", "global"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            done.push(format!("ip -6 addr flush dev {dev} scope global"));
+        }
         if done.is_empty() {
             log::debug!("清理 {dev} 的旧地址/路由：没有可清理项或 ip 不可用");
         } else {
@@ -239,6 +271,36 @@ pub fn flush_stale(dev: &str) -> Vec<String> {
         let _ = dev;
     }
     done
+}
+
+/// 从一条 `ip route show` 输出里提取删除所需的最小字段。
+///
+/// 输入形如 `default via 10.64.64.65 dev wwan0 proto static src 10.64.64.66 metric 30`，
+/// 输出 `["default", "via", "10.64.64.65", "dev", "wwan0", "metric", "30"]`。
+/// `proto`/`src`/`table` 等选择子一律丢掉（精简 ip 不支持）。
+fn minimal_default_del_args(spec: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = vec!["default".to_string()];
+    let mut i = 1;
+    while i < spec.len() {
+        match spec[i].as_str() {
+            "via" | "dev" | "metric" => {
+                if i + 1 < spec.len() {
+                    out.push(spec[i].clone());
+                    out.push(spec[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    if !out.iter().any(|t| t == "dev") {
+        // 没有 dev 就没有安全边界 —— 宁可删不掉（由调用方看到失败），
+        // 也不能误删别的接口的默认路由。
+        return Vec::new();
+    }
+    out
 }
 
 #[cfg(test)]
@@ -355,5 +417,24 @@ default via 10.42.0.1 dev eth2 proto dhcp src 10.42.0.2 metric 50\n\
     fn empty_route_output_is_safe() {
         assert!(default_route_specs("").is_empty());
         assert!(default_route_specs("10.0.0.0/8 dev eth0\n").is_empty());
+    }
+
+    /// 删除默认路由只带最小关键字段：精简版 ip 不认 proto/src/table。
+    #[test]
+    fn del_args_are_minimal() {
+        let spec: Vec<String> = "default via 10.42.0.1 dev wwan0 proto static src 10.42.0.2 metric 30"
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            minimal_default_del_args(&spec),
+            vec!["default", "via", "10.42.0.1", "dev", "wwan0", "metric", "30"]
+        );
+        // 没有 dev 的 spec 一律拒绝（不能误删别的接口）
+        let no_dev: Vec<String> = "default via 10.42.0.1 metric 20"
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        assert!(minimal_default_del_args(&no_dev).is_empty());
     }
 }

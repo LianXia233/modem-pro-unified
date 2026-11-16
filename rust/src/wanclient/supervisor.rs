@@ -85,10 +85,16 @@ pub fn udhcpc_argv(p: &Params) -> Vec<String> {
 }
 
 /// odhcp6c 的命令行（`-P0` 在附加参数之后、网卡名之前，与旧 shim 一致）。
+///
+/// `-P0` 表示「不请求前缀」。上层按 `reqprefix` 显式生成的 `-P<n>` 用户参数
+/// 必须优先：odhcp6c 后出现的 `-P0` 会把它覆盖掉，PD 就永远申请不到（C-09）。
 pub fn odhcp6c_argv(p: &Params) -> Vec<String> {
     let mut args = vec!["-s".to_string(), p.v6_script_path()];
+    let user_prefix = p.oopts.iter().any(|o| o.starts_with("-P"));
     args.extend(p.oopts.iter().cloned());
-    args.push("-P0".to_string());
+    if !user_prefix {
+        args.push("-P0".to_string());
+    }
     args.push(p.iface.clone());
     args
 }
@@ -432,5 +438,20 @@ mod tests {
         );
         // uopts 不应混进 odhcp6c 的参数里
         assert!(!odhcp6c_argv(&params(false)).contains(&"-B".to_string()));
+    }
+
+    #[test]
+    fn odhcp6c_keeps_user_prefix_request() {
+        let mut p = params(false);
+        p.oopts = vec!["-t120".to_string(), "-P60".to_string()];
+        let args = odhcp6c_argv(&p);
+        assert_eq!(args, vec![
+            "-s",
+            "/tmp/mp-dhcpv6-modem1.script",
+            "-t120",
+            "-P60",
+            "wwan0",
+        ]);
+        assert!(!args.contains(&"-P0".to_string()), "不能覆盖用户的 -P60");
     }
 }

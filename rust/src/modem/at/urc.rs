@@ -295,6 +295,15 @@ impl LineGate {
         self.dropped
     }
 
+    /// 丢弃尚未成行的残留字节。
+    ///
+    /// `command.rs::drain()` 把命令间隙读到的字节喂进本层以捞回 URC，
+    /// 但其中可能夹着半条非 URC 残留；不清掉会被下一条应答当成前缀，
+    /// 污染解析（A-P2-9）。
+    pub fn discard_partial(&mut self) {
+        self.buf.clear();
+    }
+
     /// 缓冲里是否还有未闭合的残余字节（排障用）。
     pub fn pending(&self) -> usize {
         self.buf.len()
@@ -444,6 +453,20 @@ mod tests {
     }
 
     // ---------- 按类别取走 ----------
+
+    /// 命令间隙的 drain 会把 URC 捞回队列，但没成行的残余必须清掉（A-P2-9）。
+    #[test]
+    fn discard_partial_keeps_complete_urc_but_drops_half_line() {
+        let mut g = LineGate::default();
+        let mut out = Vec::new();
+        g.feed(b"+CEREG: 5\r\n+CSQ: 2", &mut out);
+        assert_eq!(g.pending(), b"+CSQ: 2".len(), "半行留在缓冲里");
+        g.discard_partial();
+        assert_eq!(g.pending(), 0);
+        let urc = g.take_urc();
+        assert_eq!(urc.len(), 1, "已完成的 URC 不能被清掉");
+        assert_eq!(urc[0].kind, UrcKind::Reg);
+    }
 
     #[test]
     fn take_urc_of_keeps_other_kinds() {

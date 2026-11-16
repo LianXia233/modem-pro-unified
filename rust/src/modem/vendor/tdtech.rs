@@ -1,7 +1,8 @@
 //! 鼎桥 TD Tech（MT5700 系列）。
 //!
 //! 识别关键字 `MT5700`。网络/信号/温度/流量全在 `^` 私有命令里
-//! （移远那套全回 ERROR），数据面按通用 QMI 处理。
+//! （移远那套全回 ERROR）；数据面虽是 ECM/NCM，实机用的却是**展锐那套
+//! 模组自拨**（`AT^SETAUTODIAL`，见 `data_channel`），不是海思的 `AT^NDISDUP`。
 
 use crate::modem::at::AtPreset;
 
@@ -20,8 +21,9 @@ impl VendorSpec for Spec {
 
     fn detect(&self, lines: &[String]) -> bool {
         // 手册是《MT5700M-CN 5G 系列》（V200R001C20），清单里同族的 mt5710_cn
-        // 同属巴龙平台、指令面一致 —— 关键字一并认。
-        any_line(lines, &["MT5700", "MT5710"])
+        // 同属巴龙平台、指令面一致 —— 关键字一并认。固件 ATI 也可能直接报
+        // 厂商名（TDTECH / TD TECH），一并接受，别只认型号（A-P2-5）。
+        any_line(lines, &["MT5700", "MT5710", "TDTECH", "TD TECH"])
     }
 
     fn serving_cell_cmd(&self) -> &'static str {
@@ -161,18 +163,46 @@ impl VendorSpec for Spec {
         ("AT^SYSCFGEX?", "syscfgex")
     }
 
-    /// 鼎桥 MT5700/MT5710 属巴龙家族，ECM/RNDIS 走华为那套 `AT^NDISDUP`
-    /// （QModem 把这两个型号归在 `manufacturer=huawei` 分支处理，
-    /// `modem_dial.sh:1385-1415`；本项目的识别把方言归到鼎桥，指令族相同）。
+    /// 鼎桥 MT5700/MT5710 虽然常被归到「巴龙平台」，实机方言却是**展锐那套
+    /// 模组自拨**：`AT^SETAUTODIAL=1,<mode>` / `=0` + `AT^CFUN` 循环，
+    /// 数据面用 `AT^NDISSTATQRY?`（手册 §16.4/§16.18）。
     ///
-    /// 失败时允许退回 `AT+CGACT`：这是保守兜底，不会把「不支持」伪装成「已拨通」——
-    /// 回退结果仍要过 `AT+CGPADDR` 与网卡就绪校验。
+    /// 依据：上游 `luci-app-mt5700`（同型号实机抓样）与 QModem
+    /// `huawei_auto_dial_unisoc()` / `auto_dial_hang_huawei_unisoc()`
+    /// （`modem_dial.sh:1524-1568`）。此前照搬海思 `AT^NDISDUP` 是错的 ——
+    /// MT5700 上这条会回 ERROR，拨号永远停在「已激活、网卡无地址」。
+    ///
+    /// 型号未落到 MT5700/MT5710 的罕见情况（只报到厂商名）仍保守走巴龙
+    /// `AT^NDISDUP`，不凭猜测发私有指令。
     fn data_channel(
         &self,
         ctx: &super::datacall::DataCallCtx<'_>,
     ) -> Option<super::datacall::DataChannel> {
         use super::datacall::{AtStep, DataChannel};
         let cid = ctx.cid;
+        if ctx.platform == "unisoc" || crate::modem::model::is_tdtech_mt5700(ctx.model) {
+            return Some(DataChannel {
+                pdp_first: false,
+                activate: vec![AtStep::new(
+                    "AT^SETAUTODIAL=1,4",
+                    "鼎桥（展锐系）：打开模组自拨（mode=4，与 QModem 默认一致）",
+                )],
+                deactivate: vec![
+                    AtStep::new("AT^SETAUTODIAL=0", "关闭模组自拨").optional(),
+                    AtStep::new("AT+CFUN=0", "射频下行（自拨会话需要 CFUN 循环才彻底断开）"),
+                    AtStep::new("AT+CFUN=1", "射频恢复上行"),
+                ],
+                cgact_fallback: false,
+                // 先问「自拨开着吗」再决定要不要 CFUN 循环 —— 依据 QModem
+                // auto_dial_hang_huawei_unisoc（modem_dial.sh:1546-1568）。
+                autodial_probe: Some(super::datacall::AutodialProbe {
+                    query: "AT^SETAUTODIAL?",
+                    fallback: "AT^NDISDUP=0,0",
+                    status: Some("AT^NDISSTATQRY?"),
+                }),
+                note: "鼎桥 MT5700/MT5710 由模组自拨，主机不持有 PDP；断开需 CFUN 循环（先查自拨状态）",
+            });
+        }
         Some(DataChannel {
             pdp_first: false,
             activate: vec![AtStep::slow(
@@ -185,7 +215,7 @@ impl VendorSpec for Spec {
             )],
             cgact_fallback: true,
             autodial_probe: None,
-            note: "鼎桥（巴龙）由 AT^NDISDUP 激活 ECM/RNDIS；与华为海思同族",
+            note: "鼎桥（未确认型号）暂按巴龙 AT^NDISDUP 处理",
         })
     }
 

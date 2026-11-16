@@ -25,10 +25,9 @@ impl VendorSpec for Spec {
     }
 
     fn detect(&self, lines: &[String]) -> bool {
-        any_line(
-            lines,
-            &["FOXCONN", "T77W968", "T99W175", "T99W373", "T99W640"],
-        )
+        // `T99W` 覆盖 T99W175 / T99W368 / T99W373 / T99W640 等全系，
+        // 不必逐型号列（型号新增时容易漏，A-P2-17）。
+        any_line(lines, &["FOXCONN", "T77W968", "T99W"])
     }
 
     fn serving_cell_cmd(&self) -> &'static str {

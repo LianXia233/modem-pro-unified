@@ -72,6 +72,8 @@ use std::time::{Duration, Instant};
 use crate::http::AppState;
 use crate::modem::model::dial::{DIAL_CONNECTED, DIAL_DIALING};
 #[cfg(unix)]
+use crate::modem::model::is_internal_apn;
+#[cfg(unix)]
 use crate::modem::model::Modem;
 #[cfg(unix)]
 use crate::netprov::provision::device_for;
@@ -332,9 +334,10 @@ fn warn_legacy_bin_once(state: &AppState) {
 
 /// 数据网卡现在的链路事实（对齐上游 `hostDialHasAddr` + `hostDialHasCarrier`）。
 ///
-/// 有 IPv4 地址，且（读得到载波时）载波为 1。只有地址、没载波 = 已经掉线
-///（旧租约还挂着）；没地址直接不算在线。载波读不到（网卡刚好没了 / 平台
-/// 不导出）时按「有载波」处理 —— 该情况由会话探活（`alive()`）兜底。
+/// 有地址（**IPv4 或 IPv6 任一有效**——纯 IPv6 卡 / IPv6-only APN 也常见），
+/// 且（读得到载波时）载波为 1。只有地址、没载波 = 已经掉线（旧租约还挂着）；
+/// 没地址直接不算在线。载波读不到（网卡刚好没了 / 平台不导出）时按「有载波」
+/// 处理 —— 该情况由会话探活（`alive()`）兜底。
 ///
 /// 返回 `false` 不代表立刻拆会话：调用方 [`DialerSupervisor::heal_due`]
 /// 还有时长 / 限速 / 限次三道闸（刚拨号的前 60 秒是地址的正常协商窗口）。
@@ -344,9 +347,10 @@ fn native_link_ok(dev: &str) -> bool {
     if dev.is_empty() {
         return false;
     }
+    // iface_addrs_cached 已过滤 fe80::/10 链路本地地址，留下任一即为有效地址
     let has_addr = crate::modem::model::dial::iface_addrs_cached(dev)
         .iter()
-        .any(|a| !a.contains(':'));
+        .any(|a| !a.trim().is_empty());
     if !has_addr {
         return false;
     }
@@ -354,6 +358,53 @@ fn native_link_ok(dev: &str) -> bool {
         Ok(v) => v.trim() == "1",
         Err(_) => true,
     }
+}
+
+/// 从周期推送缓存判断「SIM 缺失 / 明确未注册」（C-30，**不发任何 AT**）。
+///
+/// 只认**新鲜且明确**的证据：缓存缺失（没人看过页面）、格式不认识、
+/// 或网络正在搜索（stat=2）一律不拦 —— 门禁不能凭猜测阻止拨号。
+/// 同理，注册查询失败（ERROR/超时）留下的**占位 stat=0**（缓存里没有 `known`
+/// 标记，见 [`crate::modem::model::regstate::RegState`]）也不算「明确未注册」。
+fn service_stop_from_facts(
+    sim: Option<&serde_json::Value>,
+    net: Option<&serde_json::Value>,
+) -> Option<gate::Stop> {
+    if let Some(v) = sim {
+        // 字段缺失 = 未知；只有明确 false 才判「没有卡」
+        if v.get("sim_present").and_then(|x| x.as_bool()) == Some(false) {
+            return Some(gate::Stop {
+                code: "sim_missing",
+                text: "未检测到 SIM 卡（插好卡后会自动恢复拨号）".to_string(),
+            });
+        }
+    }
+    let v = net?;
+    let mut stats = Vec::new();
+    for key in ["cs_reg", "ps_reg", "reg_5g", "reg_eps"] {
+        let Some(r) = v.get(key) else {
+            continue;
+        };
+        // `known` 缺失 = 该域的 stat 是查询失败后的占位值（旧缓存或 `RegState::default()`），
+        // 不是模组亲口说的「未注册」—— 不能拿占位值拦拨号。
+        if r.get("known").and_then(|x| x.as_bool()) != Some(true) {
+            continue;
+        }
+        if let Some(stat) = r.get("stat").and_then(|s| s.as_i64()) {
+            stats.push(stat);
+        }
+    }
+    if stats.is_empty() {
+        return None;
+    }
+    // 1/5 = 已注册（本地/漫游）；2 = 正在搜索 —— 都还有希望，不该拦。
+    if stats.iter().any(|s| *s == 1 || *s == 5 || *s == 2) {
+        return None;
+    }
+    Some(gate::Stop {
+        code: "no_service",
+        text: "模组未注册上网络（检查 SIM 是否有信号）".to_string(),
+    })
 }
 
 /// 自动连接的统一判定（纯函数，单测钉住所有拒绝理由）。
@@ -441,12 +492,30 @@ pub struct DialerSupervisor {
     /// 已经被顶掉。加锁后同一模组同时只有一个建会话流程。
     #[cfg(unix)]
     starting: Mutex<std::collections::HashSet<u32>>,
+    /// 每个模组的「停止代次」：`stop_session` / `stop_all` 每次 +1。
+    ///
+    /// `Session::start` 要好几秒，期间用户可能点了断开（会话已被 drain）；
+    /// 建好后必须比对这一代次，晚到的会话不能再插回表里 —— 否则进程退出 /
+    /// 用户断开后仍残留一条厂商侧数据呼叫（B-P2-3）。
+    #[cfg(unix)]
+    stop_gen: Mutex<HashMap<u32, u64>>,
     /// 门禁事实的短时缓存（飞行模式 / 漫游都各要发 AT，不能每轮都问）。
     ///
     /// 只在 `[net] dial_gate` 打开时才会被填写；默认 `off` 时这张表永远是空的，
     /// 即「不新增任何 AT 流量」。
     #[cfg(unix)]
     gate: Mutex<HashMap<u32, GateCache>>,
+    /// 拨号意图台账（`manual_stop` 跨重启保留，B-P2-8）。
+    ///
+    /// 懒加载：首轮 `reconcile` 用 `AppState.config_path` 建（不改 lib.rs 的装配）。
+    #[cfg(unix)]
+    intent: OnceLock<crate::runtime::store::DialIntentStore>,
+    /// 协调器单飞闸门（D-C-12）：节拍循环与 `kick` 并发进入会重复记账 /
+    /// 重复发门禁 AT。拿不到就记一笔 pending，由持锁者跑完再来一轮。
+    #[cfg(unix)]
+    reconcile_gate: Mutex<()>,
+    #[cfg(unix)]
+    reconcile_pending: std::sync::atomic::AtomicBool,
     /// `AppState` 的句柄（[`Self::kick`] 用）。
     ///
     /// 为什么不是 kick 的入参：`/api/dial/connect` 这类**同步** handler 只拿得到
@@ -526,6 +595,18 @@ impl DialerSupervisor {
     pub fn stop_all(&self) {
         #[cfg(unix)]
         {
+            {
+                // 先 bump 所有已知代次：正在 `Session::start` 的线程醒来后会
+                // 发现代次变了，主动拆掉刚建好的会话（B-P2-3）。正在建会话
+                // 的模组还没进 `native` 表，必须从 `starting` 一并取。
+                let mut ids: Vec<u32> = self.native.lock().unwrap().keys().copied().collect();
+                ids.extend(self.starting.lock().unwrap().iter().copied());
+                ids.sort_unstable();
+                ids.dedup();
+                for id in ids {
+                    self.bump_stop_gen(id);
+                }
+            }
             let all: Vec<(u32, native::Session)> = self.native.lock().unwrap().drain().collect();
             for (id, mut s) in all {
                 s.stop();
@@ -536,12 +617,44 @@ impl DialerSupervisor {
 
     /// 每轮组网循环（15 秒）调用：**所有**后端的连接决策都在这里。
     ///
+    /// 单飞（D-C-12）：节拍循环与用户操作触发的 `kick` 可能撞车；并发跑两遍
+    /// 会重复记自愈次数、重复发门禁 AT。拿不到闸门就把这次请求记成 pending，
+    /// 由持锁者跑完当前一轮后再补一轮 —— `kick()` 的公共签名不变。
+    ///
     /// 顺序：先回收已消失模组的会话，再逐台判定（原生 / AT 二选一）。
     #[cfg(unix)]
     pub fn reconcile(&self, state: &AppState) {
+        let _gate = match self.reconcile_gate.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                self.reconcile_pending
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                log::debug!("拨号协调器已有一轮在跑，本次请求记入待跑");
+                return;
+            }
+        };
+        loop {
+            self.reconcile_once(state);
+            // 跑的过程中有人来过 ⇒ 再补一轮（例如用户刚点的手动拨号）
+            if !self
+                .reconcile_pending
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                break;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn reconcile_once(&self, state: &AppState) {
         warn_legacy_bin_once(state);
         let running: Vec<std::sync::Arc<Modem>> = state.mgr.all();
         let ids: Vec<u32> = running.iter().map(|m| m.id).collect();
+        let intent = self.intent.get_or_init(|| {
+            crate::runtime::store::DialIntentStore::new(
+                crate::runtime::store::dial_intent_file(&state.config_path),
+            )
+        });
 
         // 模组没了 → 先收，避免拔掉后还挂着
         let gone: Vec<u32> = self
@@ -554,18 +667,19 @@ impl DialerSupervisor {
             .collect();
         for id in gone {
             log::info!("原生拨号：模组 {id} 已不在，停掉会话");
-            self.stop_session(id);
-            self.retry.clear(id);
-            self.rescue.lock().unwrap().remove(&id);
-            self.in_flight.lock().unwrap().remove(&id);
-            crate::netprov::provision::forget_device(id);
+            self.forget_modem_session(id);
         }
 
         for modem in running {
             if !modem.is_running() {
-                self.stop_session(modem.id);
+                // 短暂 not-running（掉线重探 / 用户关开关）和「模组没了」必须
+                // 走同一套清理：否则旧的退避、自愈复位账、门禁缓存都还在，
+                // 模组回来时这些「上一段生命」的账直接生效（B-P2-9）。
+                self.forget_modem_session(modem.id);
                 continue;
             }
+            // 重启后的首轮：先把「用户断开」的意图从盘上恢复回来，再决定拨不拨。
+            self.sync_dial_intent(intent, &modem);
             if native_takes(&modem) {
                 self.reconcile_native_one(state, &modem);
             } else {
@@ -584,8 +698,112 @@ impl DialerSupervisor {
 
 #[cfg(unix)]
 impl DialerSupervisor {
+    /// 模组离开（拔掉 / 关掉 / 重探）时的统一清理。
+    ///
+    /// 会话、退避、自愈复位账、在途标记、门禁缓存、netprov 设备台账都要清，
+    /// 否则模组下次回来会继承「上一段生命」的状态（B-P2-9）。
+    fn forget_modem_session(&self, modem_id: u32) {
+        self.stop_session(modem_id);
+        self.retry.clear(modem_id);
+        self.rescue.lock().unwrap().remove(&modem_id);
+        self.in_flight.lock().unwrap().remove(&modem_id);
+        self.gate.lock().unwrap().remove(&modem_id);
+        crate::netprov::provision::forget_device(modem_id);
+    }
+
+    /// 取缓存里的「SIM 缺失 / 未注册」事实（C-30）。只读 `AppState.cache`，
+    /// 不发 AT；缓存过期就当未知（不拦）。
+    fn service_stop(&self, state: &AppState, modem: &Modem) -> Option<gate::Stop> {
+        const SIM_TTL_MS: u64 = 10 * 60 * 1000;
+        const NET_TTL_MS: u64 = 3 * 60 * 1000;
+        let sim = state
+            .cache
+            .get("modem", modem.id)
+            .filter(|(_, age)| *age <= SIM_TTL_MS)
+            .map(|(v, _)| v);
+        let net = state
+            .cache
+            .get("network", modem.id)
+            .filter(|(_, age)| *age <= NET_TTL_MS)
+            .map(|(v, _)| v);
+        service_stop_from_facts(sim.as_ref(), net.as_ref())
+    }
+
+    /// 这台模组在拨号意图台账里的键。
+    ///
+    /// 用 **USB 身份 + 总线路径**（跨重启稳定）而不是模组 id：id 是发现顺序，
+    /// 重启后可能变。取不到 USB 拓扑（PCIe / 纯串口）时退回端口名 —— 不完美，
+    /// 但总比「重启就忘」强。
+    fn intent_key(modem: &Modem) -> Option<String> {
+        let port = modem.port();
+        if let Some(u) = crate::modem::usbdev::identity_for_tty(&port) {
+            if !u.bus_path.is_empty() {
+                return Some(format!("usb:{}:{}@{}", u.vid, u.pid, u.bus_path));
+            }
+        }
+        let port = port.trim();
+        (!port.is_empty()).then(|| format!("port:{port}"))
+    }
+
+    /// 恢复 / 写穿「用户断开」的意图（B-P2-8）。
+    ///
+    /// 两个方向，都只在**状态与盘上不一致**时才动盘：
+    ///   · 盘上 manual_stop=true 而本次启动还没发生过任何拨号意图（epoch=0）
+    ///     ⇒ 恢复（用户断开后重启不该自动重拨）；
+    ///   · 内存 manual_stop=true ⇒ 落盘（用户刚点的断开要跨重启）；
+    ///   · 内存已重新拨过号（epoch>0 且 manual_stop=false）⇒ 清掉旧记录。
+    fn sync_dial_intent(
+        &self,
+        intent: &crate::runtime::store::DialIntentStore,
+        modem: &Modem,
+    ) {
+        let Some(key) = Self::intent_key(modem) else {
+            return;
+        };
+        let st = modem.dial_status();
+        if st.manual_stop {
+            let reason = if st.stop_reason.trim().is_empty() {
+                "manual_stop".to_string()
+            } else {
+                st.stop_reason.clone()
+            };
+            let changed = intent
+                .get(&key)
+                .map(|r| r.manual_stop != true || r.stop_reason != reason)
+                .unwrap_or(true);
+            if changed {
+                intent.set(
+                    &key,
+                    crate::runtime::store::DialIntentRecord {
+                        manual_stop: true,
+                        stop_reason: reason,
+                        updated_at: crate::logging::unix_now(),
+                    },
+                );
+            }
+            return;
+        }
+        match intent.get(&key) {
+            Some(rec) if rec.manual_stop && modem.dial_epoch() == 0 => {
+                modem.restore_manual_stop(&rec.stop_reason);
+                log::info!(
+                    "原生拨号：模组 {} 恢复重启前的断开意图（manual_stop），自动组网保持暂停",
+                    modem.id
+                );
+            }
+            // 本次启动里已经重新拨过号：旧的断开意图作废
+            Some(rec) if rec.manual_stop => {
+                intent.clear(&key);
+            }
+            _ => {}
+        }
+    }
+
     /// 停掉一个模组的原生会话（重复调用安全；**不清退避**）。
     fn stop_session(&self, modem_id: u32) {
+        // 作废「正在建」的那一路：它建好后会比对代次，失配就自己拆掉。
+        #[cfg(unix)]
+        self.bump_stop_gen(modem_id);
         let s = self.native.lock().unwrap().remove(&modem_id);
         if let Some(mut s) = s {
             s.stop();
@@ -593,6 +811,26 @@ impl DialerSupervisor {
         }
         // 会话被策略/用户停掉 = 「模组没了」这一类：自愈计数清零
         self.heal.lock().unwrap().remove(&modem_id);
+    }
+
+    /// 停止代次 +1，并返回新值（建会话前后各取一次做比对）。
+    #[cfg(unix)]
+    fn bump_stop_gen(&self, modem_id: u32) -> u64 {
+        let mut g = self.stop_gen.lock().unwrap();
+        let e = g.entry(modem_id).or_insert(0);
+        *e = e.wrapping_add(1);
+        *e
+    }
+
+    /// 读取当前停止代次（未出现过 = 0）。
+    #[cfg(unix)]
+    fn stop_generation(&self, modem_id: u32) -> u64 {
+        self.stop_gen
+            .lock()
+            .unwrap()
+            .get(&modem_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// 掉线自愈判定（纯决策，移植自上游 `hostDialRestartDue`）。
@@ -757,7 +995,11 @@ impl DialerSupervisor {
         // 早先只有前三级：固件里存了 APN 但从没在页面上拨过的 MBIM 模组，
         // 会陷入「算不出计划（缺 APN）→ 5 秒退避 → 再来」的死循环；
         // 而需要显式下发 APN 的模组（上下文为空）则永远拨不上。
-        let apn = if st.apn.trim().is_empty() {
+        // 第 1 级必须过内部 APN 过滤：sync_dial_state 可能把 CGCONTRDP 报的
+        // 第一个上下文（VoLTE 机型常见 ims/sos）写进 st.apn，拿它去 WDS Start /
+        // MBIM CONNECT 会被拒（B-P1-4）。过滤后与第 2 级（独立字段）分工明确。
+        let st_apn = st.apn.trim();
+        let apn = if st_apn.is_empty() || is_internal_apn(st_apn) {
             let last = modem.last_dial_apn();
             if !last.is_empty() {
                 last
@@ -772,7 +1014,7 @@ impl DialerSupervisor {
                     .unwrap_or_default()
             }
         } else {
-            st.apn.clone()
+            st_apn.to_string()
         };
         let device = device_for(modem);
         let kind = modem.ensure_dial_kind();
@@ -794,6 +1036,14 @@ impl DialerSupervisor {
                 // 已有会话**不动**：算不出计划 ≠ 现有会话坏了（典型：控制口被
                 // 临时占用、网卡名还没出现），贸然拆掉会把唯一能用的连接弄丢。
                 let msg = e.to_string();
+                // 缺 APN 不是「偶发失败」，重试再多次也不会自己好：把原因落到
+                // 页面（stop_reason=no_apn），别让人只看到一条永久退避的日志（C-17）。
+                if matches!(e, PlanError::MbimNeedsApn) {
+                    modem.note_stopped(
+                        "no_apn",
+                        "MBIM 模式必须配置 APN：请在「拨号上网」里填写运营商 APN（或等自动识别完成）",
+                    );
+                }
                 self.retry.fail(id, msg.clone());
                 self.note_native_fail(id, &msg);
                 log::warn!("原生拨号：模组 {id} 算不出计划: {e}");
@@ -807,83 +1057,136 @@ impl DialerSupervisor {
         // 与上游口径一致：只有地址、没载波 = 已经掉线（旧租约还挂着）。
         let link_ok = native_link_ok(&device);
 
-        // 已在跑同一个计划：探活；掉线就重建
+        // 已在跑同一个计划：探活；掉线就重建。
+        //
+        // 探活是一次控制口往返（QMI/MBIM 请求，最长 OP_TIMEOUT 15s），必须在
+        // 全局会话表锁**之外**执行（B-P1-1）：某模组控制口卡死时，持锁探活会
+        // 把其它模组的 stop / reconcile 和用户「断开」的 HTTP 线程一起拖住。
+        // 做法：先把会话从表里**取出**，锁外探活，再决定放回还是停掉。
         let mut heal_only = false;
-        {
-            let mut g = self.native.lock().unwrap();
-            if let Some(s) = g.get_mut(&id) {
-                if s.plan == plan {
-                    match s.alive() {
-                        Some(false) => {
-                            // 真掉线：先把权威状态拉回 dialing（页面立刻能看到），
-                            // **不置 manual_stop** —— 这不是用户的断开意图。
-                            let epoch = modem.dial_epoch();
-                            modem.note_native_down(epoch, "主机侧数据呼叫断开，准备重拨");
-                            log::warn!("原生拨号：模组 {id} 数据呼叫已断开，重拨");
-                        }
-                        // 传输层出错（None）不当作掉线：一次读超时不该把呼叫拆了。
-                        // 但还要看一眼「链路事实」：会话在跑、数据网卡却一直拿不到
-                        // 地址（或地址还在、载波没了）是掉线的另一种形态 —— 上游
-                        // hostDialRestartDue 的口径：跑满 60s 没地址就重开（限速限次），
-                        // 拿到地址即清零。QMI/MBIM 的会话状态可能停在已连接而承载早就
-                        // 废了（实测：模组重新枚举后 raw_ip 被复位，地址永远不来）。
-                        _ => {
-                            // 同参数下重复点「拨号」时，`dial_inner` 会先把状态写成
-                            // dialing（并 bump 代次），但会话其实还在跑、计划也没变。
-                            // 这条路径原先只做「掉线自愈」，没有第二个人把状态写回
-                            // connected —— 页面于是永久停在「拨号中」，直到会话真的
-                            // 掉了才有下一轮写入。这里按当前代次重新确认一次。
-                            // 只在「状态不是 connected」时写，避免每轮往 steps 里堆条目。
-                            if st.state != DIAL_CONNECTED {
-                                let note = "会话仍在运行（连接参数未变），沿用现有数据呼叫";
-                                if modem.note_native_up(
-                                    modem.dial_epoch(),
-                                    &format!("native-{kind}"),
-                                    note,
-                                ) {
-                                    log::info!(
-                                        "原生拨号：模组 {id} 会话仍在运行，状态回写为已连接（重复拨号请求）"
-                                    );
-                                }
-                            }
-                            match self.heal_due(id, s.started, link_ok) {
-                                None => return,
-                                Some(count) => {
-                                    let epoch = modem.dial_epoch();
-                                    modem.note_native_down(
-                                    epoch,
-                                    &format!("会话在跑但数据链路没有地址，重开原生会话（第 {count} 次）"),
-                                );
-                                    log::warn!(
-                                    "原生拨号：模组 {id} 掉线自愈 —— 会话在跑但数据网卡一直没有地址（第 {count} 次重开，下一轮拉起）"
-                                );
-                                    // 上游同口径：**只停不原地起** —— 控制口 / 承载留给
-                                    // 旧会话退干净，下一轮（≤15s）再拉起。
-                                    heal_only = true;
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    // 连接参数变了（APN / PDN / IPv6 / 网卡）：按新计划重建。
-                    // 重建完成前状态是 dialing，页面不会假装还连着。
-                    let epoch = modem.dial_epoch();
-                    modem.note_native_down(epoch, "连接参数变化，重建会话");
-                    log::info!("原生拨号：模组 {id} 计划变化，重建会话");
+        enum Running {
+            Same,
+            Changed,
+            None,
+        }
+        let running = {
+            let g = self.native.lock().unwrap();
+            match g.get(&id) {
+                Some(s) if s.plan == plan => Running::Same,
+                Some(_) => Running::Changed,
+                None => Running::None,
+            }
+        };
+        let mut candidate = match running {
+            Running::Same => self.native.lock().unwrap().remove(&id),
+            Running::Changed => {
+                let old = self.native.lock().unwrap().remove(&id);
+                // 连接参数变了（APN / PDN / IPv6 / 网卡）：按新计划重建。
+                // 重建完成前状态是 dialing，页面不会假装还连着。
+                let epoch = modem.dial_epoch();
+                modem.note_native_down(epoch, "连接参数变化，重建会话");
+                log::info!("原生拨号：模组 {id} 计划变化，重建会话");
+                // 锁外停：控制口往返不占会话表
+                if let Some(mut s) = old {
+                    s.stop();
+                }
+                None
+            }
+            Running::None => None,
+        };
+
+        let probe = candidate.as_mut().map(|s| (s.alive(), s.started));
+        match probe {
+            Some((Some(false), _)) => {
+                // 真掉线：先把权威状态拉回 dialing（页面立刻能看到），
+                // **不置 manual_stop** —— 这不是用户的断开意图。
+                let epoch = modem.dial_epoch();
+                modem.note_native_down(epoch, "主机侧数据呼叫断开，准备重拨");
+                log::warn!("原生拨号：模组 {id} 数据呼叫已断开，重拨");
+                // 丢掉旧会话（锁外 stop），下面按同一计划重拨
+                if let Some(mut s) = candidate.take() {
+                    s.stop();
                 }
             }
-            // 取出旧会话（Drop 会 stop）；锁外再停，避免 QMI 请求占着锁
-            let old = g.remove(&id);
-            drop(g);
-            if let Some(mut s) = old {
-                s.stop();
+            // 传输层出错（None）不当作掉线：一次读超时不该把呼叫拆了。
+            // 但还要看一眼「链路事实」：会话在跑、数据网卡却一直拿不到
+            // 地址（或地址还在、载波没了）是掉线的另一种形态 —— 上游
+            // hostDialRestartDue 的口径：跑满 60s 没地址就重开（限速限次），
+            // 拿到地址即清零。QMI/MBIM 的会话状态可能停在已连接而承载早就
+            // 废了（实测：模组重新枚举后 raw_ip 被复位，地址永远不来）。
+            Some((_, started)) => {
+                // 同参数下重复点「拨号」时，`dial_inner` 会先把状态写成
+                // dialing（并 bump 代次），但会话其实还在跑、计划也没变。
+                // 这条路径原先只做「掉线自愈」，没有第二个人把状态写回
+                // connected —— 页面于是永久停在「拨号中」，直到会话真的
+                // 掉了才有下一轮写入。这里按当前代次重新确认一次。
+                // 只在「状态不是 connected」时写，避免每轮往 steps 里堆条目。
+                if st.state != DIAL_CONNECTED {
+                    let note = "会话仍在运行（连接参数未变），沿用现有数据呼叫";
+                    if modem.note_native_up(modem.dial_epoch(), &format!("native-{kind}"), note) {
+                        log::info!(
+                            "原生拨号：模组 {id} 会话仍在运行，状态回写为已连接（重复拨号请求）"
+                        );
+                    }
+                }
+                match self.heal_due(id, started, link_ok) {
+                    None => {
+                        // 健康：放回会话表（探活期间若有别人放了新的会话，
+                        // 就停掉我们这份，避免同一模组重复呼叫）。
+                        let mut g = self.native.lock().unwrap();
+                        if g.contains_key(&id) {
+                            drop(g);
+                            if let Some(mut dup) = candidate.take() {
+                                dup.stop();
+                            }
+                        } else if let Some(s) = candidate.take() {
+                            g.insert(id, s);
+                        }
+                        return;
+                    }
+                    Some(count) => {
+                        let epoch = modem.dial_epoch();
+                        modem.note_native_down(
+                            epoch,
+                            &format!("会话在跑但数据链路没有地址，重开原生会话（第 {count} 次）"),
+                        );
+                        log::warn!(
+                            "原生拨号：模组 {id} 掉线自愈 —— 会话在跑但数据网卡一直没有地址（第 {count} 次重开，下一轮拉起）"
+                        );
+                        // 上游同口径：**只停不原地起** —— 控制口 / 承载留给
+                        // 旧会话退干净，下一轮（≤15s）再拉起。
+                        if let Some(mut s) = candidate.take() {
+                            s.stop();
+                        }
+                        heal_only = true;
+                    }
+                }
             }
+            None => {}
         }
         if heal_only {
             return;
         }
 
         if !self.retry.due(id, Backend::Native) {
+            return;
+        }
+
+        // C-30：SIM 缺失 / 明确未注册时不再空拨（只读缓存，不发 AT）。
+        // 这里已经过了「会话在跑」的分支，不会误拆在线连接。
+        if let Some(stop) = self.service_stop(state, modem) {
+            log::debug!("原生拨号：模组 {id} 本轮不拨（{}）", stop.code);
+            modem.note_stopped(stop.code, &stop.text);
+            return;
+        }
+
+        // 自动拨号开关（[net] auto_dial）关闭：不再**自主**新建会话（已在跑的
+        // 会话在上面的分支里已经探活/放回，不受影响）。但用户刚在页面上点了
+        // 「拨号」的交办必须放行 —— QMI/MBIM 的手动拨号就是靠本函数建会话的，
+        // 一刀切会把「点拨号没反应」变成新的 bug（B-P2-5）。
+        let manual_req = modem.manual_dial_requested();
+        if !state.auto_dial() && !manual_req {
+            log::debug!("原生拨号：模组 {id} 自动拨号已关闭（auto_dial=false），本轮不建会话");
             return;
         }
 
@@ -923,6 +1226,13 @@ impl DialerSupervisor {
             log::info!("原生拨号：模组 {id} 拉起前发现用户已断开（manual_stop），本轮不建会话");
             return;
         }
+        // 建会话要几秒，期间 stop_session / stop_all 可能已经把表 drain 了。
+        // 记下停止代次，建好后必须在表锁内再比对（B-P2-3）。
+        let stop_gen = self.stop_generation(id);
+        // 已经过完全部门禁、真正要建会话：这一次「人点的拨号」交办到此消费。
+        if manual_req {
+            modem.take_manual_dial_request();
+        }
         match native::Session::start(plan.clone()) {
             Ok(mut s) => {
                 if !modem.dial_epoch_is(epoch) {
@@ -938,7 +1248,22 @@ impl DialerSupervisor {
                     s.stop();
                     return;
                 }
-                self.native.lock().unwrap().insert(id, s);
+                // 锁顺序固定为 stop_gen → native（stop_session 只在释放 stop_gen
+                // 后才拿 native，不会形成环）。代次变了 / 槽位已被别人占了 ⇒
+                // 这份会话是晚到的孤儿，锁外拆掉，绝不插回表里。
+                {
+                    let sg = self.stop_gen.lock().unwrap();
+                    let stale = sg.get(&id).copied().unwrap_or(0) != stop_gen;
+                    let mut g = self.native.lock().unwrap();
+                    if stale || g.contains_key(&id) {
+                        drop(g);
+                        drop(sg);
+                        s.stop();
+                        log::info!("原生拨号：模组 {id} 会话建好时已被停止/替换，立即拆除");
+                        return;
+                    }
+                    g.insert(id, s);
+                }
             }
             Err(e) => {
                 log::warn!(
@@ -1044,6 +1369,15 @@ impl DialerSupervisor {
                 return;
             }
         }
+        // C-30：SIM 缺失 / 明确未注册时不再空拨（与原生路径同口径）。
+        // 已连接的 AT 会话不在这里拆（同上面的理由：唯一拆法是 hangup）。
+        if st.state != DIAL_CONNECTED {
+            if let Some(stop) = self.service_stop(state, modem) {
+                log::debug!("[auto-dial] 模组 #{} 本轮不拨（{}）", id, stop.code);
+                modem.note_stopped(stop.code, &stop.text);
+                return;
+            }
+        }
         if !auto_connect_allowed(
             &st,
             state.dial_enabled(),
@@ -1128,6 +1462,47 @@ impl DialerSupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_facts_block_only_on_definite_bad_news() {
+        let sim_absent = serde_json::json!({"sim_present": false});
+        let sim_ok = serde_json::json!({"sim_present": true});
+        let net_unreg = serde_json::json!({
+            "cs_reg": {"stat": 0, "known": true}, "ps_reg": {"stat": 0, "known": true}
+        });
+        let net_searching = serde_json::json!({
+            "cs_reg": {"stat": 0, "known": true}, "ps_reg": {"stat": 2, "known": true}
+        });
+        let net_roam = serde_json::json!({"ps_reg": {"stat": 5, "known": true}});
+        // 查询失败留下的占位 stat=0（无 `known` 字段）不算「明确未注册」
+        let net_placeholder = serde_json::json!({
+            "cs_reg": {"stat": 0}, "ps_reg": {"stat": 0}
+        });
+
+        // 没卡 → sim_missing（即使网络缓存说已注册也不该有这种东西）
+        assert_eq!(
+            service_stop_from_facts(Some(&sim_absent), None)
+                .unwrap()
+                .code,
+            "sim_missing"
+        );
+        // 明确未注册（0/0，真实解析出）→ no_service
+        assert_eq!(
+            service_stop_from_facts(Some(&sim_ok), Some(&net_unreg))
+                .unwrap()
+                .code,
+            "no_service"
+        );
+        // 占位 stat=0（CREG?/CGREG? 回 ERROR 或超时的残影）→ 不拦
+        assert!(service_stop_from_facts(Some(&sim_ok), Some(&net_placeholder)).is_none());
+        // 正在搜索 / 已注册 / 漫游注册 → 不拦
+        assert!(service_stop_from_facts(Some(&sim_ok), Some(&net_searching)).is_none());
+        assert!(service_stop_from_facts(Some(&sim_ok), Some(&net_roam)).is_none());
+        // 缓存缺失 / 字段不认识 → 未知，不拦
+        assert!(service_stop_from_facts(None, None).is_none());
+        assert!(service_stop_from_facts(None, Some(&serde_json::json!({}))).is_none());
+        assert!(service_stop_from_facts(Some(&serde_json::json!({})), None).is_none());
+    }
 
     #[test]
     fn native_bin_aliases_are_recognised() {
